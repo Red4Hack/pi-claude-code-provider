@@ -19,15 +19,45 @@ import { createOutput } from "./output.ts";
 import { claimPaidTestLaunch } from "./paid-launch-budget.ts";
 import { ProcessTerminationError, superviseProcess, terminateProcessGroup, type ProcessSupervisor } from "./process-utils.ts";
 import { recordRuntimeChild, removeRuntimeDirectory } from "./runtime-directories.ts";
+import { tailText } from "./text.ts";
 import type { RateLimitNoticeSink } from "./claude-protocol.ts";
 import { ClaudeEventMapper, type ClaudeTerminationCause } from "./stream-events.ts";
 import type { ClaudeInstallation, LogicalProviderPayload, MutableOutput, RequestMetrics } from "./types.ts";
 
 const MAX_STDERR_BYTES = 64 * 1024;
-const DEFAULT_MCP_READY_TIMEOUT_MS = 5_000;
+// Claude Code connects the proposal server during its own startup, which is
+// about a second on a warm machine but is bounded by process start, settings
+// resolution, and authentication. Five seconds turned an ordinary slow start
+// into a failed request, so allow real headroom; a bridge that cannot launch
+// still fails on the process-exit branch below rather than on this deadline.
+const DEFAULT_MCP_READY_TIMEOUT_MS = 20_000;
 // Bound the stderr excerpt carried into a readiness failure; the full stream is
 // already capped, and an error message is not a log.
 const READY_STDERR_BYTES = 1_000;
+/**
+ * Reasoning room Pi expects on top of a requested output cap, mirroring
+ * `DEFAULT_THINKING_BUDGETS` and `clampReasoning` in pi-ai: Pi treats
+ * `maxTokens` as the budget for the answer and adds the thinking budget to the
+ * response ceiling, because thinking is output too. This transport always asks
+ * Claude Code for an effort level, so it always owes the answer that room.
+ */
+const THINKING_BUDGET_TOKENS: Readonly<Record<string, number>> = Object.freeze({
+  minimal: 1_024,
+  low: 2_048,
+  medium: 8_192,
+  high: 16_384,
+  xhigh: 16_384,
+  max: 16_384,
+});
+/**
+ * Pi's own context safety margin, covering what no estimate here can see:
+ * Claude Code adds its own system prompt, MCP tool schemas, and reminders to
+ * every request. Bounded by a tenth of the window so a small-context model is
+ * not declared full by the margin alone.
+ */
+const CONTEXT_SAFETY_TOKENS = 4_096;
+/** Pi's floor for an answer that shares a response ceiling with reasoning. */
+const MIN_ANSWER_TOKENS = 1_024;
 const DEFAULT_IDLE_TIMEOUT_MS = 5 * 60_000;
 const DEFAULT_TOTAL_TIMEOUT_MS = 30 * 60_000;
 /** Internal dependency seam for deterministic cleanup-failure tests. */
@@ -215,8 +245,7 @@ export function createClaudeStream(
         metrics.catalogBytes = prepared.catalogBytes;
         metrics.imageBytes = prepared.imageBytes;
         metrics.estimatedInputTokens = estimatedInputTokens;
-        const maxOutputTokens = effectiveMaxOutputTokens(model, options?.maxTokens);
-        validateContextBudget(model, estimatedInputTokens, maxOutputTokens);
+        const maxOutputTokens = availableOutputTokens(model, estimatedInputTokens, options?.maxTokens, effort);
         const { args, prompt } = providerArgs(prepared, model.id, effort);
         const expectedTools = new Set(prepared.toolNames.keys());
         mapper = new ClaudeEventMapper({
@@ -346,17 +375,22 @@ export function createClaudeStream(
         child.stdout?.once("close", finishStdout);
         if (!child.stdout) finishStdout();
         child.stderr?.on("data", (chunk: Buffer) => {
-          stderr = `${stderr}${chunk.toString("utf8")}`.slice(-MAX_STDERR_BYTES);
+          stderr = tailText(stderr, chunk, MAX_STDERR_BYTES);
         });
 
         if (prepared.readyPath) {
+          const currentMapper = mapper;
           await waitForReadyOrExit(prepared.readyPath, readyTimeoutMs, options?.signal, supervisor.wait(), {
             bridgeArgv: bridgeArgv(prepared.bunConfigPath),
             stderr: () => stderr,
+            // Claude's validated init record proves the server connected, and a
+            // published failure has already decided the request. Either one ends
+            // the wait, so a slow marker cannot mask the answer Claude already gave.
+            settled: () => currentMapper.isInitialized || currentMapper.isTerminal,
           });
           metrics.lastPhase = "mcp_ready";
         }
-        if (child.exitCode === null && child.signalCode === null && !options?.signal?.aborted) {
+        if (!mapper.isTerminal && child.exitCode === null && child.signalCode === null && !options?.signal?.aborted) {
           child.stdin?.end(
             `${JSON.stringify({
               type: "user",
@@ -500,41 +534,68 @@ function timeoutSetting(name: string, fallback: number): number {
 }
 
 /**
- * Deliberately conservative pre-launch estimate: roughly 3 bytes per token
- * plus 10% margin and a flat per-image reserve. Overestimating rejects a
- * request early with `context_budget` instead of ever overrunning the served
- * window mid-stream. Metrics record this estimate beside Claude's reported
- * prompt counters (input + cacheRead + cacheWrite); calibrate against that
- * logged data across representative transcripts before changing the ratio.
+ * Pre-launch estimate: 2.4 bytes per token plus 10% margin and a flat per-image
+ * reserve. The ratio is calibrated, not guessed. Measured against a real
+ * session transcript by comparing this transport's serialized bytes with
+ * Claude's own reported prompt counters (input + cacheRead + cacheWrite) over
+ * the same messages, dense agent history tokenized at 2.12 bytes per token —
+ * JSON structure, escaped characters, file paths, and code all tokenize far
+ * below prose. The previous 3-byte ratio was described as conservative but
+ * under-counted such a transcript by about a fifth, so the budget guard did not
+ * bound what it claimed to. Metrics still record this estimate beside Claude's
+ * reported counters; recalibrate from that logged data before changing it.
  */
 function estimateTransportTokens(transcriptBytes: number, catalogBytes: number, systemBytes: number, images: number): number {
-  const textTokens = Math.ceil((transcriptBytes + catalogBytes + systemBytes) / 3);
+  const textTokens = Math.ceil((transcriptBytes + catalogBytes + systemBytes) / 2.4);
   return Math.ceil(textTokens * 1.1) + images * 2_000;
 }
 
-function effectiveMaxOutputTokens(model: Model<Api>, requested: number | undefined): number {
-  const value = Math.min(requested ?? model.maxTokens ?? 0, model.maxTokens ?? 0);
-  if (!Number.isSafeInteger(value) || value <= 0) {
+/**
+ * The response ceiling this transport gives Claude Code. Two rules, both Pi's own:
+ * a requested cap budgets the answer and reasoning is added on top of it
+ * (`adjustMaxTokensForThinking`), and the result is clamped to the room the
+ * context window actually has left (`clampMaxTokensToContext`). Reserving the
+ * model maximum instead used to reject requests whose prompt fit with tens of
+ * thousands of tokens to spare, and squeezing reasoning inside a small
+ * requested cap truncated the answer it was supposed to protect — a compaction
+ * summary cut off mid-sentence is discarded whole, and Pi pays to make another.
+ */
+export function availableOutputTokens(
+  model: Model<Api>,
+  estimatedInputTokens: number,
+  requested: number | undefined,
+  effort: string,
+): number {
+  const modelMaximum = model.maxTokens ?? 0;
+  if (!Number.isSafeInteger(modelMaximum) || modelMaximum <= 0) {
     throw new ClaudeCodeError("max_tokens", "Pi maxTokens must be a positive integer");
   }
-  return value;
-}
-
-function validateContextBudget(model: Model<Api>, estimatedInputTokens: number, maxOutput: number): void {
+  if (requested !== undefined && (!Number.isSafeInteger(requested) || requested <= 0)) {
+    throw new ClaudeCodeError("max_tokens", "Pi maxTokens must be a positive integer");
+  }
+  const ceiling = requested === undefined
+    ? modelMaximum
+    : Math.min(requested + (THINKING_BUDGET_TOKENS[effort] ?? 0), modelMaximum);
   const contextWindow = model.contextWindow ?? 0;
-  if (contextWindow > 0 && estimatedInputTokens + maxOutput > contextWindow) {
+  if (contextWindow <= 0) return ceiling;
+  const safety = Math.min(CONTEXT_SAFETY_TOKENS, Math.floor(contextWindow / 10));
+  const available = contextWindow - estimatedInputTokens - safety;
+  if (available < Math.min(MIN_ANSWER_TOKENS, ceiling)) {
     throw new ClaudeCodeError(
       "context_budget",
-      `context_length_exceeded: estimated Claude Code transport input ${estimatedInputTokens} plus output reserve ${maxOutput} exceeds context ${contextWindow}`,
+      `context_length_exceeded: estimated Claude Code transport input ${estimatedInputTokens} leaves no room for a reply within context ${contextWindow}`,
     );
   }
+  return Math.min(ceiling, available);
 }
 
-/** Evidence carried into a readiness failure, gathered only when one occurs. */
-export interface ReadyDiagnostics {
+/** Control and evidence for the readiness wait; evidence is gathered only on failure. */
+export interface ReadyWaitOptions {
   bridgeArgv?: readonly string[];
   /** Claude Code's stderr so far, read lazily so a healthy request pays nothing. */
   stderr?: () => string;
+  /** Another signal that the wait is over, checked beside the ready marker. */
+  settled?: () => boolean;
 }
 
 /** Internal test seam for the MCP readiness race. */
@@ -543,7 +604,7 @@ export async function waitForReadyOrExit(
   timeoutMs: number,
   signal: AbortSignal | undefined,
   processResult: Promise<{ code: number | null; signal: NodeJS.Signals | null }>,
-  diagnostics: ReadyDiagnostics = {},
+  options: ReadyWaitOptions = {},
 ): Promise<void> {
   let exited: { code: number | null; signal: NodeJS.Signals | null } | undefined;
   let processError: unknown;
@@ -554,12 +615,14 @@ export async function waitForReadyOrExit(
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (signal?.aborted) throw new ClaudeCodeError("aborted", "Claude Code request was aborted");
+    // An answer Claude already gave outranks anything this wait could synthesize.
+    if (options.settled?.() === true) return;
     if (processError) throw processError;
     if (exited) {
       throw new ClaudeCodeError(
         "mcp_startup",
         `Claude Code exited before the Pi proposal MCP server became ready ` +
-        `(code ${String(exited.code)}, signal ${String(exited.signal)})${readyDiagnosticSuffix(diagnostics)}`,
+        `(code ${String(exited.code)}, signal ${String(exited.signal)})${readyDiagnosticSuffix(options)}`,
       );
     }
     if (await pathExists(path)) return;
@@ -567,9 +630,12 @@ export async function waitForReadyOrExit(
   }
   // Name the resolved command: this timeout is far more often an unlaunchable
   // bridge than a slow one, and a bare duration sends people to the wrong knob.
+  // Report seconds, not milliseconds: Pi classifies a failed turn by matching
+  // HTTP status substrings in its text, and a millisecond figure such as
+  // "5000ms" reads as a retryable 500 and restarts a request that needs a fix.
   throw new ClaudeCodeError(
     "mcp_startup",
-    `Pi proposal MCP server did not become ready within ${timeoutMs}ms${readyDiagnosticSuffix(diagnostics)}`,
+    `Pi proposal MCP server did not become ready within ${formatSeconds(timeoutMs)}${readyDiagnosticSuffix(options)}`,
   );
 }
 
@@ -579,13 +645,18 @@ export async function waitForReadyOrExit(
  * wait precedes. Its stderr is therefore the sole first-hand evidence available
  * at timeout, so carry it rather than leaving the duration to speak alone.
  */
-function readyDiagnosticSuffix(diagnostics: ReadyDiagnostics): string {
-  const command = diagnostics.bridgeArgv
-    ? `; Claude Code was told to launch argv: ${formatBridgeArgv(diagnostics.bridgeArgv)}`
+function readyDiagnosticSuffix(options: ReadyWaitOptions): string {
+  const command = options.bridgeArgv
+    ? `; Claude Code was told to launch argv: ${formatBridgeArgv(options.bridgeArgv)}`
     : "";
-  const captured = diagnostics.stderr?.().trim() ?? "";
+  const captured = options.stderr?.().trim() ?? "";
   const stderr = captured ? `; Claude Code stderr: ${captured.slice(-READY_STDERR_BYTES)}` : "";
   return `${command}${stderr}; run /pi-claude-code-provider-doctor to complete the handshake directly`;
+}
+
+/** Durations belong in seconds in user-facing text; see the readiness timeout above. */
+function formatSeconds(milliseconds: number): string {
+  return `${Number((milliseconds / 1000).toFixed(3))}s`;
 }
 
 async function pathExists(path: string): Promise<boolean> {
@@ -598,13 +669,16 @@ async function pathExists(path: string): Promise<boolean> {
 }
 
 function containsPrivateTransportToolArgument(output: MutableOutput, directory: string): boolean {
+  // Normalize the needle once: tool arguments can carry hundreds of kilobytes
+  // of model-authored text, and this scan runs over every one of them.
+  const normalizedDirectory = directory.normalize("NFC");
   return output.content.some(
-    (block) => block.type === "toolCall" && containsPrivateTransportPath(block.arguments, directory),
+    (block) => block.type === "toolCall" && containsPrivateTransportPath(block.arguments, normalizedDirectory),
   );
 }
 
 function containsPrivateTransportPath(value: unknown, directory: string): boolean {
-  if (typeof value === "string") return value.normalize("NFC").includes(directory.normalize("NFC"));
+  if (typeof value === "string") return value.normalize("NFC").includes(directory);
   if (Array.isArray(value)) return value.some((item) => containsPrivateTransportPath(item, directory));
   if (!value || typeof value !== "object") return false;
   return Object.values(value as Record<string, unknown>).some((item) => containsPrivateTransportPath(item, directory));

@@ -3,8 +3,9 @@ import { access, chmod, mkdtemp, readFile, readdir, rm, writeFile } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { createClaudeStream, isExpectedToolHandoffExit, waitForReadyOrExit } from "../../src/provider.ts";
+import { availableOutputTokens, createClaudeStream, isExpectedToolHandoffExit, waitForReadyOrExit } from "../../src/provider.ts";
 import { getLastRequestMetrics } from "../../src/metrics.ts";
+import { normalizeClaudeFailure } from "../../src/errors.ts";
 import { superviseProcess, terminateProcessGroup } from "../../src/process-utils.ts";
 import { nodeFixtureSource } from "../support/node-fixture.js";
 import { PROVIDER_INIT_FIELDS, initRecord } from "../support/claude-fixture.js";
@@ -332,6 +333,9 @@ process.stdin.on("end", () => {
   process.stdout.write(JSON.stringify({type:"result",is_error:false,result:"bounded",usage:{},modelUsage:{sonnet:{contextWindow:3000,maxOutputTokens:64000}}}) + "\\n");
 });`);
     try {
+        // A narrow window clamps the ceiling to the room that is actually left,
+        // the way Pi clamps every other provider, instead of reserving the model
+        // maximum and rejecting a prompt that fits.
         const boundedModel = { ...model, contextWindow: 3_000, maxTokens: 64_000 };
         const result = await createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(
             boundedModel,
@@ -339,7 +343,10 @@ process.stdin.on("end", () => {
             { maxTokens: 2_048 },
         ).result();
         assert.equal(result.stopReason, "stop", result.errorMessage);
-        assert.equal(await readFile(marker, "utf8"), "2048");
+        const forwarded = Number(await readFile(marker, "utf8"));
+        const estimated = getLastRequestMetrics()?.estimatedInputTokens ?? 0;
+        assert.equal(forwarded, 3_000 - estimated - 300);
+        assert.ok(forwarded > 2_048, `expected reasoning room above the requested answer cap, got ${forwarded}`);
         assert.equal(getLastRequestMetrics()?.servedMaxOutputTokens, 64_000);
     } finally {
         await rm(directory, { recursive: true, force: true });
@@ -937,7 +944,13 @@ test("provider reports malformed JSONL and early MCP exit without hanging", asyn
 test("MCP readiness has a bounded timeout even while the process remains alive", async () => {
     const directory = await mkdtemp(join(tmpdir(), "provider-ready-timeout-"));
     try {
-        await assert.rejects(waitForReadyOrExit(join(directory, "missing"), 20, undefined, new Promise(() => { })), /did not become ready within 20ms/);
+        // Seconds, not milliseconds: Pi classifies a failed turn by matching HTTP
+        // status substrings in its text, and "5000ms" reads to it as a retryable 500.
+        await assert.rejects(waitForReadyOrExit(join(directory, "missing"), 20, undefined, new Promise(() => { })), /did not become ready within 0.02s/);
+        await assert.rejects(waitForReadyOrExit(join(directory, "missing"), 5000, undefined, Promise.resolve({ code: 1, signal: null })), (error) => !/500/.test(error.message));
+        // Claude's own init record proves the proposal server connected, so it
+        // ends the wait even when the marker file has not landed yet.
+        await waitForReadyOrExit(join(directory, "missing"), 5_000, undefined, new Promise(() => { }), { settled: () => true });
         // The failure mode this timeout actually reports is an unlaunchable bridge,
         // so it must carry the resolved command and Claude's own first-hand output.
         await assert.rejects(
@@ -1162,4 +1175,53 @@ test("provider fails before streaming when Pi's async response handler rejects",
     finally {
         await rm(fake.dir, { recursive: true, force: true });
     }
+});
+
+test("an exhausted subscription window produces a failure Pi will not retry", async () => {
+    const limited = await fakeClaude(`
+setTimeout(() => {
+  process.stdout.write(JSON.stringify(${JSON.stringify(init)}) + "\\n");
+  process.stdout.write(JSON.stringify({type:"result",is_error:true,api_error_status:429,result:"You've hit your session limit \u00b7 resets 3:50am (America/Sao_Paulo)"}) + "\\n");
+}, 10);`);
+    try {
+        const result = await createClaudeStream({ executable: limited.executable, version: "test", subscriptionType: "pro" })(model, context, { reasoning: "medium" }).result();
+        assert.equal(result.stopReason, "error");
+        assert.match(result.errorMessage ?? "", /429.*session limit/);
+        // The wording the provider actually emits has to be the wording the
+        // normalization boundary recognizes, or Pi retries a window that cannot open.
+        assert.equal(normalizeClaudeFailure(result.errorMessage), `quota exceeded: ${result.errorMessage}`);
+        await waitForRequestMetrics((entry) => entry.errorCategory === "claude_error");
+    }
+    finally {
+        await rm(limited.dir, { recursive: true, force: true });
+    }
+});
+
+test("a requested output cap budgets the answer and reasoning is added on top of it", () => {
+    // Pi's own contract for every budget-based provider: `maxTokens` is the
+    // answer budget and the thinking budget is added to the response ceiling,
+    // because thinking is output too. Treating the request as the total ceiling
+    // truncated a compaction summary that Pi then discarded whole, so the
+    // tokens were spent and Pi had to compact again.
+    const opus = { ...model, contextWindow: 200_000, maxTokens: 64_000 };
+    assert.equal(availableOutputTokens(opus, 40_000, 6_553, "max"), 6_553 + 16_384);
+    assert.equal(availableOutputTokens(opus, 40_000, 6_553, "medium"), 6_553 + 8_192);
+    assert.equal(availableOutputTokens(opus, 40_000, 6_553, "low"), 6_553 + 2_048);
+    // The model maximum still bounds the sum, and no requested cap means the
+    // model maximum is already the ceiling reasoning has to share.
+    assert.equal(availableOutputTokens(opus, 40_000, 60_000, "max"), 64_000);
+    assert.equal(availableOutputTokens(opus, 40_000, undefined, "max"), 64_000);
+});
+
+test("the output ceiling is clamped to remaining context instead of reserving the model maximum", () => {
+    const opus = { ...model, contextWindow: 200_000, maxTokens: 64_000 };
+    // A 160k-token prompt leaves real room for a reply. Reserving the model
+    // maximum rejected exactly this request while ~36k tokens were still free.
+    assert.equal(availableOutputTokens(opus, 160_000, undefined, "max"), 200_000 - 160_000 - 4_096);
+    // Only a prompt with no room left for an answer is refused before launch.
+    assert.throws(() => availableOutputTokens(opus, 199_000, undefined, "max"), /context_length_exceeded/);
+    assert.throws(() => availableOutputTokens({ ...opus, maxTokens: 0 }, 10, undefined, "max"), /maxTokens must be a positive integer/);
+    assert.throws(() => availableOutputTokens(opus, 10, -1, "max"), /maxTokens must be a positive integer/);
+    // An unknown context window cannot be budgeted against; the ceiling stands.
+    assert.equal(availableOutputTokens({ ...opus, contextWindow: 0 }, 10_000, 2_048, "high"), 2_048 + 16_384);
 });

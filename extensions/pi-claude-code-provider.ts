@@ -10,7 +10,7 @@ import { bridgeArgv } from "../src/claude-args.ts";
 import { readClaudeModelAliases } from "../src/claude-models.ts";
 import { MINIMUM_VERSIONS, VERIFIED_VERSIONS, platformStatus, startupPlatformWarning, versionStatus } from "../src/compatibility.ts";
 import { writeDiagnosticReport } from "../src/diagnostics.ts";
-import { errorText, normalizeClaudeOverflow } from "../src/errors.ts";
+import { errorText, normalizeClaudeFailure } from "../src/errors.ts";
 import { formatDoctorSummary, probeBridge } from "../src/doctor.ts";
 import { flushMetricsLog, getLastRequestMetrics, getLastSearchMetrics, getMetricsLogError } from "../src/metrics.ts";
 import { createClaudeStream } from "../src/provider.ts";
@@ -86,7 +86,7 @@ export default async function piClaudeCodeProvider(pi: ExtensionAPI): Promise<vo
     const assistant = message as AssistantMessage;
     if (assistant.provider !== PROVIDER && ctx.model?.provider !== PROVIDER) return;
     const errorMessage = assistant.errorMessage ?? "";
-    const normalized = normalizeClaudeOverflow(errorMessage);
+    const normalized = normalizeClaudeFailure(errorMessage);
     if (normalized === errorMessage) return;
     return { message: { ...assistant, errorMessage: normalized } };
   });

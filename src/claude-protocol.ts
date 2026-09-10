@@ -60,6 +60,17 @@ export function parseRateLimitNotice(info: unknown): RateLimitNotice | undefined
   };
 }
 
+/**
+ * Single wording for a rejected rate-limit notice. The provider and the
+ * web-search tool report the same condition, and `normalizeClaudeUsageLimit`
+ * recognizes this one phrasing, so it must not drift between them.
+ */
+export function formatRateLimitRejection(notice: RateLimitNotice): string {
+  const reset = notice.resetsAt === undefined ? "" : `; resets at ${new Date(notice.resetsAt).toISOString()}`;
+  const reason = notice.overageDisabledReason === undefined ? "" : `; ${notice.overageDisabledReason}`;
+  return `Claude rate limit rejected (${notice.rateLimitType})${reason}${reset}`;
+}
+
 export function terminalResultErrorDetail(
   record: Record<string, unknown>,
   assistantDiagnostic?: string,
@@ -76,7 +87,7 @@ export function terminalResultErrorDetail(
 }
 
 export function validateClaudeInitialization(value: unknown, expectation: ClaudeInitializationExpectation): string {
-  const record = object(value, "Claude initialization");
+  const record = requireObject(value, "Claude initialization");
   if (record.type !== "system" || record.subtype !== "init") {
     throw new ClaudeCodeError("protocol_init", "Claude initialization record was invalid");
   }
@@ -165,7 +176,8 @@ function formatNames(names: ReadonlySet<string>): string {
   return [...names].sort().join(", ") || "none";
 }
 
-function object(value: unknown, field: string): Record<string, unknown> {
+/** Shared protocol-shape guard for every untrusted Claude record and event. */
+export function requireObject(value: unknown, field: string): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new ClaudeCodeError("protocol_shape", `${field} must be an object`);
   }

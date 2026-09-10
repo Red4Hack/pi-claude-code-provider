@@ -37,6 +37,23 @@ test("supervisor terminates a process that exceeds its idle deadline", async () 
     supervisor.dispose();
     assert.match(failure?.message, /no protocol activity for 30ms/);
 });
+test("protocol activity postpones the idle deadline without rearming a timer per record", async () => {
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: ["pipe", "pipe", "pipe"] });
+    let failure;
+    const supervisor = superviseProcess(child, { idleTimeoutMs: 120, totalTimeoutMs: 5000, onFailure(error) { failure = error; } });
+    // A fast stream calls touch() per record, so it records a timestamp the one
+    // long-lived timer consults; the deadline must still slide with the activity.
+    const started = Date.now();
+    for (let elapsed = 0; elapsed < 300; elapsed = Date.now() - started) {
+        supervisor.touch();
+        await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(failure, undefined);
+    await supervisor.wait();
+    supervisor.dispose();
+    assert.match(failure?.message, /no protocol activity for 120ms/);
+    assert.ok(Date.now() - started >= 300);
+});
 test("supervisor reports only the first pipe failure", async () => {
     const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: ["pipe", "pipe", "pipe"] });
     const failures = [];

@@ -28,6 +28,9 @@ pi install /absolute/path/to/pi-claude-code-provider
 | Authentication, CLI, and compatibility | `src/auth.ts`, `src/claude-args.ts`, `src/compatibility.ts` | `auth.test.js`, `claude-args.test.js`, `compatibility.test.js` |
 | Transcript and provider lifecycle | `src/context-serializer.ts`, `src/provider.ts`, `src/stream-events.ts`, `src/claude-protocol.ts` | `context-serializer.test.js`, `provider.test.js`, `stream-events.test.js` |
 | Runtime launch, process trees, and private state | `src/host-runtime.ts`, `src/process-utils.ts`, `src/runtime-directories.ts` | `process-utils.test.js`, `runtime-directories.test.js` |
+| Failure classification and bounded capture | `src/errors.ts`, `src/text.ts` | `errors.test.js`, `text.test.js` |
+| Local-model live lane | `test/support/local-claude.js`, `scripts/local-test.js` | `local-claude.test.js` |
+| Captured Claude Code protocol | `scripts/capture-claude-protocol.js` | `captured-protocol.test.js` |
 | Visible web search | `src/web-search.ts` | `web-search.test.js` |
 | Diagnostics and metrics | `src/diagnostics.ts`, `src/doctor.ts`, `src/metrics.ts` | `metrics-doctor.test.js` |
 | Proposal-only MCP bridge | `bridge/mcp-proposal-server.js` | `mcp-bridge.test.js` |
@@ -45,11 +48,11 @@ Pi remains authoritative for prepared context, branches, compaction, active tool
 | Pi | 0.85.1, npm distribution; standalone tar.gz bridge live-verified on Linux x64 |
 | Claude Code | 2.1.261 |
 | Node.js | 24.16.0 on WSL2 and Apple Silicon macOS CI; 22.23.1 on Windows |
-| Platform | WSL2 Ubuntu/Linux x64; native Windows x64; Apple Silicon macOS 26.5 (arm64) |
+| Platform | Linux x64, gated on WSL2 Ubuntu; native Windows x64; Apple Silicon macOS 26.5 (arm64) |
 
 Pi's distribution is part of the baseline, not an implementation detail: the npm build runs on Node and the standalone tar.gz build is a compiled Bun binary, and `process.execPath` means something different on each. `src/host-runtime.ts` owns that difference in one place (`scriptLaunch`), which sets `BUN_BE_BUN=1` so a compiled Pi binary runs the proposal bridge instead of its own embedded entry point, and pins `--config=` to a neutral `bunfig.toml` in the private request directory. Pi compiles with `--no-compile-autoload-bunfig`, but that protects Pi's own entry point only and does not survive `BUN_BE_BUN`; without the pin, a `bunfig.toml` in the bridge's working directory preloads code into it. Only the joined `--config=` form works, as Bun ignores a space-separated one and then consumes the script path. The mechanism is not Linux-specific: Pi builds all six standalone targets from one `bun build --compile` invocation, and `BUN_BE_BUN` is part of the embedded Bun runtime on each. Record a standalone baseline only after `npm run test:paid:bridge-standalone` passes against that exact build.
 
-Apple Silicon macOS passes the [deterministic GitHub Actions matrix](.github/workflows/ci.yml) and has community-reported live coverage for the release stages described below. `platformStatus` treats `darwin` as verified across architectures rather than `arm64` alone: the report is accepted as a macOS report, and nothing here takes a different code path on an Intel Mac. Other platforms and versions continue with advisory warnings, while protocol and isolation mismatches fail closed. Supported effort values are `low`, `medium`, `high`, `xhigh`, and `max`; Pi `off` and `minimal` are hidden.
+Apple Silicon macOS passes the [deterministic GitHub Actions matrix](.github/workflows/ci.yml) and has community-reported live coverage for the release stages described below. `platformStatus` treats `darwin` as verified across architectures rather than `arm64` alone: the report is accepted as a macOS report, and nothing here takes a different code path on an Intel Mac. Linux is treated the same way across distributions: the gate runs on `linux/x64`, which is exactly what WSL2 Ubuntu is, and no distribution or kernel selects a different code path here. Architecture still decides verification, because it decides which Claude Code build is installed at all. Other platforms and versions continue with advisory warnings, while protocol and isolation mismatches fail closed. Supported effort values are `low`, `medium`, `high`, `xhigh`, and `max`; Pi `off` and `minimal` are hidden.
 
 ### macOS live validation
 
@@ -68,9 +71,36 @@ The model matrix passes with personal skills left in place. Fable remains outsid
 
 Recapture with `npm run capture:claude-surface`, then point `CAPTURED_CLAUDE_VERSION` in `test/support/claude-fixture.js` at the new file and review the diff. Re-pin deliberately, as part of moving the verified baseline — the diff on a CLI upgrade is the point of committing the artifact.
 
+### Captured Claude Code protocol
+
+Claude Code can run on a model that is not Anthropic's, and that is the cheapest way to see what its headless protocol really emits. It accepts an alternate endpoint and API-key authentication, and it maps each alias to a model of your choosing:
+
+| Variable | Purpose |
+| --- | --- |
+| `ANTHROPIC_BASE_URL` | Endpoint to call, for example a local llama.cpp server answering `/v1/messages` |
+| `ANTHROPIC_API_KEY` | Any value; it selects API-key authentication over the claude.ai login |
+| `ANTHROPIC_DEFAULT_SONNET_MODEL`, `..._OPUS_MODEL`, `..._HAIKU_MODEL`, `..._FABLE_MODEL` | Model each alias resolves to, so `--model sonnet` reaches the local model |
+| `ANTHROPIC_SMALL_FAST_MODEL` | Model for Claude Code's own side queries, such as session titles |
+
+`npm run capture:claude-protocol` drives one provider request that way and writes the JSONL to `test/support/captured/claude-<version>-protocol.jsonl`. Its argument vector comes from `providerArgs`, not from a copy of it, so the capture describes a request this package actually makes; machine-identifying fields are redacted and everything else is kept verbatim. Point it at a server with `--base-url` or `PI_CLAUDE_LOCAL_BASE_URL` and pick the model with `--model`.
+
+Unlike the help capture, this artifact is untracked (see `.gitignore`): it records one machine's run against one model, and it ages with the CLI that produced it. `captured-protocol.test.js` replays whichever capture is present and skips when there is none, so a fresh clone stays green and a contributor who takes a capture immediately gets it checked against the mapper. Take one after a Claude Code upgrade — a protocol change then becomes a failing test rather than a broken release.
+
+This is a capture tool, never a way to run the provider on another model. The provider refuses that configuration at three independent points, and deliberately: `parseAuthStatus` requires a subscription (`src/auth.ts`), `buildClaudeEnvironment` never forwards `ANTHROPIC_*` to the process it starts, and `validateClaudeInitialization` requires `apiKeySource: "none"` (`src/claude-protocol.ts`). A capture also says nothing about Anthropic model behaviour — it exercises the CLI's protocol, not the model behind it, so the paid stages remain the only compatibility statement.
+
+The technique earns its place: the first capture showed Claude Code reporting `max_tokens` on a message capped by `CLAUDE_CODE_MAX_OUTPUT_TOKENS` and then continuing to finish the turn under a different stop reason. This provider had been keeping the first stop reason and reporting a completed answer as truncated, which made Pi discard and repay for every compaction summary.
+
 ## Validation
 
 `npm run check` enforces dependency and import policy, Markdown links and versions, source boundaries, JavaScript syntax, and strict TypeScript. `npm test` runs deterministic tests. Neither command performs Claude inference or consumes subscription quota; `check` may run `claude --version` for advisory metadata.
+
+### Free live lane
+
+`npm run test:local` runs real Pi against the real provider transport with a local llama.cpp model standing in for Claude Code, so the lane costs nothing. `test/support/local-claude.js` implements the headless surface this package depends on — `--version`, `auth status`, the captured `--help`, the ordered JSONL protocol, a real `initialize` plus `tools/list` handshake against the proposal bridge, and the 143 exit of a correlated tool handoff — and takes its content from an OpenAI-compatible endpoint. It defaults to `openbmb/MiniCPM5-2B-GGUF:Q4_K_M` at `http://127.0.0.1:8080`; point it at another host with `--base-url` or `PI_CLAUDE_LOCAL_BASE_URL`, choose another model with `--model` or `PI_CLAUDE_LOCAL_MODEL`, and pass `--text-only` to skip the tool round trip. The lane refuses to start when the server does not serve the named model, so a missing server fails in seconds instead of mid-run.
+
+Every deadline in the lane comes from one knob, `--timeout-ms` (or `PI_CLAUDE_LOCAL_TIMEOUT_MS`), defaulting to an hour: Pi's supervisor, the provider's idle and total timeouts, and the stand-in's own HTTP deadline. The provider's production defaults assume Claude Code's latency, and a small model on modest hardware can spend minutes on prompt processing before its first token while the stand-in answers in one piece — so without raising them an honest slow answer is reported as a hung process. The lane asserts against the provider's own metrics log, not the model's prose, so a small model's wording cannot make it flaky.
+
+This lane is not a compatibility gate and never substitutes for one. It says this package's transport, bridge, tool handoff, and cleanup hold; it says nothing about what Claude Code actually emits, because no Claude Code ran. Only the paid stages below can move the verified baseline. `local-claude.test.js` covers the stand-in itself hermetically, against a stub endpoint, so `npm test` stays offline and fast.
 
 Subscription-consuming commands are named `test:paid:*`. They show the detected subscription, request caps, and quota/spend warning, then require the exact phrase `USE PAID CLAUDE QUOTA`. Noninteractive execution additionally requires `PI_CLAUDE_CODE_PROVIDER_CONFIRM_PAID_TESTS=1`. The underlying scripts refuse direct invocation, perform no automatic retries, and atomically claim a stage and aggregate slot before every provider or web-search Claude launch.
 

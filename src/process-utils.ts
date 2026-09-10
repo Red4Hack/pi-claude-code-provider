@@ -2,6 +2,7 @@ import { execFile, type ChildProcess } from "node:child_process";
 import { constants } from "node:fs";
 import { access } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
+import { errorText } from "./errors.ts";
 
 export interface ProcessResult {
   code: number | null;
@@ -29,13 +30,14 @@ export class ProcessTerminationError extends Error {
   readonly livenessUnknown = true;
 
   constructor(cause: unknown) {
-    super(`Claude Code process cleanup failed; process liveness is unknown: ${errorMessage(cause)}`, { cause });
+    super(`Claude Code process cleanup failed; process liveness is unknown: ${errorText(cause)}`, { cause });
     this.name = "ProcessTerminationError";
   }
 }
 
 export function superviseProcess(child: ChildProcess, options: ProcessSupervisorOptions): ProcessSupervisor {
   let idleTimer: NodeJS.Timeout | undefined;
+  let lastActivity = Date.now();
   let totalTimer: NodeJS.Timeout | undefined;
   let disposed = false;
   let settled = false;
@@ -101,12 +103,22 @@ export function superviseProcess(child: ChildProcess, options: ProcessSupervisor
   const onStdoutError = (error: Error): void => fail(new Error(`Claude Code stdout failed: ${error.message}`));
   const onStderrError = (error: Error): void => fail(new Error(`Claude Code stderr failed: ${error.message}`));
 
-  const armIdle = (): void => {
+  // Protocol activity arrives per record, so the deadline is tracked with a
+  // timestamp and one long-lived timer that re-arms for the remaining time.
+  // Clearing and recreating a timer per record was pure overhead on a fast stream.
+  const armIdle = (milliseconds: number): void => {
     if (idleTimer) clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => {
-      fail(new Error(`Claude Code produced no protocol activity for ${options.idleTimeoutMs}ms`));
-    }, options.idleTimeoutMs);
+    idleTimer = setTimeout(onIdleDeadline, milliseconds);
     idleTimer.unref();
+  };
+
+  const onIdleDeadline = (): void => {
+    const idleFor = Date.now() - lastActivity;
+    if (idleFor < options.idleTimeoutMs) {
+      armIdle(options.idleTimeoutMs - idleFor);
+      return;
+    }
+    fail(new Error(`Claude Code produced no protocol activity for ${options.idleTimeoutMs}ms`));
   };
 
   child.once("error", onChildError);
@@ -114,14 +126,16 @@ export function superviseProcess(child: ChildProcess, options: ProcessSupervisor
   child.stdin?.on("error", onStdinError);
   child.stdout?.on("error", onStdoutError);
   child.stderr?.on("error", onStderrError);
-  armIdle();
+  armIdle(options.idleTimeoutMs);
   totalTimer = setTimeout(() => {
     fail(new Error(`Claude Code request exceeded ${options.totalTimeoutMs}ms`));
   }, options.totalTimeoutMs);
   totalTimer.unref();
 
   return {
-    touch: armIdle,
+    touch(): void {
+      lastActivity = Date.now();
+    },
     wait: () => result,
     terminate,
     dispose(): void {
@@ -218,7 +232,7 @@ export async function validateProcessTerminationCapability(
 }
 
 async function terminateWindowsProcessTree(child: ChildProcess, pid: number, graceMs: number): Promise<void> {
-  if (!validPid(pid)) throw new Error("Claude Code child process has no valid process ID");
+  if (!isValidPid(pid)) throw new Error("Claude Code child process has no valid process ID");
   if (child.exitCode !== null || child.signalCode !== null) return;
 
   let taskkillFailure: unknown;
@@ -239,7 +253,7 @@ async function terminateWindowsProcessTree(child: ChildProcess, pid: number, gra
       child.kill("SIGKILL");
       await waitForChildClose(child, graceMs);
     }
-    throw new Error(`Process tree ${pid} cleanup failed: ${errorMessage(taskkillFailure)}`);
+    throw new Error(`Process tree ${pid} cleanup failed: ${errorText(taskkillFailure)}`);
   }
   if (child.exitCode === null && child.signalCode === null) {
     child.kill("SIGKILL");
@@ -309,8 +323,19 @@ function isTaskkillMissingProcess(error: unknown): boolean {
   return error instanceof Error && "code" in error && error.code === 128;
 }
 
-function validPid(value: unknown): value is number {
+/** A process identifier this package is willing to signal or record. */
+export function isValidPid(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+/** Existence probe. A denied signal still proves the process exists. */
+export function isProcessAlive(pid: number, killProcess: ProcessKiller = process.kill): boolean {
+  try {
+    killProcess(pid, 0);
+    return true;
+  } catch (error) {
+    return !isMissingProcess(error);
+  }
 }
 
 function isMissingProcess(error: unknown): boolean {
@@ -344,8 +369,4 @@ function errorDetails(error: unknown): string {
     .filter((field) => field in error)
     .map((field) => `${field}=${String((error as unknown as Record<string, unknown>)[field])}`);
   return fields.length > 0 ? `${error.message} [${fields.join(" ")}]` : error.message;
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

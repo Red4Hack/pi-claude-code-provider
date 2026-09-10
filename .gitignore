@@ -23,5 +23,8 @@ dist/
 .pi-subagents/
 .ralph/
 .claude/settings.local.json
+# Locally captured Claude Code protocol. Regenerate with
+# `npm run capture:claude-protocol`; the committed help capture stays.
+test/support/captured/*-protocol.jsonl
 .DS_Store
 Thumbs.db

@@ -1,7 +1,9 @@
 import type { AssistantMessageEventStream, ToolCall } from "@earendil-works/pi-ai";
 import { ClaudeCodeError } from "./errors.ts";
 import {
+  formatRateLimitRejection,
   parseRateLimitNotice,
+  requireObject as object,
   terminalResultErrorDetail,
   validateClaudeInitialization,
   type RateLimitNoticeSink,
@@ -31,6 +33,13 @@ interface StreamEventEnvelope {
   apiKeySource?: string;
   rate_limit_info?: unknown;
 }
+
+/**
+ * Upper bound on the accumulated tool input that is re-parsed on every delta to
+ * keep a streaming preview available. Chosen well above ordinary tool calls and
+ * well below a large file write, whose deltas would otherwise cost quadratic work.
+ */
+const MAX_INCREMENTAL_PARSE_CHARS = 64 * 1024;
 
 /** Publishes Pi's provider-response observation once the transport handshake validates. Async observers gate body mapping. */
 export type ResponseAnnouncementSink = () => void | Promise<void>;
@@ -93,6 +102,11 @@ export class ClaudeEventMapper {
 
   get isTerminal(): boolean {
     return this.terminal;
+  }
+
+  /** Claude's validated init record proves the proposal server connected. */
+  get isInitialized(): boolean {
+    return this.initialized;
   }
 
   get hasSuccessfulResult(): boolean {
@@ -277,10 +291,16 @@ export class ClaudeEventMapper {
       block.thinkingSignature = `${block.thinkingSignature ?? ""}${delta.signature}`;
     } else if (delta.type === "input_json_delta" && block?.type === "toolCall" && typeof delta.partial_json === "string") {
       indexed.partialJson = `${indexed.partialJson ?? ""}${delta.partial_json}`;
-      try {
-        block.arguments = JSON.parse(indexed.partialJson) as Record<string, unknown>;
-      } catch {
-        // Partial JSON is expected until content_block_stop.
+      // Re-parsing every delta is quadratic in the size of a tool input, and a
+      // large file write reaches hundreds of kilobytes across thousands of
+      // deltas. The preview stops updating past the bound; content_block_stop
+      // still parses the complete input exactly once, which is authoritative.
+      if (indexed.partialJson.length <= MAX_INCREMENTAL_PARSE_CHARS) {
+        try {
+          block.arguments = JSON.parse(indexed.partialJson) as Record<string, unknown>;
+        } catch {
+          // Partial JSON is expected until content_block_stop.
+        }
       }
       this.stream.push({ type: "toolcall_delta", contentIndex: indexed.contentIndex, delta: delta.partial_json, partial: this.output });
     } else {
@@ -301,10 +321,13 @@ export class ClaudeEventMapper {
       if (indexed.partialJson) {
         try {
           const parsed = JSON.parse(indexed.partialJson) as unknown;
-          if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not an object");
+          if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not a JSON object");
           block.arguments = parsed as Record<string, unknown>;
-        } catch {
-          throw new ClaudeCodeError("tool_arguments", `Claude emitted invalid arguments for tool ${block.name}`);
+        } catch (error) {
+          throw new ClaudeCodeError(
+            "tool_arguments",
+            `Claude emitted invalid arguments for tool ${block.name}: ${toolArgumentDetail(error, indexed.partialJson)}`,
+          );
         }
       }
       this.stream.push({ type: "toolcall_end", contentIndex: indexed.contentIndex, toolCall: block as ToolCall, partial: this.output });
@@ -334,7 +357,13 @@ export class ClaudeEventMapper {
       this.fail(`Claude Code request failed${status}: ${terminalResultErrorDetail(record as Record<string, unknown>, this.assistantDiagnostic, this.rejectedRateLimit)}`);
       return;
     }
-    if (record.stop_reason !== null && record.stop_reason !== undefined && this.stopReason === undefined) {
+    // The terminal envelope states how the whole turn ended, so it outranks any
+    // stop reason seen mid-stream. Claude Code caps a response at
+    // CLAUDE_CODE_MAX_OUTPUT_TOKENS, reports `max_tokens` on that message, then
+    // continues and finishes the turn under a different stop reason. Keeping the
+    // first one reported a completed answer as truncated, and Pi discards a
+    // truncated compaction summary whole and pays for another one.
+    if (record.stop_reason !== null && record.stop_reason !== undefined) {
       this.stopReason = stopReason(record.stop_reason);
     }
     // Claude result envelopes make success explicit. Do not infer it from an
@@ -422,11 +451,7 @@ export class ClaudeEventMapper {
         // UI notifications are advisory and must never fail a provider request.
       }
     }
-    if (notice.status === "rejected") {
-      const reset = notice.resetsAt === undefined ? "" : `; resets at ${new Date(notice.resetsAt).toISOString()}`;
-      const reason = notice.overageDisabledReason === undefined ? "" : `; ${notice.overageDisabledReason}`;
-      this.rejectedRateLimit = `Claude rate limit rejected (${notice.rateLimitType})${reason}${reset}`;
-    }
+    if (notice.status === "rejected") this.rejectedRateLimit = formatRateLimitRejection(notice);
   }
 
   private applyModelUsage(value: unknown): void {
@@ -462,6 +487,31 @@ export class ClaudeEventMapper {
   }
 }
 
+/**
+ * Name the evidence rather than the cause: an input that ends mid-JSON is the
+ * signature of a response truncated at its output-token limit, while any other
+ * syntax error means the stream itself was corrupted. Report the size, never
+ * the content, which is model-authored tool input.
+ */
+function toolArgumentDetail(error: unknown, partialJson: string): string {
+  const bytes = Buffer.byteLength(partialJson);
+  const message = error instanceof Error ? error.message : String(error);
+  return endedPrematurely(message, partialJson)
+    ? `the streamed input ended after ${bytes} bytes without closing its JSON, which is what a response truncated at its output-token limit looks like`
+    : `the streamed input was not a JSON object after ${bytes} bytes (${message})`;
+}
+
+/**
+ * A truncated input can fail in several ways depending on where it was cut, so
+ * do not depend on one runtime's wording alone: a syntax error reported at the
+ * very end of the accumulated text says the same thing structurally.
+ */
+function endedPrematurely(message: string, partialJson: string): boolean {
+  if (/unexpected end of|unterminated/i.test(message)) return true;
+  const position = Number(/position (\d+)/.exec(message)?.[1]);
+  return Number.isInteger(position) && position >= partialJson.length - 1;
+}
+
 function stopReason(value: unknown): string {
   // Claude exposes this as a string rather than a closed enum. Pi only gives
   // special meaning to max_tokens and tool_use, so preserve future values as
@@ -485,11 +535,4 @@ function index(value: unknown): number {
 
 function isPromise(value: unknown): value is PromiseLike<void> {
   return typeof value === "object" && value !== null && typeof (value as { then?: unknown }).then === "function";
-}
-
-function object(value: unknown, field: string): Record<string, unknown> {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new ClaudeCodeError("protocol_shape", `${field} must be an object`);
-  }
-  return value as Record<string, unknown>;
 }

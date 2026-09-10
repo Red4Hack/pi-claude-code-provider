@@ -8,6 +8,7 @@ import { MODEL_ALIASES, type ModelAliasVersions } from "./claude-models.ts";
 import type { VersionStatus } from "./compatibility.ts";
 import { NEUTRAL_BUN_CONFIG, hostRuntimeDescription, needsBunConfig } from "./host-runtime.ts";
 import { superviseProcess } from "./process-utils.ts";
+import { headText } from "./text.ts";
 import type { RuntimeCleanupResult } from "./runtime-directories.ts";
 import type { ClaudeInstallation, RequestMetrics } from "./types.ts";
 
@@ -55,10 +56,10 @@ export async function probeBridge(timeoutMs = 10_000): Promise<BridgeProbeResult
     let stderr = "";
     let failure: string | undefined;
     child.stdout?.on("data", (chunk: Buffer) => {
-      stdout = `${stdout}${chunk.toString("utf8")}`.slice(0, 64 * 1024);
+      stdout = headText(stdout, chunk, 64 * 1024);
     });
     child.stderr?.on("data", (chunk: Buffer) => {
-      stderr = `${stderr}${chunk.toString("utf8")}`.slice(0, 4 * 1024);
+      stderr = headText(stderr, chunk, 4 * 1024);
     });
     const supervisor = superviseProcess(child, {
       idleTimeoutMs: timeoutMs,
@@ -133,8 +134,9 @@ export function formatDoctorSummary(input: DoctorSummaryInput): string {
     ? `; last request: ${metrics.requestedModel}/${metrics.effort}, ${metrics.messageCount} messages, ${metrics.estimatedInputTokens} estimated transport tokens, ${reportedUsage}, ${metrics.durationMs ?? 0}ms, ${metrics.stopReason ?? "unknown"}${metrics.errorCategory ? ` (${metrics.errorCategory})` : ""}${metrics.cleanupComplete ? "" : ", cleanup incomplete"}`
     : "; no request metrics recorded yet";
   const metricsLogSummary = input.metricsLogError ? `; metrics log error: ${input.metricsLogError}` : "";
-  const cleanupSummary = input.runtimeCleanup.removed > 0 || input.runtimeCleanup.failures > 0
-    ? `; stale runtime cleanup: ${input.runtimeCleanup.removed} removed, ${input.runtimeCleanup.failures} ${input.runtimeCleanup.failures === 1 ? "failure" : "failures"}`
+  const cleanup = input.runtimeCleanup;
+  const cleanupSummary = cleanup.removed > 0 || cleanup.failures > 0 || cleanup.reaped > 0
+    ? `; stale runtime cleanup: ${cleanup.removed} removed, ${cleanup.reaped} abandoned Claude ${cleanup.reaped === 1 ? "process" : "processes"} terminated, ${cleanup.failures} ${cleanup.failures === 1 ? "failure" : "failures"}`
     : "";
   const bridgeSummary = input.bridgeProbe
     ? `; bridge ${input.bridgeProbe.ok ? "ok" : "BROKEN"} via ${formatBridgeArgv(input.bridgeProbe.argv)} (${input.bridgeProbe.detail})`

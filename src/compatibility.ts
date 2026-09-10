@@ -1,5 +1,3 @@
-import { release } from "node:os";
-
 export const VERIFIED_VERSIONS = Object.freeze({
   pi: "0.85.1",
   claudeCode: "2.1.261",
@@ -16,7 +14,7 @@ export const MINIMUM_VERSIONS = Object.freeze({
   claudeCode: "2.1.261",
 });
 
-const VERIFIED_PLATFORMS = "WSL2 Ubuntu/linux-x64; native Windows/win32-x64; macOS/darwin";
+const VERIFIED_PLATFORMS = "Linux/linux-x64, including WSL2; native Windows/win32-x64; macOS/darwin";
 
 // Which family an alias must serve, not which dated model. Claude Code refreshes
 // model versions on its own schedule; pinning exact ids only guarantees the paid
@@ -56,8 +54,6 @@ export function meetsMinimumVersion(current: string, minimum: string): boolean {
 export function platformStatus(
   platform: NodeJS.Platform = process.platform,
   architecture: string = process.arch,
-  kernelRelease: string = release(),
-  wslDistribution: string | undefined = process.env.WSL_DISTRO_NAME,
 ): VersionStatus {
   const current = `${platform}/${architecture}`;
   if (platform === "win32" && architecture === "x64") {
@@ -77,12 +73,12 @@ export function platformStatus(
       warning: `${current} is unverified; the native Windows verified baseline is x64`,
     };
   }
-  if (
-    platform === "linux" &&
-    architecture === "x64" &&
-    /microsoft.*wsl2/i.test(kernelRelease) &&
-    /^ubuntu(?:-|$)/i.test(wslDistribution ?? "")
-  ) {
+  // Verified across distributions rather than for WSL2 Ubuntu alone: the gate
+  // runs on linux/x64, which is exactly what WSL2 Ubuntu is, and nothing here
+  // takes a different code path on another distribution or kernel. The same
+  // reasoning applies to macOS architectures below. Architecture still counts,
+  // because that is what decides which Claude Code build is installed at all.
+  if (platform === "linux" && architecture === "x64") {
     return {
       component: "Platform",
       current,

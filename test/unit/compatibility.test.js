@@ -62,9 +62,15 @@ test("startup platform acknowledgement is exact and preserves diagnostic metadat
 });
 
 test("reports verified and candidate platforms accurately", () => {
-  assert.equal(platformStatus("linux", "x64", "6.6.87.2-microsoft-standard-WSL2", "Ubuntu-26.04").isVerified, true);
-  assert.equal(platformStatus("linux", "x64", "6.8.0-generic").isVerified, false);
-  assert.equal(platformStatus("linux", "arm64", "6.6-microsoft-standard-WSL2", "Ubuntu").isVerified, false);
+  // Linux is verified by platform and architecture, not by distribution: WSL2
+  // Ubuntu is linux/x64, and no distribution takes a different code path here.
+  for (const linux of [platformStatus("linux", "x64")]) {
+    assert.equal(linux.isVerified, true);
+    assert.equal(linux.warning, undefined);
+    assert.match(linux.verified, /Linux\/linux-x64, including WSL2/);
+  }
+  assert.equal(platformStatus("linux", "arm64").isVerified, false);
+  assert.match(platformStatus("linux", "arm64").warning, /compatibility candidate/);
   // macOS is verified by platform, not by architecture: an Intel Mac takes the
   // same code path, so a per-arch split would warn without a reason to.
   for (const architecture of ["arm64", "x64"]) {

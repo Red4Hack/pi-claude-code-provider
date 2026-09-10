@@ -7,13 +7,15 @@ import { baseClaudeArgs } from "./claude-args.ts";
 import { buildClaudeEnvironment, claudeLaunch } from "./auth.ts";
 import { appendCleanupFailure, ClaudeCodeError, errorText } from "./errors.ts";
 import { JsonlParser } from "./jsonl.ts";
+import { tailText } from "./text.ts";
 import { recordSearchMetrics } from "./metrics.ts";
 import { claimPaidTestLaunch } from "./paid-launch-budget.ts";
 import { ProcessTerminationError, superviseProcess, type ProcessSupervisor } from "./process-utils.ts";
 import { createRuntimeDirectory, recordRuntimeChild, removeRuntimeDirectory } from "./runtime-directories.ts";
-import { parseRateLimitNotice, terminalResultErrorDetail, type RateLimitNoticeSink, validateClaudeInitialization } from "./claude-protocol.ts";
+import { formatRateLimitRejection, parseRateLimitNotice, terminalResultErrorDetail, type RateLimitNoticeSink, validateClaudeInitialization } from "./claude-protocol.ts";
 
 const MAX_CAPTURE_BYTES = 2 * 1024 * 1024;
+const MAX_STDERR_BYTES = 64 * 1024;
 const MAX_REQUEST_BYTES = 64 * 1024;
 const SEARCH_TIMEOUT_MS = 180_000;
 /** Internal dependency seam for deterministic cleanup-failure tests. */
@@ -195,7 +197,7 @@ export async function searchWithClaude(
       }
     });
     child.stderr?.on("data", (chunk: Buffer) => {
-      stderr = `${stderr}${chunk.toString("utf8")}`.slice(-64 * 1024);
+      stderr = tailText(stderr, chunk, MAX_STDERR_BYTES);
     });
     const processResult = await supervisor.wait();
     metrics.exitCode = processResult.code;
@@ -328,10 +330,7 @@ class SearchProtocol {
         } catch {
           // UI notifications are advisory and must never fail a search request.
         }
-        if (notice.status === "rejected") {
-          const reset = notice.resetsAt === undefined ? "" : `; resets at ${new Date(notice.resetsAt).toISOString()}`;
-          this.rateLimitFailure = `Claude rate limit rejected (${notice.rateLimitType})${reset}`;
-        }
+        if (notice.status === "rejected") this.rateLimitFailure = formatRateLimitRejection(notice);
       }
     } else if (
       record.type !== "stream_event" &&

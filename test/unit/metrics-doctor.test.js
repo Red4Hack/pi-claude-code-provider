@@ -125,7 +125,7 @@ test("metrics logging exposes only a sanitized latest failure", async () => {
     }
 });
 function doctorBase() {
-    return { platformStatus: platformStatus("linux", "x64", "6.6-microsoft-standard-WSL2", "Ubuntu"), piStatus: versionStatus("Pi", "1", "1"), claudeStatus: versionStatus("Claude Code", "2", "1"), installation: { executable: "/usr/bin/claude", version: "2", subscriptionType: "pro" }, modelIds: ["sonnet"], runtimeCleanup: { removed: 0, failures: 0 } };
+    return { platformStatus: platformStatus("linux", "x64"), piStatus: versionStatus("Pi", "1", "1"), claudeStatus: versionStatus("Claude Code", "2", "1"), installation: { executable: "/usr/bin/claude", version: "2", subscriptionType: "pro" }, modelIds: ["sonnet"], runtimeCleanup: { removed: 0, failures: 0, reaped: 0 } };
 }
 test("doctor names the model each alias would be served, or says it cannot", () => {
     const base = { ...doctorBase(), modelIds: ["sonnet", "fable", "opus", "haiku"] };
@@ -145,7 +145,7 @@ test("doctor names the model each alias would be served, or says it cannot", () 
 });
 
 test("doctor summary handles absent, successful, and failed request diagnostics", () => {
-    const base = { platformStatus: platformStatus("linux", "x64", "6.6-microsoft-standard-WSL2", "Ubuntu"), piStatus: versionStatus("Pi", "1", "1"), claudeStatus: versionStatus("Claude Code", "2", "1"), installation: { executable: "/usr/bin/claude", version: "2", subscriptionType: "pro" }, modelIds: ["sonnet"], runtimeCleanup: { removed: 0, failures: 0 } };
+    const base = { platformStatus: platformStatus("linux", "x64"), piStatus: versionStatus("Pi", "1", "1"), claudeStatus: versionStatus("Claude Code", "2", "1"), installation: { executable: "/usr/bin/claude", version: "2", subscriptionType: "pro" }, modelIds: ["sonnet"], runtimeCleanup: { removed: 0, failures: 0, reaped: 0 } };
     assert.match(formatDoctorSummary(base), /no request metrics recorded/);
     assert.match(formatDoctorSummary({ ...base, metrics }), /1000 estimated transport tokens.*30 input, 10 cache read, 20 cache write, 16\.67% cache hit.*250ms.*stop/);
     assert.match(formatDoctorSummary({ ...base, metrics: { ...metrics, cacheRead: 0, cacheWrite: 0, cacheHitPercent: 0 } }), /30 input, 0 cache read, 0 cache write, 0% cache hit/);
@@ -153,7 +153,10 @@ test("doctor summary handles absent, successful, and failed request diagnostics"
     const failed = formatDoctorSummary({ ...base, metrics: { ...metrics, stopReason: "error", errorCategory: "protocol" } });
     assert.match(failed, /error \(protocol\)/);
     assert.match(formatDoctorSummary({ ...base, metricsLogError: "EACCES" }), /metrics log error: EACCES/);
-    assert.match(formatDoctorSummary({ ...base, runtimeCleanup: { removed: 2, failures: 1 } }), /stale runtime cleanup: 2 removed, 1 failure/);
+    assert.match(formatDoctorSummary({ ...base, runtimeCleanup: { removed: 2, failures: 1, reaped: 0 } }), /stale runtime cleanup: 2 removed, 0 abandoned Claude processes terminated, 1 failure/);
+    // An abandoned Claude process group that outlived its Pi host is reported on
+    // its own: it explains both a reclaimed machine and a spent subscription slot.
+    assert.match(formatDoctorSummary({ ...base, runtimeCleanup: { removed: 1, failures: 0, reaped: 1 } }), /1 removed, 1 abandoned Claude process terminated, 0 failures/);
     assert.match(formatDoctorSummary({ ...base, metrics: { ...metrics, cleanupComplete: false, errorCategory: "process_cleanup" } }), /process_cleanup.*cleanup incomplete/);
     assert.doesNotMatch(failed, /prompt|secret|pi-claude-code-provider-/i);
 });
@@ -164,7 +167,7 @@ test("diagnostic reports are bounded, private, redacted, and content-free", asyn
         piStatus: versionStatus("Pi", "1", "1"),
         preflightError: new ClaudeCodeError("executable_missing", `Claude missing below ${homedir()}`),
         metrics,
-        runtimeCleanup: { removed: 2, failures: 1 },
+        runtimeCleanup: { removed: 2, failures: 1, reaped: 0 },
     });
     try {
         if (process.platform !== "win32") {

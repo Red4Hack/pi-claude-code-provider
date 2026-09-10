@@ -405,3 +405,36 @@ test("an occupied permanent web-search name is preserved with a prefixed warning
         await rm(directory, { recursive: true, force: true });
     }
 });
+
+test("an exhausted subscription window reaches Pi as a stop, not as a retryable throttle", async () => {
+    const { directory, executable } = await createFakeClaude();
+    const original = process.env.PI_CLAUDE_CODE_PROVIDER_PATH;
+    process.env.PI_CLAUDE_CODE_PROVIDER_PATH = executable;
+    try {
+        const pi = fakePi();
+        await piClaudeCodeProvider(pi.api);
+        const handler = pi.handlers.get("message_end")[0];
+        const limited = {
+            role: "assistant",
+            provider: "pi-claude-code-provider",
+            stopReason: "error",
+            errorMessage: "Claude Code request failed (429): You've hit your session limit · resets 3:50am (America/Sao_Paulo)",
+        };
+        // Pi restarts a turn whose failure text looks like a transient 429, which
+        // spends one Claude launch per attempt and cannot succeed until the window
+        // resets. The quota marker is what makes Pi stop instead.
+        const rewritten = handler({ message: limited }, {});
+        assert.equal(rewritten.message.errorMessage, `quota exceeded: ${limited.errorMessage}`);
+        assert.equal(handler({ message: rewritten.message }, {}), undefined);
+        // A transient failure keeps its retryable wording, and another provider's
+        // message is never rewritten at all.
+        assert.equal(handler({ message: { ...limited, errorMessage: "Claude Code request failed (529): overloaded" } }, {}), undefined);
+        assert.equal(handler({ message: { ...limited, provider: "anthropic" } }, { model: { provider: "anthropic" } }), undefined);
+        assert.equal(handler({ message: { ...limited, stopReason: "stop" } }, {}), undefined);
+    }
+    finally {
+        if (original === undefined) delete process.env.PI_CLAUDE_CODE_PROVIDER_PATH;
+        else process.env.PI_CLAUDE_CODE_PROVIDER_PATH = original;
+        await rm(directory, { recursive: true, force: true });
+    }
+});

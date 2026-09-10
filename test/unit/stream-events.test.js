@@ -596,3 +596,102 @@ test("surfaces a throwing response announcement to the protocol caller", () => {
     });
     assert.throws(() => init(mapper), /observer exploded/);
 });
+
+function toolMapperWithOpenBlock() {
+    const stream = createAssistantMessageEventStream();
+    const output = createOutput(model);
+    const mapper = makeMapper(stream, output, new Set(["mcp__pi__write"]), new Map([["mcp__pi__write", "write"]]), () => { });
+    mapper.accept(initRecord(["mcp__pi__write"], [{ name: "pi", status: "connected" }]));
+    mapper.accept({ type: "stream_event", event: { type: "message_start", message: { id: "msg_tool", model: "claude-sonnet-5", usage: {} } } });
+    mapper.accept({ type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "call_1", name: "mcp__pi__write" } } });
+    return { stream, output, mapper };
+}
+
+test("names the evidence when a tool input never closes its JSON", async () => {
+    const { mapper } = toolMapperWithOpenBlock();
+    const partial = `{"path":"notes.md","content":"${"a".repeat(300)}`;
+    mapper.accept({ type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: partial } } });
+    // A tool input that stops mid-JSON is what a response truncated at its
+    // output-token limit looks like, and the old bare message sent people hunting
+    // for a protocol bug instead.
+    assert.throws(
+        () => mapper.accept({ type: "stream_event", event: { type: "content_block_stop", index: 0 } }),
+        (error) => /invalid arguments for tool write/.test(error.message)
+            && /ended after \d+ bytes without closing its JSON/.test(error.message)
+            && /output-token limit/.test(error.message)
+            && !error.message.includes("aaa"),
+    );
+});
+
+test("distinguishes a corrupted tool input from a truncated one", async () => {
+    const { mapper } = toolMapperWithOpenBlock();
+    mapper.accept({ type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: "[1,2,3]" } } });
+    assert.throws(
+        () => mapper.accept({ type: "stream_event", event: { type: "content_block_stop", index: 0 } }),
+        (error) => /was not a JSON object after 7 bytes/.test(error.message) && !/output-token limit/.test(error.message),
+    );
+});
+
+test("streams a preview for ordinary tool inputs and stops previewing an oversized one", async () => {
+    const { output, mapper } = toolMapperWithOpenBlock();
+    mapper.accept({ type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: '{"path":"a.md","content":"' } } });
+    mapper.accept({ type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: 'hi"}' } } });
+    assert.deepEqual(output.content[0].arguments, { path: "a.md", content: "hi" });
+    // Past the preview bound the partial view stops updating, but the complete
+    // input is still parsed exactly once at content_block_stop.
+    const { output: large, mapper: largeMapper } = toolMapperWithOpenBlock();
+    const bulk = "b".repeat(80 * 1024);
+    largeMapper.accept({ type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: `{"path":"a.md","content":"${bulk}` } } });
+    assert.deepEqual(large.content[0].arguments, {});
+    largeMapper.accept({ type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: '"}' } } });
+    largeMapper.accept({ type: "stream_event", event: { type: "content_block_stop", index: 0 } });
+    assert.equal(large.content[0].arguments.content, bulk);
+});
+
+test("a turn Claude continued past its output cap is not reported as truncated", async () => {
+    const stream = createAssistantMessageEventStream();
+    const output = createOutput(model);
+    const mapper = makeMapper(stream, output, new Set(), new Map(), () => { });
+    init(mapper);
+    mapper.accept({ type: "stream_event", event: { type: "message_start", message: { id: "msg_capped", model: "claude-sonnet-5", usage: {} } } });
+    mapper.accept({ type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } } });
+    mapper.accept({ type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "1 2 3" } } });
+    mapper.accept({ type: "stream_event", event: { type: "content_block_stop", index: 0 } });
+    // Captured from a real Claude Code run under CLAUDE_CODE_MAX_OUTPUT_TOKENS:
+    // it reports max_tokens on each capped message, then continues and finishes.
+    mapper.accept({ type: "stream_event", event: { type: "message_delta", delta: { stop_reason: "max_tokens" }, usage: {} } });
+    mapper.accept({ type: "stream_event", event: { type: "message_delta", delta: { stop_reason: "max_tokens" }, usage: {} } });
+    mapper.accept({ type: "stream_event", event: { type: "message_stop" } });
+    mapper.accept({ type: "result", is_error: false, result: "1 2 3", stop_reason: "stop_sequence" });
+    mapper.completeResult();
+    const result = await stream.result();
+    // Pi throws away a summary that stopped at its cap, so a completed turn
+    // reported as "length" costs a whole compaction and buys nothing.
+    assert.equal(result.stopReason, "stop");
+});
+
+test("a turn that really ended at its cap is still reported as truncated", async () => {
+    const stream = createAssistantMessageEventStream();
+    const output = createOutput(model);
+    const mapper = makeMapper(stream, output, new Set(), new Map(), () => { });
+    init(mapper);
+    mapper.accept({ type: "stream_event", event: { type: "message_start", message: { id: "msg_cut", model: "claude-sonnet-5", usage: {} } } });
+    mapper.accept({ type: "stream_event", event: { type: "message_delta", delta: { stop_reason: "max_tokens" }, usage: {} } });
+    mapper.accept({ type: "stream_event", event: { type: "message_stop" } });
+    mapper.accept({ type: "result", is_error: false, result: "cut", stop_reason: "max_tokens" });
+    mapper.completeResult();
+    assert.equal((await stream.result()).stopReason, "length");
+});
+
+test("a result without a stop reason keeps the one seen mid-stream", async () => {
+    const stream = createAssistantMessageEventStream();
+    const output = createOutput(model);
+    const mapper = makeMapper(stream, output, new Set(), new Map(), () => { });
+    init(mapper);
+    mapper.accept({ type: "stream_event", event: { type: "message_start", message: { id: "msg_silent", model: "claude-sonnet-5", usage: {} } } });
+    mapper.accept({ type: "stream_event", event: { type: "message_delta", delta: { stop_reason: "max_tokens" }, usage: {} } });
+    mapper.accept({ type: "stream_event", event: { type: "message_stop" } });
+    mapper.accept({ type: "result", is_error: false, result: "cut", stop_reason: null });
+    mapper.completeResult();
+    assert.equal((await stream.result()).stopReason, "length");
+});

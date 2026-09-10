@@ -5,7 +5,12 @@
   "description": "Use a Claude Code subscription as a model provider in Pi through the approved non-interactive mode and without Anthropic's Agents SDK.",
   "author": "chem <sineverbisnon@gmail.com>",
   "license": "MIT",
-  "keywords": ["pi-package", "pi-extension", "claude-code", "subscription"],
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "claude-code",
+    "subscription"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/chem/pi-claude-code-provider.git"
@@ -29,14 +34,18 @@
     "access": "public"
   },
   "pi": {
-    "extensions": ["./extensions/pi-claude-code-provider.ts"]
+    "extensions": [
+      "./extensions/pi-claude-code-provider.ts"
+    ]
   },
   "scripts": {
     "setup:dev": "npm --prefix tooling ci --ignore-scripts",
     "typecheck": "node scripts/typecheck.js",
     "check": "node scripts/check.js && npm run typecheck",
     "capture:claude-surface": "node scripts/capture-claude-surface.js",
+    "capture:claude-protocol": "node scripts/capture-claude-protocol.js",
     "test": "node --import ./test/support/register-pi-loader.js --test test/unit/*.test.js",
+    "test:local": "node scripts/local-test.js",
     "release:check": "npm run check && npm test && node scripts/release-check.js",
     "prepublishOnly": "npm run check && npm test",
     "test:paid:smoke": "node scripts/paid-test-runner.js smoke",
@@ -56,9 +65,15 @@
     "typebox": "*"
   },
   "peerDependenciesMeta": {
-    "@earendil-works/pi-ai": { "optional": true },
-    "@earendil-works/pi-coding-agent": { "optional": true },
-    "typebox": { "optional": true }
+    "@earendil-works/pi-ai": {
+      "optional": true
+    },
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "typebox": {
+      "optional": true
+    }
   },
   "engines": {
     "node": ">=22.19.0"
