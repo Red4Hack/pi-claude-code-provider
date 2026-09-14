@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
-import { ClaudeEventMapper as EventMapper } from "../../src/stream-events.ts";
+import { ClaudeEventMapper as EventMapper, argumentPreviewDue } from "../../src/stream-events.ts";
 import { createOutput } from "../../src/output.ts";
 import { PROVIDER_INIT_FIELDS, initRecord as claudeInitRecord } from "../support/claude-fixture.js";
 
@@ -9,9 +9,6 @@ function makeMapper(stream, output, expectedTools, toolNames, onToolUse, onRateL
     return new EventMapper({ stream, output, expectedTools, toolNames, onToolUse, onRateLimitNotice, onResponseAnnouncement });
 }
 
-function ClaudeEventMapper(...args) {
-    return makeMapper(...args);
-}
 const model = {
     id: "sonnet",
     name: "Sonnet",
@@ -82,7 +79,7 @@ test("preserves mixed content and multiple tool calls by Pi content index", asyn
     const stream = createAssistantMessageEventStream();
     const output = createOutput(model);
     let toolUse = false;
-    const mapper = new ClaudeEventMapper(
+    const mapper = makeMapper(
         stream,
         output,
         new Set(["mcp__pi__read", "mcp__pi__search"]),
@@ -135,7 +132,7 @@ test("preserves mixed content and multiple tool calls by Pi content index", asyn
 });
 test("rejects unexpected initialization tools", () => {
     const stream = createAssistantMessageEventStream();
-    const mapper = new ClaudeEventMapper(stream, createOutput(model), new Set(), new Map(), () => { });
+    const mapper = makeMapper(stream, createOutput(model), new Set(), new Map(), () => { });
     assert.throws(() => mapper.accept(initRecord(["Bash"])), /unexpected tool/);
 });
 function init(mapper) {
@@ -156,7 +153,7 @@ function exactToolTerminationResult(overrides = {}) {
 function readyToolMapper(stopReason = "tool_use") {
     const stream = createAssistantMessageEventStream();
     const output = createOutput(model);
-    const mapper = new ClaudeEventMapper(stream, output, new Set(["mcp__pi__read"]), new Map([["mcp__pi__read", "read"]]), () => { });
+    const mapper = makeMapper(stream, output, new Set(["mcp__pi__read"]), new Map([["mcp__pi__read", "read"]]), () => { });
     mapper.accept(initRecord(["mcp__pi__read"], [{ name: "pi", status: "connected" }]));
     mapper.accept({ type: "stream_event", event: { type: "message_start", message: { id: "msg_tool_ack", model: "claude-sonnet-5", usage: {} } } });
     mapper.accept({ type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "toolu_ack", name: "mcp__pi__read", input: {} } } });
@@ -166,20 +163,20 @@ function readyToolMapper(stopReason = "tool_use") {
     return { stream, output, mapper };
 }
 test("rejects duplicate initialization, unknown records, and invalid event ordering", () => {
-    const mapper = new ClaudeEventMapper(createAssistantMessageEventStream(), createOutput(model), new Set(), new Map(), () => { });
+    const mapper = makeMapper(createAssistantMessageEventStream(), createOutput(model), new Set(), new Map(), () => { });
     init(mapper);
     assert.throws(() => init(mapper), /duplicate initialization/);
-    const unknown = new ClaudeEventMapper(createAssistantMessageEventStream(), createOutput(model), new Set(), new Map(), () => { });
+    const unknown = makeMapper(createAssistantMessageEventStream(), createOutput(model), new Set(), new Map(), () => { });
     init(unknown);
     assert.throws(() => unknown.accept({ type: "future_protocol_record" }), /Unsupported Claude record/);
-    const ordering = new ClaudeEventMapper(createAssistantMessageEventStream(), createOutput(model), new Set(), new Map(), () => { });
+    const ordering = makeMapper(createAssistantMessageEventStream(), createOutput(model), new Set(), new Map(), () => { });
     init(ordering);
     assert.throws(() => ordering.accept({ type: "stream_event", event: { type: "content_block_stop", index: 0 } }), /before message_start/);
 });
 test("maps result-only fallback text, served limits, and cache details", async () => {
     const stream = createAssistantMessageEventStream();
     const output = createOutput(model);
-    const mapper = new ClaudeEventMapper(stream, output, new Set(), new Map(), () => { });
+    const mapper = makeMapper(stream, output, new Set(), new Map(), () => { });
     const events = [];
     const consume = (async () => {
         for await (const event of stream)
@@ -203,7 +200,7 @@ test("maps result-only fallback text, served limits, and cache details", async (
 test("maps an explicit Claude error result to one terminal error", async () => {
     const stream = createAssistantMessageEventStream();
     const output = createOutput(model);
-    const mapper = new ClaudeEventMapper(stream, output, new Set(), new Map(), () => { });
+    const mapper = makeMapper(stream, output, new Set(), new Map(), () => { });
     const events = [];
     const consume = (async () => {
         for await (const event of stream)
@@ -220,7 +217,7 @@ test("maps an explicit Claude error result to one terminal error", async () => {
 test("keeps assistant and loop diagnostics when the result text is empty", async () => {
     const stream = createAssistantMessageEventStream();
     const output = createOutput(model);
-    const mapper = new ClaudeEventMapper(stream, output, new Set(), new Map(), () => { });
+    const mapper = makeMapper(stream, output, new Set(), new Map(), () => { });
     init(mapper);
     mapper.accept({ type: "assistant", error: "rate_limit", message: { content: [{ type: "text", text: "You're out of usage credits" }] } });
     mapper.accept({ type: "result", subtype: "success", is_error: true, api_error_status: 429, result: "", errors: ["loop detail"] });
@@ -285,18 +282,19 @@ test("does not reinterpret a tool acknowledgement after caller abort", async () 
 });
 test("rejects a tool acknowledgement while arguments remain incomplete", () => {
     const stream = createAssistantMessageEventStream();
-    const mapper = new ClaudeEventMapper(stream, createOutput(model), new Set(["mcp__pi__read"]), new Map([["mcp__pi__read", "read"]]), () => { });
+    const mapper = makeMapper(stream, createOutput(model), new Set(["mcp__pi__read"]), new Map([["mcp__pi__read", "read"]]), () => { });
     mapper.accept(initRecord(["mcp__pi__read"], [{ name: "pi", status: "connected" }]));
     mapper.accept({ type: "stream_event", event: { type: "message_start", message: { id: "msg_open", model: "claude-sonnet-5", usage: {} } } });
     mapper.accept({ type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "toolu_open", name: "mcp__pi__read", input: {} } } });
     assert.throws(() => mapper.accept(exactToolTerminationResult(), "tool_handoff"), /unclosed content blocks/);
 });
-test("emits validated rate-limit notices once and retains rejected diagnostics", () => {
+test("emits validated rate-limit notices and retains rejected diagnostics", () => {
+    // Repeats are de-duplicated per session by the extension, not here; see
+    // extension.test.js "reports a repeated rate-limit warning once per session".
     const notices = [];
-    const mapper = new ClaudeEventMapper(createAssistantMessageEventStream(), createOutput(model), new Set(), new Map(), () => { }, (notice) => notices.push(notice));
+    const mapper = makeMapper(createAssistantMessageEventStream(), createOutput(model), new Set(), new Map(), () => { }, (notice) => notices.push(notice));
     init(mapper);
     mapper.accept({ type: "rate_limit_event", rate_limit_info: { status: "allowed" } });
-    mapper.accept({ type: "rate_limit_event", rate_limit_info: { status: "allowed_warning", rateLimitType: "five_hour", utilization: 0.876 } });
     mapper.accept({ type: "rate_limit_event", rate_limit_info: { status: "allowed_warning", rateLimitType: "five_hour", utilization: 0.876 } });
     mapper.accept({ type: "rate_limit_event", rate_limit_info: { status: "rejected", rateLimitType: "five_hour", resetsAt: 1_800_000_000 } });
     assert.deepEqual(notices, [
@@ -308,13 +306,13 @@ test("emits validated rate-limit notices once and retains rejected diagnostics",
 });
 test("does not double-convert epoch-millisecond reset timestamps", () => {
     const notices = [];
-    const mapper = new ClaudeEventMapper(createAssistantMessageEventStream(), createOutput(model), new Set(), new Map(), () => { }, (notice) => notices.push(notice));
+    const mapper = makeMapper(createAssistantMessageEventStream(), createOutput(model), new Set(), new Map(), () => { }, (notice) => notices.push(notice));
     init(mapper);
     mapper.accept({ type: "rate_limit_event", rate_limit_info: { status: "rejected", rateLimitType: "five_hour", resetsAt: 1_800_000_000_000 } });
     assert.deepEqual(notices, [{ status: "rejected", rateLimitType: "five_hour", resetsAt: 1_800_000_000_000 }]);
 });
 test("ignores malformed optional rate-limit fields and notification failures", () => {
-    const mapper = new ClaudeEventMapper(createAssistantMessageEventStream(), createOutput(model), new Set(), new Map(), () => { }, () => {
+    const mapper = makeMapper(createAssistantMessageEventStream(), createOutput(model), new Set(), new Map(), () => { }, () => {
         throw new Error("UI unavailable");
     });
     init(mapper);
@@ -334,7 +332,7 @@ test("ignores malformed optional rate-limit fields and notification failures", (
 });
 test("ignores a rejected overage while the plan window is healthy", () => {
     const notices = [];
-    const mapper = new ClaudeEventMapper(createAssistantMessageEventStream(), createOutput(model), new Set(), new Map(), () => { }, (notice) => notices.push(notice));
+    const mapper = makeMapper(createAssistantMessageEventStream(), createOutput(model), new Set(), new Map(), () => { }, (notice) => notices.push(notice));
     init(mapper);
     // A subscription without usage credits reports this on every event.
     mapper.accept({
@@ -359,7 +357,7 @@ test("ignores a rejected overage while the plan window is healthy", () => {
 });
 test("keeps the plan window and utilization when overage is merely disabled", () => {
     const notices = [];
-    const mapper = new ClaudeEventMapper(createAssistantMessageEventStream(), createOutput(model), new Set(), new Map(), () => { }, (notice) => notices.push(notice));
+    const mapper = makeMapper(createAssistantMessageEventStream(), createOutput(model), new Set(), new Map(), () => { }, (notice) => notices.push(notice));
     init(mapper);
     mapper.accept({
         type: "rate_limit_event",
@@ -383,7 +381,7 @@ test("keeps the plan window and utilization when overage is merely disabled", ()
 });
 test("retains overage context when the plan window is exhausted", () => {
     const notices = [];
-    const mapper = new ClaudeEventMapper(createAssistantMessageEventStream(), createOutput(model), new Set(), new Map(), () => { }, (notice) => notices.push(notice));
+    const mapper = makeMapper(createAssistantMessageEventStream(), createOutput(model), new Set(), new Map(), () => { }, (notice) => notices.push(notice));
     init(mapper);
     mapper.accept({
         type: "rate_limit_event",
@@ -410,7 +408,7 @@ test("retains overage context when the plan window is exhausted", () => {
 });
 test("escalates a rejected overage while the account is drawing on overage", () => {
     const notices = [];
-    const mapper = new ClaudeEventMapper(createAssistantMessageEventStream(), createOutput(model), new Set(), new Map(), () => { }, (notice) => notices.push(notice));
+    const mapper = makeMapper(createAssistantMessageEventStream(), createOutput(model), new Set(), new Map(), () => { }, (notice) => notices.push(notice));
     init(mapper);
     mapper.accept({
         type: "rate_limit_event",
@@ -437,7 +435,7 @@ test("escalates a rejected overage while the account is drawing on overage", () 
 test("maps redacted thinking into Pi's opaque thinking representation", async () => {
     const stream = createAssistantMessageEventStream();
     const output = createOutput(model);
-    const mapper = new ClaudeEventMapper(stream, output, new Set(), new Map(), () => { });
+    const mapper = makeMapper(stream, output, new Set(), new Map(), () => { });
     const events = [];
     const consume = (async () => {
         for await (const event of stream) events.push(event.type);
@@ -452,7 +450,7 @@ test("maps redacted thinking into Pi's opaque thinking representation", async ()
     assert.deepEqual(output.content[0], { type: "thinking", thinking: "", thinkingSignature: "opaque-encrypted-data", redacted: true });
     assert.deepEqual(events, ["start", "thinking_start", "thinking_end", "done"]);
 
-    const malformed = new ClaudeEventMapper(createAssistantMessageEventStream(), createOutput(model), new Set(), new Map(), () => { });
+    const malformed = makeMapper(createAssistantMessageEventStream(), createOutput(model), new Set(), new Map(), () => { });
     init(malformed);
     malformed.accept({ type: "stream_event", event: { type: "message_start", message: { id: "msg", model: "claude-sonnet-5", usage: {} } } });
     assert.throws(
@@ -462,7 +460,7 @@ test("maps redacted thinking into Pi's opaque thinking representation", async ()
 });
 test("rejects unsupported blocks, deltas, unclosed blocks, and events after stop", () => {
     const make = () => {
-        const mapper = new ClaudeEventMapper(createAssistantMessageEventStream(), createOutput(model), new Set(), new Map(), () => { });
+        const mapper = makeMapper(createAssistantMessageEventStream(), createOutput(model), new Set(), new Map(), () => { });
         init(mapper);
         mapper.accept({ type: "stream_event", event: { type: "message_start", message: { id: "msg", model: "claude-sonnet-5", usage: {} } } });
         return mapper;
@@ -481,7 +479,7 @@ test("rejects unsupported blocks, deltas, unclosed blocks, and events after stop
 });
 test("rejects malformed results and accepts future stop reasons", () => {
     const make = () => {
-        const mapper = new ClaudeEventMapper(createAssistantMessageEventStream(), createOutput(model), new Set(), new Map(), () => { });
+        const mapper = makeMapper(createAssistantMessageEventStream(), createOutput(model), new Set(), new Map(), () => { });
         init(mapper);
         mapper.accept({ type: "stream_event", event: { type: "message_start", message: { id: "msg", model: "claude-sonnet-5", usage: {} } } });
         return mapper;
@@ -501,14 +499,14 @@ test("rejects malformed results and accepts future stop reasons", () => {
 });
 test("preserves result errors and accepts future result stop reasons", async () => {
     const successStream = createAssistantMessageEventStream();
-    const successMapper = new ClaudeEventMapper(successStream, createOutput(model), new Set(), new Map(), () => { });
+    const successMapper = makeMapper(successStream, createOutput(model), new Set(), new Map(), () => { });
     init(successMapper);
     successMapper.accept({ type: "result", is_error: false, result: "declined", stop_reason: "refusal" });
     successMapper.completeResult();
     assert.equal((await successStream.result()).stopReason, "stop");
 
     const errorStream = createAssistantMessageEventStream();
-    const errorMapper = new ClaudeEventMapper(errorStream, createOutput(model), new Set(), new Map(), () => { });
+    const errorMapper = makeMapper(errorStream, createOutput(model), new Set(), new Map(), () => { });
     init(errorMapper);
     errorMapper.accept({
         type: "result",
@@ -526,7 +524,7 @@ test("announces one validated response before publishing any content", async () 
     const output = createOutput(model);
     assert.equal(output.stopReason, "pending");
     const observed = [];
-    const mapper = new ClaudeEventMapper(stream, output, new Set(), new Map(), () => { }, () => { }, () => observed.push(`announced:${output.stopReason}`));
+    const mapper = makeMapper(stream, output, new Set(), new Map(), () => { }, () => { }, () => observed.push(`announced:${output.stopReason}`));
     const consume = (async () => {
         for await (const event of stream)
             observed.push(event.type);
@@ -552,7 +550,7 @@ test("waits for an asynchronous response announcement before publishing start", 
     const announcement = new Promise((resolve) => {
         releaseAnnouncement = resolve;
     });
-    const mapper = new ClaudeEventMapper(
+    const mapper = makeMapper(
         stream,
         output,
         new Set(),
@@ -584,14 +582,14 @@ test("waits for an asynchronous response announcement before publishing start", 
 });
 test("does not announce a response when initialization is rejected", () => {
     let announcements = 0;
-    const mapper = new ClaudeEventMapper(createAssistantMessageEventStream(), createOutput(model), new Set(["mcp__pi__calculate"]), new Map(), () => { }, () => { }, () => {
+    const mapper = makeMapper(createAssistantMessageEventStream(), createOutput(model), new Set(["mcp__pi__calculate"]), new Map(), () => { }, () => { }, () => {
         announcements += 1;
     });
     assert.throws(() => mapper.accept(initRecord()));
     assert.equal(announcements, 0);
 });
 test("surfaces a throwing response announcement to the protocol caller", () => {
-    const mapper = new ClaudeEventMapper(createAssistantMessageEventStream(), createOutput(model), new Set(), new Map(), () => { }, () => { }, () => {
+    const mapper = makeMapper(createAssistantMessageEventStream(), createOutput(model), new Set(), new Map(), () => { }, () => { }, () => {
         throw new Error("observer exploded");
     });
     assert.throws(() => init(mapper), /observer exploded/);
@@ -630,22 +628,6 @@ test("distinguishes a corrupted tool input from a truncated one", async () => {
         () => mapper.accept({ type: "stream_event", event: { type: "content_block_stop", index: 0 } }),
         (error) => /was not a JSON object after 7 bytes/.test(error.message) && !/output-token limit/.test(error.message),
     );
-});
-
-test("streams a preview for ordinary tool inputs and stops previewing an oversized one", async () => {
-    const { output, mapper } = toolMapperWithOpenBlock();
-    mapper.accept({ type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: '{"path":"a.md","content":"' } } });
-    mapper.accept({ type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: 'hi"}' } } });
-    assert.deepEqual(output.content[0].arguments, { path: "a.md", content: "hi" });
-    // Past the preview bound the partial view stops updating, but the complete
-    // input is still parsed exactly once at content_block_stop.
-    const { output: large, mapper: largeMapper } = toolMapperWithOpenBlock();
-    const bulk = "b".repeat(80 * 1024);
-    largeMapper.accept({ type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: `{"path":"a.md","content":"${bulk}` } } });
-    assert.deepEqual(large.content[0].arguments, {});
-    largeMapper.accept({ type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: '"}' } } });
-    largeMapper.accept({ type: "stream_event", event: { type: "content_block_stop", index: 0 } });
-    assert.equal(large.content[0].arguments.content, bulk);
 });
 
 test("a turn Claude continued past its output cap is not reported as truncated", async () => {
@@ -694,4 +676,43 @@ test("a result without a stop reason keeps the one seen mid-stream", async () =>
     mapper.accept({ type: "result", is_error: false, result: "cut", stop_reason: null });
     mapper.completeResult();
     assert.equal((await stream.result()).stopReason, "length");
+});
+test("re-parses streamed tool-argument previews a bounded number of times", () => {
+    let parsedLength = 0;
+    let parses = 0;
+    for (let received = 100; received <= 1_000_000; received += 100) {
+        if (argumentPreviewDue(received, parsedLength)) {
+            parses += 1;
+            parsedLength = received;
+        }
+    }
+    // Parsing on every delta would rescan a growing string 10,000 times.
+    assert.ok(parses <= 60, `${parses} preview parses for 10,000 deltas`);
+});
+test("publishes a partial tool-argument preview before the call completes", () => {
+    const stream = createAssistantMessageEventStream();
+    const output = createOutput(model);
+    const mapper = makeMapper(stream, output, new Set(["mcp__pi__write"]), new Map([["mcp__pi__write", "write"]]), () => { });
+    mapper.accept(initRecord(["mcp__pi__write"], [{ name: "pi", status: "connected" }]));
+    mapper.accept({ type: "stream_event", event: { type: "message_start", message: { id: "msg_preview", model: "claude-sonnet-5", usage: {} } } });
+    mapper.accept({ type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "toolu_preview", name: "mcp__pi__write", input: {} } } });
+    const content = "x".repeat(100);
+    mapper.accept({ type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: `{"path":"notes.txt","content":"${content}` } } });
+    assert.equal(output.content[0].arguments.path, "notes.txt");
+    mapper.accept({ type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: '"}' } } });
+    mapper.accept({ type: "stream_event", event: { type: "content_block_stop", index: 0 } });
+    assert.deepEqual(output.content[0].arguments, { path: "notes.txt", content });
+});
+test("explains a cache-breakpoint limit rejection and names the escape hatch", async () => {
+    const stream = createAssistantMessageEventStream();
+    const mapper = makeMapper(stream, createOutput(model), new Set(), new Map(), () => { });
+    init(mapper);
+    mapper.accept({ type: "result", is_error: true, api_error_status: 400, result: "API Error: 400 A maximum of 4 blocks with cache_control may be provided. Found 5." });
+    const result = await stream.result();
+    assert.equal(mapper.cacheBreakpointLimit, true);
+    assert.match(result.errorMessage ?? "", /A maximum of 4 blocks with cache_control.*PI_CLAUDE_CODE_PROVIDER_TRANSCRIPT_BREAKPOINT=off/);
+    const unrelated = makeMapper(createAssistantMessageEventStream(), createOutput(model), new Set(), new Map(), () => { });
+    init(unrelated);
+    unrelated.accept({ type: "result", is_error: true, api_error_status: 429, result: "subscription limit reached" });
+    assert.equal(unrelated.cacheBreakpointLimit, false);
 });

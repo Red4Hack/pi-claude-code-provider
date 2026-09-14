@@ -130,19 +130,32 @@ export function formatDoctorSummary(input: DoctorSummaryInput): string {
     metrics && reportedPromptTokens > 0
       ? `reported usage: ${metrics.inputTokens} input, ${metrics.cacheRead} cache read, ${metrics.cacheWrite} cache write${metrics.cacheHitPercent === undefined ? "" : `, ${metrics.cacheHitPercent}% cache hit`}`
       : "reported token usage unavailable";
-  const requestSummary = metrics
-    ? `; last request: ${metrics.requestedModel}/${metrics.effort}, ${metrics.messageCount} messages, ${metrics.estimatedInputTokens} estimated transport tokens, ${reportedUsage}, ${metrics.durationMs ?? 0}ms, ${metrics.stopReason ?? "unknown"}${metrics.errorCategory ? ` (${metrics.errorCategory})` : ""}${metrics.cleanupComplete ? "" : ", cleanup incomplete"}`
-    : "; no request metrics recorded yet";
-  const metricsLogSummary = input.metricsLogError ? `; metrics log error: ${input.metricsLogError}` : "";
-  const cleanup = input.runtimeCleanup;
-  const cleanupSummary = cleanup.removed > 0 || cleanup.failures > 0 || cleanup.reaped > 0
-    ? `; stale runtime cleanup: ${cleanup.removed} removed, ${cleanup.reaped} abandoned Claude ${cleanup.reaped === 1 ? "process" : "processes"} terminated, ${cleanup.failures} ${cleanup.failures === 1 ? "failure" : "failures"}`
-    : "";
-  const bridgeSummary = input.bridgeProbe
-    ? `; bridge ${input.bridgeProbe.ok ? "ok" : "BROKEN"} via ${formatBridgeArgv(input.bridgeProbe.argv)} (${input.bridgeProbe.detail})`
-    : "";
+  // One labeled fact per line: this is read in a notification, not parsed.
+  const lines = [
+    verification,
+    `Runtime: ${hostRuntimeDescription()}`,
+    `Claude: ${input.installation.executable} (${input.installation.subscriptionType} subscription)`,
+    `Models: ${input.modelIds.join(", ")}`,
+  ];
   const servedModels = formatServedModels(input);
-  return `${verification}; runtime ${hostRuntimeDescription()}; Claude at ${input.installation.executable}; ${input.installation.subscriptionType} subscription; models: ${input.modelIds.join(", ")}${servedModels}${bridgeSummary}${requestSummary}${metricsLogSummary}${cleanupSummary}`;
+  if (servedModels) lines.push(`Served models (Claude Code install): ${servedModels}`);
+  if (input.bridgeProbe) {
+    lines.push(`Bridge: ${input.bridgeProbe.ok ? "ok" : "BROKEN"} via ${formatBridgeArgv(input.bridgeProbe.argv)} (${input.bridgeProbe.detail})`);
+  }
+  lines.push(metrics
+    ? `Last request: ${metrics.requestedModel}/${metrics.effort}, ${metrics.messageCount} messages, ${metrics.estimatedInputTokens} estimated transport tokens, ${reportedUsage}, ${metrics.durationMs ?? 0}ms, ${metrics.stopReason ?? "unknown"}${metrics.errorCategory ? ` (${metrics.errorCategory})` : ""}${metrics.cleanupComplete ? "" : ", cleanup incomplete"}`
+    : "Last request: no request metrics recorded yet");
+  if (input.metricsLogError) lines.push(`Metrics log error: ${input.metricsLogError}`);
+  const cleanup = input.runtimeCleanup;
+  if (cleanup.removed > 0 || cleanup.failures > 0 || cleanup.reaped > 0) {
+    // An abandoned Claude process group is named only when one was reclaimed:
+    // it explains both a freed machine and a spent subscription slot.
+    const reaped = cleanup.reaped > 0
+      ? `, ${cleanup.reaped} abandoned Claude ${cleanup.reaped === 1 ? "process" : "processes"} terminated`
+      : "";
+    lines.push(`Stale runtime cleanup: ${cleanup.removed} removed${reaped}, ${cleanup.failures} ${cleanup.failures === 1 ? "failure" : "failures"}`);
+  }
+  return lines.join("\n");
 }
 
 /**
@@ -163,5 +176,5 @@ function formatServedModels(input: DoctorSummaryInput): string {
       : "";
     return `${alias} ${model}${caveat}`;
   });
-  return `; models (Claude Code install): ${entries.join(", ")}`;
+  return entries.join(", ");
 }

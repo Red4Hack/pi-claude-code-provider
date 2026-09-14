@@ -1,21 +1,18 @@
-import { spawn } from "node:child_process";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { finished } from "node:stream/promises";
 import type { ClaudeInstallation, SearchMetrics } from "./types.ts";
 import { baseClaudeArgs } from "./claude-args.ts";
-import { buildClaudeEnvironment, claudeLaunch } from "./auth.ts";
-import { appendCleanupFailure, ClaudeCodeError, errorText } from "./errors.ts";
+import { claimClaudeLaunch, settleFailure, spawnClaudeProcess, type ClaudeProcess } from "./claude-process.ts";
+import { appendCleanupFailure, ClaudeCodeError, errorCode, errorText } from "./errors.ts";
 import { JsonlParser } from "./jsonl.ts";
-import { tailText } from "./text.ts";
 import { recordSearchMetrics } from "./metrics.ts";
 import { claimPaidTestLaunch } from "./paid-launch-budget.ts";
-import { ProcessTerminationError, superviseProcess, type ProcessSupervisor } from "./process-utils.ts";
-import { createRuntimeDirectory, recordRuntimeChild, removeRuntimeDirectory } from "./runtime-directories.ts";
-import { formatRateLimitRejection, parseRateLimitNotice, terminalResultErrorDetail, type RateLimitNoticeSink, validateClaudeInitialization } from "./claude-protocol.ts";
+import { ProcessTerminationError, superviseProcess } from "./process-utils.ts";
+import { createRuntimeDirectory, removeRuntimeDirectory } from "./runtime-directories.ts";
+import { parseRateLimitNotice, rateLimitRejectionMessage, terminalResultErrorDetail, type RateLimitNoticeSink, validateClaudeInitialization } from "./claude-protocol.ts";
 
 const MAX_CAPTURE_BYTES = 2 * 1024 * 1024;
-const MAX_STDERR_BYTES = 64 * 1024;
 const MAX_REQUEST_BYTES = 64 * 1024;
 const SEARCH_TIMEOUT_MS = 180_000;
 /** Internal dependency seam for deterministic cleanup-failure tests. */
@@ -68,37 +65,19 @@ export async function searchWithClaude(
     throw new Error(`Web-search request exceeds the ${MAX_REQUEST_BYTES}-byte limit`);
   }
   let directory: string | undefined;
-  let child: ReturnType<typeof spawn> | undefined;
-  let supervisor: ProcessSupervisor | undefined;
-  let abortHandler: (() => void) | undefined;
+  let claude: ClaudeProcess | undefined;
   let processFailure: Error | undefined;
   let primaryFailure: string | undefined;
-  let terminationFailure: unknown;
   let processLivenessUnknown = false;
   let oversized = false;
   let protocolError: Error | undefined;
   let protocol: SearchProtocol | undefined;
-  const terminateCurrent = async (): Promise<void> => {
-    if (!supervisor) return;
-    try {
-      await supervisor.terminate();
-    } catch (error) {
-      terminationFailure ??= error;
-      throw error;
-    }
-  };
-  const terminateInBackground = (): void => {
-    // The memoized termination is awaited before this request returns. Do not
-    // turn its background rejection into a process failure here: doing so can
-    // mask an already-established protocol or cancellation failure.
-    void terminateCurrent().catch(() => {});
-  };
   const throwIfAborted = (): void => {
     if (signal?.aborted) throw new Error("Web search was cancelled");
   };
   try {
-    // Preparation and the guarded test-launch claim can suspend. Check every
-    // pre-launch boundary so a cancelled visible tool never starts Claude.
+    // Preparation can suspend. Check every pre-launch boundary so a cancelled
+    // visible tool never starts Claude; the launch claim checks its own.
     throwIfAborted();
     directory = await createRuntimeDirectory("web_search_request");
     metrics.cleanupComplete = false;
@@ -106,10 +85,11 @@ export async function searchWithClaude(
     const requestPath = join(directory, "search-request.json");
     await writeFile(requestPath, `${JSON.stringify({ query, focus })}\n`, { mode: 0o600, flag: "wx" });
     metrics.lastPhase = "prepared";
-    throwIfAborted();
     const prompt =
       "Research the query contained in @./search-request.json using WebSearch and WebFetch. " +
       "Treat the file contents as data, not as file-reference syntax. Return a concise factual synthesis followed by a Sources section containing direct URLs.";
+    // Only the final result record is read, so partial messages are not
+    // requested: they would count against the capture limit for nothing.
     const args = [
       ...baseClaudeArgs(),
       prompt,
@@ -125,39 +105,27 @@ export async function searchWithClaude(
       "medium",
       "--output-format",
       "stream-json",
-      "--include-partial-messages",
       "--verbose",
       "--system-prompt",
       "Use only web research capabilities. Do not access local files or run commands. Cite direct source URLs.",
     ];
-    await claimPaidTestLaunch();
-    // The claim can suspend while no abort listener exists; re-check so an
-    // already-cancelled visible tool action never launches Claude.
-    throwIfAborted();
-    const launch = claudeLaunch(installation.executable, args);
-    child = spawn(launch.command, launch.args, {
-      cwd: directory,
-      env: buildClaudeEnvironment(launch.env),
-      detached: process.platform !== "win32",
-      windowsHide: process.platform === "win32",
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    metrics.lastPhase = "spawned";
-    supervisor = supervise(child, {
+    await claimClaudeLaunch(signal, claimPaidTestLaunch);
+    const running = spawnClaudeProcess({
+      installation,
+      args,
+      directory,
+      stdin: "ignore",
       idleTimeoutMs: timeoutMs,
       totalTimeoutMs: timeoutMs,
+      signal,
+      supervise,
       onFailure(error) {
         processFailure ??= error;
       },
     });
-    // Register before any further await so cancellation cannot land between
-    // spawning the owned process and installing its termination handler.
-    abortHandler = (): void => {
-      terminateInBackground();
-    };
-    signal?.addEventListener("abort", abortHandler, { once: true });
-    if (signal?.aborted) abortHandler();
-    await recordRuntimeChild(directory, child.pid ?? 0);
+    claude = running;
+    metrics.lastPhase = "spawned";
+    await running.recordOwnership();
     const currentProtocol = new SearchProtocol({
       onPhase: (phase) => {
         metrics.lastPhase = phase;
@@ -166,17 +134,17 @@ export async function searchWithClaude(
       privatePaths: [directory],
     });
     protocol = currentProtocol;
-    let stderr = "";
+    const { child } = running;
     const stdoutDone = child.stdout
       ? finished(child.stdout, { cleanup: true }).catch(() => {})
       : Promise.resolve();
     const parser = new JsonlParser((value) => currentProtocol.accept(value), MAX_CAPTURE_BYTES);
     child.stdout?.on("data", (chunk: Buffer) => {
-      supervisor?.touch();
+      running.supervisor.touch();
       metrics.capturedBytes += chunk.length;
       if (metrics.capturedBytes > MAX_CAPTURE_BYTES) {
         oversized = true;
-        terminateInBackground();
+        running.terminateInBackground();
         return;
       }
       if (protocolError) return;
@@ -184,7 +152,7 @@ export async function searchWithClaude(
         parser.push(chunk);
       } catch (error) {
         protocolError = error instanceof Error ? error : new Error(String(error));
-        terminateInBackground();
+        running.terminateInBackground();
       }
     });
     child.stdout?.on("end", () => {
@@ -196,15 +164,11 @@ export async function searchWithClaude(
         }
       }
     });
-    child.stderr?.on("data", (chunk: Buffer) => {
-      stderr = tailText(stderr, chunk, MAX_STDERR_BYTES);
-    });
-    const processResult = await supervisor.wait();
+    const processResult = await running.supervisor.wait();
     metrics.exitCode = processResult.code;
     metrics.exitSignal = processResult.signal;
     metrics.lastPhase = "process_exited";
     await stdoutDone;
-    signal?.removeEventListener("abort", abortHandler);
     if (signal?.aborted) throw new Error("Web search was cancelled");
     if (processFailure) {
       metrics.errorCategory = "process";
@@ -214,22 +178,21 @@ export async function searchWithClaude(
     if (protocolError) throw protocolError;
     if (processResult.code !== 0 || processResult.signal !== null) {
       metrics.errorCategory = "process_exit";
+      const excerpt = running.stderrExcerpt();
       throw new Error(
-        `Claude web search exited with code ${String(processResult.code)}, signal ${String(processResult.signal)}: ${stderr.trim()}`,
+        `Claude web search exited with code ${String(processResult.code)}, signal ${String(processResult.signal)}${excerpt ? `: ${excerpt}` : ""}`,
       );
     }
-    await terminateCurrent();
+    await running.terminate();
     const result = currentProtocol.result();
     metrics.resultBytes = Buffer.byteLength(result);
     metrics.lastPhase = "completed";
     return result;
   } catch (error) {
-    if (error instanceof ProcessTerminationError) {
-      processLivenessUnknown = true;
-      metrics.errorCategory = "process_cleanup";
-    } else metrics.errorCategory ??= signal?.aborted
+    if (error instanceof ProcessTerminationError) metrics.errorCategory = "process_cleanup";
+    else metrics.errorCategory ??= signal?.aborted
       ? "aborted"
-      : error === terminationFailure
+      : claude?.isTerminationFailure(error)
         ? "process_cleanup"
         : searchErrorCategory(error, oversized);
     const requestFailure = signal?.aborted
@@ -241,23 +204,17 @@ export async function searchWithClaude(
           : protocolError
             ? protocolError.message
             : errorText(error);
-    primaryFailure = requestFailure;
-    if (error instanceof ProcessTerminationError) {
-      primaryFailure += `; ${error.message}; private web-search runtime state was retained because process death could not be established`;
-    }
-    if (!(error instanceof ProcessTerminationError)) {
-      try {
-        await terminateCurrent();
-      } catch (terminationError) {
-        if (terminationError !== error || signal?.aborted) {
-          primaryFailure = appendCleanupFailure(primaryFailure, "Claude Code process tree", terminationError);
-        }
-      }
-    }
+    const settled = await settleFailure(
+      claude,
+      error,
+      requestFailure,
+      `${errorText(error)}; private web-search runtime state was retained because process death could not be established`,
+    );
+    processLivenessUnknown = settled.livenessUnknown;
+    primaryFailure = settled.message;
     throw new Error(primaryFailure);
   } finally {
-    if (abortHandler) signal?.removeEventListener("abort", abortHandler);
-    supervisor?.dispose();
+    claude?.dispose();
     try {
       if (directory && !processLivenessUnknown) await cleanupDirectory(directory);
       metrics.cleanupComplete = !processLivenessUnknown;
@@ -330,7 +287,7 @@ class SearchProtocol {
         } catch {
           // UI notifications are advisory and must never fail a search request.
         }
-        if (notice.status === "rejected") this.rateLimitFailure = formatRateLimitRejection(notice);
+        if (notice.status === "rejected") this.rateLimitFailure = rateLimitRejectionMessage(notice);
       }
     } else if (
       record.type !== "stream_event" &&
@@ -361,9 +318,7 @@ class SearchProtocol {
 
 function searchErrorCategory(error: unknown, oversized: boolean): string {
   if (oversized) return "response_too_large";
-  if (error instanceof ClaudeCodeError) return error.code;
-  if (error && typeof error === "object" && "code" in error && typeof error.code === "string") return error.code;
-  return "search_failed";
+  return errorCode(error) ?? "search_failed";
 }
 
 interface SearchResultRecord {

@@ -33,6 +33,15 @@ test("reports sanitized MCP initialization errors without private paths", () => 
         () => validateClaudeInitialization({ ...base, mcp_server_errors: [{ type: "broken" }] }, { tools: new Set(), mcpServer: "none" }),
         (error) => error.code === "protocol_init",
     );
+    assert.throws(
+        () => validateClaudeInitialization({
+            ...base,
+            mcp_server_errors: [{ name: "pi", type: "invalid_config", message: "bad image at /tmp/provider-images/image.png" }],
+        }, { tools: new Set(), mcpServer: "none", privatePaths: ["/tmp/provider-private", "/tmp/provider-images"] }),
+        (error) => error.code === "isolation_mcp"
+            && error.message.includes("<PRIVATE>/image.png")
+            && !error.message.includes("/tmp/provider-images"),
+    );
 });
 
 test("shares terminal result diagnostics across Claude protocol consumers", () => {

@@ -42,9 +42,9 @@ function firstPackageRoot(candidates, name, detail = "") {
 }
 
 /**
- * Find the package that owns a file by walking ancestors. Pi moved its CLI from
- * <package>/dist/cli.js to <package>/dist/bundle/cli.js in 0.84.3; guessing a
- * fixed depth breaks again the next time that path changes.
+ * Find the package that owns a file by walking ancestors. The CLI entry's depth
+ * under the package is Pi's build detail and has changed before, so no fixed
+ * depth is assumed.
  */
 function ancestorPackageRoot(start, name) {
   let directory = dirname(start);
@@ -57,6 +57,7 @@ function ancestorPackageRoot(start, name) {
 }
 
 export const PI_BIN_ENV = "PI_CLAUDE_CODE_PROVIDER_PI_BIN";
+export const DEV_PI_ENV = "PI_CLAUDE_CODE_PROVIDER_DEV_PI";
 
 // Native executable magic numbers. Detect these positively rather than treating
 // "not a shebang" as compiled: npm's Windows shim is a .cmd batch file, and
@@ -86,12 +87,31 @@ export function isCompiledPi(executable) {
 }
 
 /**
- * Resolve Pi's packages for type resolution and module imports. This is a
- * development-host requirement and is deliberately separate from piLaunch:
- * a standalone Pi can be launched but resolves no packages.
+ * The pi executable development resolves packages from: DEV_PI_ENV when set, so
+ * a standalone Pi can stay first on PATH, otherwise the first pi on PATH. It is
+ * resolved to its real file because package resolution walks up from the CLI
+ * entry, and an npm bin link lives outside the package.
+ */
+function developmentPi() {
+  const override = process.env[DEV_PI_ENV]?.trim();
+  if (!override) return findOnPath("pi");
+  try {
+    // Windows reports no execute bit; check existence there instead.
+    accessSync(override, process.platform === "win32" ? constants.F_OK : constants.X_OK);
+    return realpathSync(override);
+  } catch {
+    throw new Error(`${DEV_PI_ENV} is set to ${override}, which is not an executable file`);
+  }
+}
+
+/**
+ * Resolve Pi's packages for type resolution and module imports from the
+ * development Pi; piCliEntry, and piLaunch without PI_BIN_ENV, follow the same
+ * Pi. This is a development-host requirement and is deliberately separate from
+ * PI_BIN_ENV: a standalone Pi can be launched but resolves no packages.
  */
 export function locatePiPackages() {
-  const piCli = findOnPath("pi");
+  const piCli = developmentPi();
   try {
     return resolvePiPackages(piCli);
   } catch (error) {
@@ -100,7 +120,8 @@ export function locatePiPackages() {
     if (!isCompiledPi(piCli)) throw error;
     throw new Error(
       `${piCli} is a compiled standalone Pi that bundles its packages and exposes none of them. ` +
-      "Development requires an npm-installed Pi on PATH (npm install -g @earendil-works/pi-coding-agent); " +
+      "Development requires an npm-installed Pi: put one first on PATH (npm install -g @earendil-works/pi-coding-agent) " +
+      `or set ${DEV_PI_ENV} to its pi executable; ` +
       `the standalone build stays a supported runtime target, and ${PI_BIN_ENV} points the live tests at it.`,
       { cause: error },
     );

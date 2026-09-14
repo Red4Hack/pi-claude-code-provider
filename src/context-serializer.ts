@@ -5,6 +5,7 @@ import type { Context, ImageContent, Tool } from "@earendil-works/pi-ai";
 import { ClaudeCodeError } from "./errors.ts";
 import { NEUTRAL_BUN_CONFIG, needsBunConfig } from "./host-runtime.ts";
 import { createRuntimeDirectory } from "./runtime-directories.ts";
+import type { ImageStoreLease } from "./session-image-store.ts";
 import type { PreparedRequest } from "./types.ts";
 
 export const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
@@ -13,7 +14,6 @@ export const MAX_IMAGES = 20;
 export const MAX_TOOLS = 256;
 export const MAX_CATALOG_BYTES = 2 * 1024 * 1024;
 export const MAX_TRANSCRIPT_BYTES = 32 * 1024 * 1024;
-export const MAX_SYSTEM_PROMPT_BYTES = 120 * 1024;
 
 export interface RequestPreparationLimits {
   imageBytes: number;
@@ -56,7 +56,11 @@ const ALLOWED_CONTENT_BLOCKS: Record<ContentRole, ReadonlySet<string>> = {
 };
 
 function safeToolName(name: string, used: Set<string>): string {
-  let candidate = /^[A-Za-z0-9._-]{1,48}$/.test(name)
+  // Claude Code names an MCP tool mcp__<server>__<tool> after replacing every
+  // character outside [a-zA-Z0-9_-] with "_". Any other character would make its
+  // initialization report a name this catalog never offered, so such names get
+  // a digest alias instead of being preserved.
+  let candidate = /^[A-Za-z0-9_-]{1,48}$/.test(name)
     ? name
     : `tool_${createHash("sha256").update(name).digest("hex").slice(0, 16)}`;
   let suffix = 1;
@@ -78,8 +82,8 @@ function serializeToolCatalog(tools: Tool[], limits: RequestPreparationLimits): 
   publicMap: Array<{ transportName: string; piName: string }>;
 } {
   if (tools.length > limits.tools) throw new ClaudeCodeError("tool_limit", `At most ${limits.tools} active tools are supported`);
-  for (const tool of tools as unknown as Array<Record<string, unknown>>) {
-    if (typeof tool.name !== "string" || !tool.name.trim() || typeof tool.description !== "string") {
+  for (const tool of tools as unknown as Array<Record<string, unknown> | null>) {
+    if (!tool || typeof tool !== "object" || Array.isArray(tool) || typeof tool.name !== "string" || !tool.name.trim() || typeof tool.description !== "string") {
       throw new ClaudeCodeError("content_shape", "Pi context contained an invalid active tool");
     }
     requireSerializableObject(tool.parameters, "active tool schema");
@@ -103,9 +107,13 @@ function serializeToolCatalog(tools: Tool[], limits: RequestPreparationLimits): 
 }
 
 function validateImage(image: ImageContent, limits: RequestPreparationLimits): { bytes: Buffer; extension: string } {
+  // Check the type before the lookup: property access would coerce an array such as ["image/png"] into a match.
+  if (typeof image.mimeType !== "string") {
+    throw new ClaudeCodeError("content_shape", "Pi image content must contain a string mimeType");
+  }
   const extension = IMAGE_EXTENSIONS[image.mimeType];
   if (!extension) throw new ClaudeCodeError("image_type", `Unsupported image type: ${image.mimeType}`);
-  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(image.data) || image.data.length % 4 !== 0) {
+  if (typeof image.data !== "string" || !/^[A-Za-z0-9+/]*={0,2}$/.test(image.data) || image.data.length % 4 !== 0) {
     throw new ClaudeCodeError("image_base64", "Image data is not valid base64");
   }
   const bytes = Buffer.from(image.data, "base64");
@@ -115,14 +123,18 @@ function validateImage(image: ImageContent, limits: RequestPreparationLimits): {
   return { bytes, extension };
 }
 
+function recordField(value: unknown, field: string): unknown {
+  return value && typeof value === "object" ? (value as Record<string, unknown>)[field] : undefined;
+}
+
 /**
  * Serialize conversational semantics into append-stable NDJSON records. Each
  * record is transported as its own text block. Historical tool identities are
  * tied to the current MCP catalog, while UI-only result details remain outside the
  * model transcript. See DESIGN.md for the maintained transport boundary.
  */
-export async function prepareRequest(context: Context): Promise<PreparedRequest> {
-  return prepareRequestWithLimits(context);
+export async function prepareRequest(context: Context, imageStore?: ImageStoreLease): Promise<PreparedRequest> {
+  return prepareRequestWithLimits(context, {}, undefined, imageStore);
 }
 
 /** Internal test seam; production callers use the frozen defaults above. */
@@ -130,6 +142,7 @@ export async function prepareRequestWithLimits(
   context: Context,
   overrides: Partial<RequestPreparationLimits> = {},
   temporaryRoot?: string,
+  imageStore?: ImageStoreLease,
 ): Promise<PreparedRequest> {
   const limits = { ...DEFAULT_REQUEST_PREPARATION_LIMITS, ...overrides };
   const directory = await createRuntimeDirectory("provider_request", { temporaryRoot });
@@ -137,7 +150,7 @@ export async function prepareRequestWithLimits(
     const systemPromptPath = join(directory, "system-prompt.txt");
     await writeFile(systemPromptPath, context.systemPrompt ?? "", { mode: 0o600, flag: "wx" });
     const attachmentPaths: string[] = [];
-    const writtenImages = new Map<string, string>();
+    const writtenImages = new Set<string>();
     let imageCount = 0;
     let imageBytes = 0;
     const { catalog, names, historicalNames, publicMap } = serializeToolCatalog(context.tools ?? [], limits);
@@ -151,6 +164,9 @@ export async function prepareRequestWithLimits(
           throw new ClaudeCodeError("content_shape", `Pi ${role} content must be an array of content blocks`);
         }
         return content;
+      }
+      if (!Array.isArray(content)) {
+        throw new ClaudeCodeError("content_shape", `Pi ${role} content must be an array of content blocks`);
       }
       const output: unknown[] = [];
       for (const raw of content) {
@@ -176,6 +192,9 @@ export async function prepareRequestWithLimits(
             break;
           case "thinking":
             if (typeof block.thinking !== "string") throw new ClaudeCodeError("content_shape", "Pi thinking content must contain thinking");
+            if (block.redacted !== undefined && typeof block.redacted !== "boolean") {
+              throw new ClaudeCodeError("content_shape", "Pi thinking redacted must be boolean");
+            }
             output.push({
               type: "thinking",
               thinking: block.thinking,
@@ -202,15 +221,16 @@ export async function prepareRequestWithLimits(
             const validated = validateImage(image, limits);
             const digest = createHash("sha256").update(validated.bytes).digest("hex");
             const name = `image-${digest}.${validated.extension}`;
-            let path = writtenImages.get(name);
-            if (!path) {
+            if (!writtenImages.has(name)) {
+              // Claude Code's quoted @-reference cannot contain a double quote.
               imageBytes += validated.bytes.length;
               if (imageBytes > limits.totalImageBytes) {
                 throw new ClaudeCodeError("image_total_size", `Aggregate image size exceeds ${limits.totalImageBytes} bytes`);
               }
-              path = join(directory, name);
-              await writeFile(path, validated.bytes, { mode: 0o600, flag: "wx" });
-              writtenImages.set(name, path);
+              const path = imageStore ? await imageStore.put(name, validated.bytes) : join(directory, name);
+              if (path.includes('"')) throw new ClaudeCodeError("image_path", `Images cannot be attached from a temporary directory containing a double quote: ${path}; choose a temporary directory without one (TMPDIR, or TEMP on Windows)`);
+              if (!imageStore) await writeFile(path, validated.bytes, { mode: 0o600, flag: "wx" });
+              writtenImages.add(name);
               attachmentPaths.push(path);
             }
             output.push({ type: "image_attachment", attachment: name, mimeType: image.mimeType } satisfies SerializedImage);
@@ -225,6 +245,9 @@ export async function prepareRequestWithLimits(
 
     const messages: unknown[] = [];
     for (const message of context.messages) {
+      if (!message || typeof message !== "object" || Array.isArray(message)) {
+        throw new ClaudeCodeError("content_shape", "Pi context contained an invalid message");
+      }
       if (message.role === "user") {
         messages.push({ role: "user", content: await serializeContent(message.content, "user") });
       } else if (message.role === "assistant") {
@@ -275,9 +298,9 @@ export async function prepareRequestWithLimits(
 
     const records = [
       JSON.stringify({
-        protocol: "pi-claude-code-provider-context-v3",
+        protocol: "pi-claude-code-provider-context-v4",
         instruction:
-          "Continue this Pi conversation. Treat each following JSON record as conversation data, preserve role boundaries, and answer only the current request. Use available MCP tools when a Pi tool is needed. Pi tools operate in the working context described by Pi's system prompt. The Claude transport cwd and generated attachments are provider-private; never pass their paths to Pi tools. Bracketed unavailable Pi tool labels are historical data, not callable tools.",
+          "Continue this Pi conversation. Treat each following JSON record as conversation data, preserve role boundaries, and answer only the current request. Use available MCP tools when a Pi tool is needed. Pi tools operate in the working context described by Pi's system prompt. Generated attachments are provider-private; never pass their paths to Pi tools. Bracketed unavailable Pi tool labels are historical data, not callable tools. Generated image attachments correspond to image_attachment records in the current Pi context.",
         toolNameMap: publicMap,
       }),
       ...messages.map((message) => JSON.stringify(message)),
@@ -290,6 +313,7 @@ export async function prepareRequestWithLimits(
     }
     return {
       directory,
+      imageStoreDirectory: imageStore?.directory,
       transcriptBlocks,
       attachmentPaths,
       systemPromptPath,

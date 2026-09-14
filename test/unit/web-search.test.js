@@ -44,6 +44,8 @@ test("web search uses a relative private request reference and validates its res
     await writeFile(executable, nodeFixtureSource(`
 const prompt = process.argv.find((arg) => arg.startsWith("Research the query")) ?? "";
 if (!prompt.includes("@./search-request.json") || prompt.includes(process.cwd() + "/search-request.json")) process.exit(7);
+// Only the final result is read, so partial messages would only count against the capture limit.
+if (process.argv.includes("--include-partial-messages")) process.exit(8);
 process.stdout.write(JSON.stringify(${JSON.stringify(searchInit)}) + "\\n");
 process.stdout.write(JSON.stringify({ type: "result", is_error: false, result: "sourced result" }) + "\\n");
 `), { mode: 0o700 });
@@ -60,6 +62,26 @@ process.stdout.write(JSON.stringify({ type: "result", is_error: false, result: "
     }
     finally {
         await rm(directory, { recursive: true, force: true });
+    }
+});
+
+test("web search reports a bounded stderr excerpt without its private directory", async () => {
+    const fake = await fakeSearch(`
+process.stderr.write("x".repeat(5000) + " failed in " + process.cwd());
+process.exit(3);`);
+    try {
+        const installation = { executable: fake.executable, version: "test", subscriptionType: "pro" };
+        await assert.rejects(searchWithClaude(installation, { query: "query" }), (error) => {
+            assert.match(error.message, /^Claude web search exited with code 3, signal null: /);
+            const excerpt = error.message.slice(error.message.indexOf(": ") + 2);
+            assert.ok(excerpt.length <= 1_000, `${excerpt.length} characters of stderr`);
+            assert.match(excerpt, /failed in <PRIVATE>$/);
+            return true;
+        });
+        assert.equal(getLastSearchMetrics().errorCategory, "process_exit");
+    }
+    finally {
+        await rm(fake.directory, { recursive: true, force: true });
     }
 });
 

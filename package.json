@@ -1,16 +1,11 @@
 {
   "name": "pi-claude-code-provider",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
-  "description": "Use a Claude Code subscription as a model provider in Pi through the approved non-interactive mode and without Anthropic's Agents SDK.",
+  "description": "The convenience of your Claude subscription in Pi, with the fewest possible surprises. Uses Claude Code's CLI under the hood.",
   "author": "chem <sineverbisnon@gmail.com>",
   "license": "MIT",
-  "keywords": [
-    "pi-package",
-    "pi-extension",
-    "claude-code",
-    "subscription"
-  ],
+  "keywords": ["pi-package", "pi-extension", "claude-code", "subscription"],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/chem/pi-claude-code-provider.git"
@@ -34,15 +29,14 @@
     "access": "public"
   },
   "pi": {
-    "extensions": [
-      "./extensions/pi-claude-code-provider.ts"
-    ]
+    "extensions": ["./extensions/index.ts"]
   },
   "scripts": {
     "setup:dev": "npm --prefix tooling ci --ignore-scripts",
     "typecheck": "node scripts/typecheck.js",
     "check": "node scripts/check.js && npm run typecheck",
     "capture:claude-surface": "node scripts/capture-claude-surface.js",
+    "capture:claude-breakpoints": "node scripts/capture-claude-breakpoints.js",
     "capture:claude-protocol": "node scripts/capture-claude-protocol.js",
     "test": "node --import ./test/support/register-pi-loader.js --test test/unit/*.test.js",
     "test:local": "node scripts/local-test.js",
@@ -54,6 +48,9 @@
     "test:paid:full": "node scripts/paid-test-runner.js full",
     "test:paid:post-tools": "node scripts/paid-test-runner.js post-tools",
     "test:paid:cache": "node scripts/paid-test-runner.js cache",
+    "test:paid:cache-haiku": "node scripts/paid-test-runner.js cache-haiku",
+    "test:paid:cache-images": "node scripts/paid-test-runner.js cache-images",
+    "test:paid:cache-images-haiku": "node scripts/paid-test-runner.js cache-images-haiku",
     "test:paid:fable": "node scripts/paid-test-runner.js fable",
     "test:paid:opus": "node scripts/paid-test-runner.js opus",
     "test:paid:matrix": "node scripts/paid-test-runner.js matrix",
@@ -65,15 +62,9 @@
     "typebox": "*"
   },
   "peerDependenciesMeta": {
-    "@earendil-works/pi-ai": {
-      "optional": true
-    },
-    "@earendil-works/pi-coding-agent": {
-      "optional": true
-    },
-    "typebox": {
-      "optional": true
-    }
+    "@earendil-works/pi-ai": { "optional": true },
+    "@earendil-works/pi-coding-agent": { "optional": true },
+    "typebox": { "optional": true }
   },
   "engines": {
     "node": ">=22.19.0"

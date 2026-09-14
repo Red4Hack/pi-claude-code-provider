@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 // Claude Code's help, captured byte-for-byte. Re-pin with
 // `npm run capture:claude-surface` and update this constant deliberately; a
 // hand-written approximation invents spellings the CLI never emitted.
-export const CAPTURED_CLAUDE_VERSION = "2.1.261";
+export const CAPTURED_CLAUDE_VERSION = "2.1.270";
 export const CAPTURED_CLAUDE_HELP_PATH = fileURLToPath(
   new URL(`./captured/claude-${CAPTURED_CLAUDE_VERSION}-help.txt`, import.meta.url),
 );
@@ -36,6 +36,20 @@ export function textResponseEvents(text, { id, model, usage = {} }) {
     { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } } },
     { type: "stream_event", event: { type: "content_block_stop", index: 0 } },
     resultRecord({ is_error: false, result: text, usage }),
+  ];
+}
+
+/** Stream records for one proposed Pi tool call, ending in a tool_use stop. */
+export function toolUseEvents({ messageId, toolUseId, name = "mcp__pi__read", partialJson, messageStop = false }) {
+  return [
+    { type: "stream_event", event: { type: "message_start", message: { id: messageId, model: "claude-sonnet-5", usage: {} } } },
+    { type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: toolUseId, name, input: {} } } },
+    ...(partialJson === undefined
+      ? []
+      : [{ type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: partialJson } } }]),
+    { type: "stream_event", event: { type: "content_block_stop", index: 0 } },
+    { type: "stream_event", event: { type: "message_delta", delta: { stop_reason: "tool_use" } } },
+    ...(messageStop ? [{ type: "stream_event", event: { type: "message_stop" } }] : []),
   ];
 }
 

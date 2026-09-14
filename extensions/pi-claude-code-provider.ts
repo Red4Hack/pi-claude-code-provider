@@ -15,6 +15,7 @@ import { formatDoctorSummary, probeBridge } from "../src/doctor.ts";
 import { flushMetricsLog, getLastRequestMetrics, getLastSearchMetrics, getMetricsLogError } from "../src/metrics.ts";
 import { createClaudeStream } from "../src/provider.ts";
 import { cleanupStaleRuntimeDirectories, createRuntimeDirectory } from "../src/runtime-directories.ts";
+import { SessionImageStore } from "../src/session-image-store.ts";
 import { searchWithClaude } from "../src/web-search.ts";
 import type { RateLimitNotice } from "../src/claude-protocol.ts";
 import type { RuntimeCleanupResult } from "../src/runtime-directories.ts";
@@ -39,8 +40,12 @@ export default async function piClaudeCodeProvider(pi: ExtensionAPI): Promise<vo
   const providerModels = providerModelsForSubscription(installation.subscriptionType);
   const currentPlatform = platformStatus();
   const searchOutputs = createSearchOutputOwner();
+  const imageStore = new SessionImageStore();
   let searchRegistrationAttempted = false;
   let activeRateLimitNotify: ((notice: RateLimitNotice) => void) | undefined;
+  // Pi's session directory, not process.cwd(): a resumed session takes its cwd
+  // from the session file, and Pi's tools resolve paths against that one.
+  let sessionCwd: string | undefined;
 
   pi.registerProvider(PROVIDER, {
     name: "Claude Code Subscription",
@@ -50,11 +55,15 @@ export default async function piClaudeCodeProvider(pi: ExtensionAPI): Promise<vo
     models: providerModels,
     streamSimple: createClaudeStream(installation, {
       onRateLimitNotice: (notice) => activeRateLimitNotify?.(notice),
+      workingDirectory: () => sessionCwd,
+      imageStore,
     }),
   });
 
   pi.on("session_start", (_event, ctx) => {
     searchOutputs.open();
+    imageStore.open();
+    sessionCwd = ctx.cwd;
     // The provider starts a process per tool round-trip; session scope prevents
     // Claude's repeated notice from surfacing throughout one Pi turn.
     activeRateLimitNotify = createRateLimitNotifier((message) => ctx.ui.notify(message, "warning"));
@@ -73,8 +82,9 @@ export default async function piClaudeCodeProvider(pi: ExtensionAPI): Promise<vo
 
   pi.on("session_shutdown", async () => {
     activeRateLimitNotify = undefined;
+    sessionCwd = undefined;
     try {
-      await searchOutputs.close();
+      await Promise.all([searchOutputs.close(), imageStore.close()]);
     } finally {
       await flushMetricsLog();
     }
@@ -161,14 +171,17 @@ function registerDoctorCommand(pi: ExtensionAPI, runtimeCleanup: RuntimeCleanupR
 function createRateLimitNotifier(notify: (message: string) => void): (notice: RateLimitNotice) => void {
   const emitted = new Set<string>();
   return (notice) => {
-    const key = JSON.stringify(notice);
-    if (emitted.has(key)) return;
+    // Key on the displayed text: utilization arrives as a fraction that changes
+    // between events while the notice shows whole percent, so keying on the raw
+    // notice would repeat an identical-looking warning on every round trip.
+    const message = formatRateLimitNotice(notice);
+    if (emitted.has(message)) return;
     if (emitted.size >= MAX_TRACKED_RATE_LIMIT_NOTICES) {
       const [oldest] = emitted;
       if (oldest !== undefined) emitted.delete(oldest);
     }
-    emitted.add(key);
-    notify(formatRateLimitNotice(notice));
+    emitted.add(message);
+    notify(message);
   };
 }
 

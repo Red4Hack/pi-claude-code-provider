@@ -44,6 +44,7 @@ test("removes only old runtime directories whose recorded processes are gone", a
   const now = Date.now();
   try {
     const stale = await createRuntimeDirectory("provider_request", { temporaryRoot: root, ownerPid: 301, now: now - 2 * HOUR });
+    const staleImages = await createRuntimeDirectory("provider_image_store", { temporaryRoot: root, ownerPid: 307, now: now - 2 * HOUR });
     // The web_search_output prefix nests inside the web_search_request prefix,
     // so this directory is only reclaimed when its kind is resolved by the
     // longest matching prefix rather than the first one.
@@ -58,8 +59,9 @@ test("removes only old runtime directories whose recorded processes are gone", a
       now,
       processAlive: (pid) => pid === 302 || pid === 304,
     });
-    assert.deepEqual(removed, { removed: 2, failures: 0, reaped: 0 });
+    assert.deepEqual(removed, { removed: 3, failures: 0, reaped: 0 });
     await assert.rejects(access(stale));
+    await assert.rejects(access(staleImages));
     await assert.rejects(access(staleOutput));
     await Promise.all([activeOwner, activeChild, young].map((directory) => access(directory)));
   } finally {
@@ -99,6 +101,23 @@ test("leaves unowned, unmarked, diagnostic, symlinked, and out-of-budget candida
   }
 });
 
+test("retains a stale session image store while an owned request child may be alive", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-runtime-image-child-test-"));
+  const now = Date.now();
+  try {
+    const images = await createRuntimeDirectory("provider_image_store", { temporaryRoot: root, ownerPid: 501, now: now - 2 * HOUR });
+    const request = await createRuntimeDirectory("provider_request", { temporaryRoot: root, ownerPid: 501, now: now - 2 * HOUR });
+    await recordRuntimeChild(request, 502);
+    const options = { temporaryRoot: root, currentUid: (await lstat(root)).uid, now };
+    assert.deepEqual(await cleanupStaleRuntimeDirectories({ ...options, processAlive: (pid) => pid === 502 }), { removed: 0, failures: 0, reaped: 0 });
+    await Promise.all([images, request].map((directory) => access(directory)));
+    assert.deepEqual(await cleanupStaleRuntimeDirectories({ ...options, processAlive: () => false }), { removed: 2, failures: 0, reaped: 0 });
+    await Promise.all([images, request].map((directory) => assert.rejects(access(directory))));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("reports a content-free aggregate when the temporary root cannot be scanned", async () => {
   const missing = join(tmpdir(), `pi-runtime-missing-${process.pid}-${Date.now()}`);
   assert.deepEqual(await cleanupStaleRuntimeDirectories({
@@ -117,7 +136,7 @@ test("reaps an abandoned Claude process group only when the live process proves 
     await recordRuntimeChild(impostor, 504);
     const currentUid = (await lstat(root)).uid;
     const terminated = [];
-    // 504 is a live process that does not run in the recorded directory, which
+    // 504 is a live process that does not reference the recorded directory, which
     // is what a reused process identifier looks like: it must never be signalled,
     // and its unprovable state must leave the directory in place too.
     const result = await cleanupStaleRuntimeDirectories({
@@ -125,7 +144,7 @@ test("reaps an abandoned Claude process group only when the live process proves 
       currentUid,
       now,
       processAlive: (pid) => pid === 502 || pid === 504,
-      processDirectory: async (pid) => (pid === 502 ? abandoned : "/somewhere/else"),
+      processOwnsDirectory: async (pid, directory) => pid === 502 && directory === abandoned,
       terminateGroup: async (pid) => {
         terminated.push(pid);
         return true;
@@ -151,7 +170,7 @@ test("counts a process group that refuses to die as a failure and keeps its dire
       currentUid: (await lstat(root)).uid,
       now,
       processAlive: (pid) => pid === 602,
-      processDirectory: async () => stubborn,
+      processOwnsDirectory: async (_pid, directory) => directory === stubborn,
       terminateGroup: async () => false,
     }), { removed: 0, failures: 1, reaped: 0 });
     await access(stubborn);
@@ -177,7 +196,7 @@ test("reaping is bounded per pass so Pi startup cannot stall behind it", async (
       now,
       maxReaped: 1,
       processAlive: (pid) => pid >= 800,
-      processDirectory: async (pid) => directories[pid - 800],
+      processOwnsDirectory: async (pid, directory) => directories[pid - 800] === directory,
       terminateGroup: async (pid) => {
         terminated.push(pid);
         return true;

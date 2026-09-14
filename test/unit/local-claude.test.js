@@ -96,7 +96,7 @@ test("the local Claude stand-in satisfies the provider's preflight surface", asy
 
 test("a local text turn completes through the provider's protocol validation", async () => {
   await withLocalClaude(completion({ content: "LOCAL-OK", reasoning: "brief plan" }), async ({ executable, server }) => {
-    const result = await createClaudeStream({ executable, version: "2.1.261", subscriptionType: "pro" })(
+    const result = await createClaudeStream({ executable, version: "2.1.270", subscriptionType: "pro" }, { workingDirectory: () => tmpdir() })(
       model,
       context,
       { reasoning: "medium", maxTokens: 256 },
@@ -119,7 +119,7 @@ test("a local tool proposal round-trips through the real proposal bridge", async
     toolCalls: [{ id: "call_local_1", function: { name: "read", arguments: '{"path":"README.md"}' } }],
   });
   await withLocalClaude(reply, async ({ executable, server }) => {
-    const result = await createClaudeStream({ executable, version: "2.1.261", subscriptionType: "pro" })(
+    const result = await createClaudeStream({ executable, version: "2.1.270", subscriptionType: "pro" }, { workingDirectory: () => tmpdir() })(
       model,
       toolContext,
       { reasoning: "medium" },
@@ -137,7 +137,7 @@ test("a local tool proposal round-trips through the real proposal bridge", async
 
 test("a local turn that hits its output ceiling reports a length stop", async () => {
   await withLocalClaude(completion({ content: "cut off", finishReason: "length" }), async ({ executable }) => {
-    const result = await createClaudeStream({ executable, version: "2.1.261", subscriptionType: "pro" })(
+    const result = await createClaudeStream({ executable, version: "2.1.270", subscriptionType: "pro" }, { workingDirectory: () => tmpdir() })(
       model,
       context,
       { reasoning: "low", maxTokens: 32 },

@@ -12,6 +12,13 @@ export function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** The string `code` of a Node system error or ClaudeCodeError, if present. */
+export function errorCode(error: unknown): string | undefined {
+  return error && typeof error === "object" && "code" in error && typeof error.code === "string"
+    ? error.code
+    : undefined;
+}
+
 export function appendCleanupFailure(primary: string | undefined, subject: string, cleanupError: unknown): string {
   const cleanup = `${subject} cleanup failed: ${errorText(cleanupError)}`;
   return primary ? `${primary}; ${cleanup}` : cleanup;

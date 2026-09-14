@@ -232,7 +232,7 @@ export async function validateProcessTerminationCapability(
 }
 
 async function terminateWindowsProcessTree(child: ChildProcess, pid: number, graceMs: number): Promise<void> {
-  if (!isValidPid(pid)) throw new Error("Claude Code child process has no valid process ID");
+  if (!validPid(pid)) throw new Error("Claude Code child process has no valid process ID");
   if (child.exitCode !== null || child.signalCode !== null) return;
 
   let taskkillFailure: unknown;
@@ -324,7 +324,7 @@ function isTaskkillMissingProcess(error: unknown): boolean {
 }
 
 /** A process identifier this package is willing to signal or record. */
-export function isValidPid(value: unknown): value is number {
+export function validPid(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
 

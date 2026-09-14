@@ -27,7 +27,8 @@ export function documentationPolicyErrors(root, markdownFiles, verifiedVersions,
     errors.push("README.md must link to DEVELOPING.md#compatibility-baseline");
   }
   // README owns the user-facing minimum supported versions; DEVELOPING.md owns
-  // the verified baseline. Each number lives in exactly one document.
+  // the verified baseline. A verified version appears in README only when it is
+  // also a minimum.
   const minimums = new Set(Object.values(minimumVersions));
   for (const [component, version] of Object.entries(minimumVersions)) {
     if (!readme.includes(version)) {

@@ -23,10 +23,10 @@ test("a supported-version floor is reported separately from the tested baseline"
   // Use literals, not the constants: this covers the mechanism, and the two
   // constants are independent by design. Reading them here would make the test
   // change meaning whenever either moves, which is how it broke once already.
-  const below = versionStatus("Claude Code", "2.1.241", "2.1.241", "2.1.261");
+  const below = versionStatus("Claude Code", "2.1.269", "2.1.269", "2.1.270");
   assert.equal(below.isVerified, true, "a version can be the tested baseline and still below the floor");
   assert.equal(below.meetsMinimum, false);
-  assert.equal(below.minimum, "2.1.261");
+  assert.equal(below.minimum, "2.1.270");
   // A floor is advisory: it never becomes the platform advisory's warning.
   assert.equal(below.warning, undefined);
   // Above the baseline yet below the floor, and the reverse, are both possible.

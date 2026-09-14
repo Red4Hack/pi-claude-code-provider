@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { BRIDGE_PATH, baseClaudeArgs, providerArgs } from "../../src/claude-args.ts";
+import { BRIDGE_PATH, baseClaudeArgs, providerArgs, transcriptBreakpointEnabled } from "../../src/claude-args.ts";
 import { NEUTRAL_BUN_CONFIG, needsBunConfig, scriptLaunch } from "../../src/host-runtime.ts";
 test("uses only generated attachment references and replacement prompt", () => {
     const prepared = {
@@ -18,8 +18,9 @@ test("uses only generated attachment references and replacement prompt", () => {
     const promptText = prompt.map((block) => block.text).join("\n");
     const joined = args.join("\n");
     assert.equal(prompt.length, 3);
-    assert.match(promptText, /@\.\/image.png/);
-    assert.doesNotMatch(promptText, /\/tmp\/private/);
+    // The only private path in the prompt is the quoted attachment reference.
+    assert.match(promptText, /@"\/tmp\/private\/image\.png"/);
+    assert.equal(promptText.split("/tmp/private").length - 1, 1);
     assert.doesNotMatch(promptText, /request\.json/);
     assert.doesNotMatch(promptText, /@\/etc\/passwd/);
     assert.match(promptText, /\\u0040\/etc\/passwd/);
@@ -31,8 +32,24 @@ test("uses only generated attachment references and replacement prompt", () => {
     assert.ok(args.includes(""));
     assert.deepEqual(prompt.map((block) => block.text), [
         ...prepared.transcriptBlocks,
-        "Generated image attachments for image_attachment blocks: @./image.png.",
+        'Generated image attachments for image_attachment blocks: @"/tmp/private/image.png".',
     ]);
+});
+
+test("references attachments by quoted absolute path, so a temp root with spaces stays one reference", () => {
+    // Claude runs in Pi's session directory, where a relative reference would
+    // resolve against the project instead of the private request directory.
+    const prepared = {
+        transcriptBlocks: ['{"record":0}'],
+        attachmentPaths: ["/tmp/root with spaces/request/a.png", "/tmp/root with spaces/request/b.png"],
+        systemPromptPath: "/tmp/root with spaces/request/system-prompt.txt",
+    };
+    const { prompt } = providerArgs(prepared, "sonnet", "low");
+    assert.equal(
+        prompt.at(-1).text,
+        'Generated image attachments for image_attachment blocks: @"/tmp/root with spaces/request/a.png" @"/tmp/root with spaces/request/b.png".',
+    );
+    assert.equal(prompt.at(-1).cache_control, undefined);
 });
 
 test("every advertised alias is passed to Claude verbatim", () => {
@@ -43,7 +60,7 @@ test("every advertised alias is passed to Claude verbatim", () => {
     }
 });
 
-test("pins cache-stable Claude settings and omits fixed outer guidance", () => {
+test("pins cache-stable Claude settings", () => {
     const args = baseClaudeArgs();
     const settings = JSON.parse(args[args.indexOf("--settings") + 1]);
     assert.deepEqual(settings, {
@@ -51,9 +68,38 @@ test("pins cache-stable Claude settings and omits fixed outer guidance", () => {
         autoMemoryEnabled: false,
         totalTokensReminder: "off",
     });
+});
+
+test("marks exactly the last history block with a 1h cache breakpoint", () => {
+    // Claude Code does not mark the transcript, so the transport does.
+    // The marker belongs on unchanged history, never on the growing attachment
+    // suffix, and must be 1h: the API orders breakpoints longest-TTL-first and
+    // Claude Code places a 1h marker after this one. The on-the-wire total is
+    // checked by npm run capture:claude-breakpoints, not by a unit test.
     const prepared = {
         directory: "/tmp/private",
-        transcriptBlocks: ['{"protocol":"test"}'],
+        transcriptBlocks: Array.from({ length: 40 }, (_, index) => `{"record":${index}}`),
+        attachmentPaths: ["/tmp/private/a.png", "/tmp/private/b.png"],
+        systemPromptPath: "/tmp/private/system-prompt.txt",
+        toolNames: new Map(),
+        transcriptBytes: 1,
+        catalogBytes: 0,
+        imageBytes: 1,
+    };
+    const { prompt } = providerArgs(prepared, "sonnet", "low");
+    const marked = prompt.filter((block) => block.cache_control !== undefined);
+    assert.deepEqual(marked, [
+        { type: "text", text: prepared.transcriptBlocks.at(-1), cache_control: { type: "ephemeral", ttl: "1h" } },
+    ]);
+    assert.equal(prompt.at(-1).cache_control, undefined);
+    // An empty history has nothing to mark; a marker with no block is invalid.
+    assert.deepEqual(providerArgs({ ...prepared, transcriptBlocks: [], attachmentPaths: [] }, "sonnet", "low").prompt, []);
+});
+
+test("the transcript breakpoint turns off only through a valid setting", () => {
+    const prepared = {
+        directory: "/tmp/private",
+        transcriptBlocks: ['{"record":0}', '{"record":1}'],
         attachmentPaths: [],
         systemPromptPath: "/tmp/private/system-prompt.txt",
         toolNames: new Map(),
@@ -61,8 +107,14 @@ test("pins cache-stable Claude settings and omits fixed outer guidance", () => {
         catalogBytes: 0,
         imageBytes: 0,
     };
-    const generated = providerArgs(prepared, "sonnet", "low");
-    assert.deepEqual(generated.prompt, [{ type: "text", text: prepared.transcriptBlocks[0] }]);
+    const { prompt } = providerArgs(prepared, "sonnet", "low", { transcriptBreakpoint: false });
+    assert.equal(prompt.length, 2);
+    assert.equal(prompt.some((block) => "cache_control" in block), false);
+    const name = "PI_CLAUDE_CODE_PROVIDER_TRANSCRIPT_BREAKPOINT";
+    assert.equal(transcriptBreakpointEnabled({}), true);
+    assert.equal(transcriptBreakpointEnabled({ [name]: "on" }), true);
+    assert.equal(transcriptBreakpointEnabled({ [name]: " off " }), false);
+    assert.throws(() => transcriptBreakpointEnabled({ [name]: "false" }), (error) => error.code === "breakpoint_config");
 });
 
 test("proposal MCP server launches the bridge through the hosting runtime", () => {

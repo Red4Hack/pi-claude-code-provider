@@ -2,7 +2,18 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { PassThrough } from "node:stream";
 import test from "node:test";
-import { closeLiveRpcProcess, consumeJsonl, superviseLiveProcess } from "../../scripts/lib/live-process.js";
+import { assistantReply, closeLiveRpcProcess, consumeJsonl, superviseLiveProcess } from "../../scripts/lib/live-process.js";
+
+test("a live assistant reply reports a provider error by name rather than as empty text", () => {
+  const end = (message) => ({ type: "message_end", message });
+  const reply = { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "OK" }] };
+  assert.equal(assistantReply([end({ role: "user" }), end(reply)], "case"), reply);
+  assert.throws(
+    () => assistantReply([end({ role: "assistant", stopReason: "error", errorMessage: "usage credits are disabled", content: [] })], "fable:medium"),
+    { message: "fable:medium: usage credits are disabled" },
+  );
+  assert.throws(() => assistantReply([end({ role: "user" })], "cache turn 1"), { message: "cache turn 1 returned no assistant message" });
+});
 
 test("live-process supervision clears normal exits and enforces deadlines", async () => {
   const clean = spawn(process.execPath, ["-e", "process.exit(0)"], { detached: true, stdio: "ignore" });

@@ -1,5 +1,6 @@
-import { spawn } from "node:child_process";
-import { access } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { access, stat } from "node:fs/promises";
+import { isAbsolute } from "node:path";
 import type {
   Api,
   AssistantMessageEventStream,
@@ -9,31 +10,27 @@ import type {
   SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
-import { buildClaudeEnvironment, claudeLaunch } from "./auth.ts";
-import { bridgeArgv, formatBridgeArgv, providerArgs } from "./claude-args.ts";
-import { MAX_SYSTEM_PROMPT_BYTES, prepareRequest } from "./context-serializer.ts";
-import { appendCleanupFailure, ClaudeCodeError, errorText } from "./errors.ts";
+import { bridgeArgv, formatBridgeArgv, providerArgs, transcriptBreakpointEnabled } from "./claude-args.ts";
+import { claimClaudeLaunch, settleFailure, spawnClaudeProcess, type ClaudeProcess } from "./claude-process.ts";
+import { prepareRequest } from "./context-serializer.ts";
+import { appendCleanupFailure, ClaudeCodeError, errorCode, errorText } from "./errors.ts";
 import { JsonlParser } from "./jsonl.ts";
 import { recordRequestMetrics } from "./metrics.ts";
 import { createOutput } from "./output.ts";
 import { claimPaidTestLaunch } from "./paid-launch-budget.ts";
-import { ProcessTerminationError, superviseProcess, terminateProcessGroup, type ProcessSupervisor } from "./process-utils.ts";
-import { recordRuntimeChild, removeRuntimeDirectory } from "./runtime-directories.ts";
-import { tailText } from "./text.ts";
+import { ProcessTerminationError, superviseProcess } from "./process-utils.ts";
+import { removeRuntimeDirectory } from "./runtime-directories.ts";
+import { SessionImageStore, type ImageStoreLease } from "./session-image-store.ts";
 import type { RateLimitNoticeSink } from "./claude-protocol.ts";
 import { ClaudeEventMapper, type ClaudeTerminationCause } from "./stream-events.ts";
 import type { ClaudeInstallation, LogicalProviderPayload, MutableOutput, RequestMetrics } from "./types.ts";
 
-const MAX_STDERR_BYTES = 64 * 1024;
 // Claude Code connects the proposal server during its own startup, which is
 // about a second on a warm machine but is bounded by process start, settings
 // resolution, and authentication. Five seconds turned an ordinary slow start
 // into a failed request, so allow real headroom; a bridge that cannot launch
 // still fails on the process-exit branch below rather than on this deadline.
 const DEFAULT_MCP_READY_TIMEOUT_MS = 20_000;
-// Bound the stderr excerpt carried into a readiness failure; the full stream is
-// already capped, and an error message is not a log.
-const READY_STDERR_BYTES = 1_000;
 /**
  * Reasoning room Pi expects on top of a requested output cap, mirroring
  * `DEFAULT_THINKING_BUDGETS` and `clampReasoning` in pi-ai: Pi treats
@@ -71,6 +68,12 @@ export interface ClaudeStreamDependencies {
   onRateLimitNotice?: RateLimitNoticeSink;
   claimLaunch?: ClaimLaunch;
   supervise?: typeof superviseProcess;
+  /**
+   * Pi's session working directory. Claude runs there so the working directory
+   * Claude Code reports to the model is the one Pi's tools resolve against.
+   */
+  workingDirectory?: () => string | undefined;
+  imageStore?: SessionImageStore;
 }
 
 export function createClaudeStream(
@@ -81,25 +84,27 @@ export function createClaudeStream(
   const onRateLimitNotice = dependencies.onRateLimitNotice;
   const claimLaunch = dependencies.claimLaunch ?? claimPaidTestLaunch;
   const supervise = dependencies.supervise ?? superviseProcess;
+  const imageStore = dependencies.imageStore;
   return (model: Model<Api>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream => {
     const stream = createAssistantMessageEventStream();
+    // Read once, when Pi starts the request: a session switch during asynchronous
+    // preparation must not move this request to another directory.
+    const sessionCwd = dependencies.workingDirectory?.();
     const output = createOutput(model);
 
     void (async () => {
       const startedAt = Date.now();
       const effort = options?.reasoning ?? "medium";
       let prepared: Awaited<ReturnType<typeof prepareRequest>> | undefined;
-      let child: ReturnType<typeof spawn> | undefined;
-      let supervisor: ProcessSupervisor | undefined;
-      let abortHandler: (() => void) | undefined;
+      let imageLease: ImageStoreLease | undefined;
+      let claude: ClaudeProcess | undefined;
+      let cwd: string | undefined;
       let toolUse = false;
       let terminationCause: ClaudeTerminationCause = "none";
-      let stderr = "";
       let mapper: ClaudeEventMapper | undefined;
       let exitCode: number | null | undefined;
       let exitSignal: NodeJS.Signals | null | undefined;
       let errorCategory: string | undefined;
-      let terminationFailure: unknown;
       let processLivenessUnknown = false;
       let finalized = false;
       const metrics: RequestMetrics = {
@@ -144,24 +149,6 @@ export function createClaudeStream(
         }
       };
 
-      const terminateCurrent = async (): Promise<void> => {
-        try {
-          if (supervisor) await supervisor.terminate();
-          else if (child) await terminateProcessGroup(child);
-        } catch (error) {
-          terminationFailure ??= error;
-          throw error;
-        }
-      };
-
-      const terminateInBackground = (): void => {
-        void terminateCurrent().catch(() => {
-          errorCategory ??= "process_cleanup";
-          // The shared supervisor rejects wait() promptly on this same failure;
-          // the main catch path owns the complete, non-duplicated user message.
-        });
-      };
-
       // Claude Code's headless protocol has no HTTP response to report, so a
       // validated initialization is announced with a synthetic success status
       // and no headers. Pi requires that an asynchronous observer finish
@@ -183,7 +170,7 @@ export function createClaudeStream(
         toolUse = true;
         terminationCause = "tool_handoff";
         metrics.terminationExpected = true;
-        terminateInBackground();
+        claude?.terminateInBackground();
       };
 
       const finalizeLifecycle = async (): Promise<void> => {
@@ -191,13 +178,14 @@ export function createClaudeStream(
         finalized = true;
         // Terminal stream publication belongs to the protocol boundary below;
         // this idempotent finalizer owns only request resources and metrics.
-        if (abortHandler) options?.signal?.removeEventListener("abort", abortHandler);
-        supervisor?.dispose();
+        claude?.dispose();
         try {
           await cleanupPrepared();
         } catch {
           errorCategory ??= "cleanup";
         }
+        imageLease?.release(processLivenessUnknown);
+        if (processLivenessUnknown && prepared?.imageStoreDirectory) metrics.cleanupComplete = false;
         metrics.durationMs = Date.now() - startedAt;
         metrics.resolvedModel = output.responseModel;
         metrics.servedContextWindow = mapper?.contextWindow;
@@ -211,8 +199,13 @@ export function createClaudeStream(
         const promptTokens = metrics.inputTokens + metrics.cacheRead + metrics.cacheWrite;
         metrics.cacheHitPercent = promptTokens > 0 ? Math.round((metrics.cacheRead * 10_000) / promptTokens) / 100 : undefined;
         metrics.stopReason = output.stopReason;
-        metrics.errorCategory =
-          errorCategory ?? (mapper?.rateLimitFailure ? "rate_limit" : output.stopReason === "error" ? "claude_error" : undefined);
+        metrics.errorCategory = errorCategory ?? (
+          mapper?.cacheBreakpointLimit
+            ? "cache_breakpoint_limit"
+            : mapper?.rateLimitFailure
+              ? "rate_limit"
+              : output.stopReason === "error" ? "claude_error" : undefined
+        );
         metrics.exitCode = exitCode;
         metrics.exitSignal = exitSignal;
         recordRequestMetrics(metrics);
@@ -222,16 +215,18 @@ export function createClaudeStream(
         // Phase 1 — prepare Pi's logical payload and private transport state.
         const effectiveContext = await applyPayloadHook(model, context, options);
         metrics.lastPhase = "payload_applied";
+        cwd = await requireWorkingDirectory(sessionCwd);
+        imageLease = imageStore?.acquire();
         metrics.messageCount = effectiveContext.messages.length;
         metrics.toolCount = effectiveContext.tools?.length ?? 0;
         const systemPromptBytes = Buffer.byteLength(effectiveContext.systemPrompt ?? "");
-        if (systemPromptBytes > MAX_SYSTEM_PROMPT_BYTES) {
-          throw new ClaudeCodeError(
-            "system_prompt_size",
-            `Pi system prompt is ${systemPromptBytes} bytes; the supported limit is ${MAX_SYSTEM_PROMPT_BYTES}`,
-          );
-        }
-        prepared = await prepareRequest(effectiveContext);
+        // Measured on the post-hook effective context and before preparation: a
+        // system prompt no served model can hold is refused before any private
+        // file exists, because nothing later in the request can make room for it.
+        const systemPromptTokens = estimateTransportTokens(0, 0, systemPromptBytes, 0);
+        metrics.estimatedInputTokens = systemPromptTokens;
+        validateSystemPromptBudget(model, systemPromptTokens, options?.maxTokens, effort);
+        prepared = await prepareRequest(effectiveContext, imageLease);
         metrics.cleanupComplete = false;
         metrics.lastPhase = "prepared";
         const estimatedInputTokens = estimateTransportTokens(
@@ -246,18 +241,6 @@ export function createClaudeStream(
         metrics.imageBytes = prepared.imageBytes;
         metrics.estimatedInputTokens = estimatedInputTokens;
         const maxOutputTokens = availableOutputTokens(model, estimatedInputTokens, options?.maxTokens, effort);
-        const { args, prompt } = providerArgs(prepared, model.id, effort);
-        const expectedTools = new Set(prepared.toolNames.keys());
-        mapper = new ClaudeEventMapper({
-          stream,
-          output,
-          expectedTools,
-          toolNames: prepared.toolNames,
-          onToolUse: stopForToolUse,
-          onRateLimitNotice,
-          onResponseAnnouncement: announceResponse,
-          privatePaths: [prepared.directory],
-        });
 
         // Configuration must fail before a paid budget slot is claimed or a
         // Claude process is spawned.
@@ -272,75 +255,78 @@ export function createClaudeStream(
           timeoutSetting("PI_CLAUDE_CODE_PROVIDER_MCP_READY_TIMEOUT_MS", DEFAULT_MCP_READY_TIMEOUT_MS),
           totalTimeoutMs,
         );
+        const { args, prompt } = providerArgs(prepared, model.id, effort, {
+          transcriptBreakpoint: transcriptBreakpointEnabled(),
+        });
+        const expectedTools = new Set(prepared.toolNames.keys());
+        mapper = new ClaudeEventMapper({
+          stream,
+          output,
+          expectedTools,
+          toolNames: prepared.toolNames,
+          onToolUse: stopForToolUse,
+          onRateLimitNotice,
+          onResponseAnnouncement: announceResponse,
+          privatePaths: [prepared.directory, ...(prepared.imageStoreDirectory ? [prepared.imageStoreDirectory] : [])],
+        });
 
         // Phase 2 — claim the launch, spawn Claude, and record exact ownership.
-        // Pi can cancel before asynchronous request preparation finishes. Do
-        // not briefly launch Claude or its MCP child for an already-dead turn;
-        // the finally path still removes the prepared private directory.
-        if (options?.signal?.aborted) {
-          errorCategory = "aborted";
-          mapper.fail("Claude Code request was aborted", true);
-          return;
-        }
-
-        await claimLaunch();
-        // The claim can suspend, and an abort while it was pending has no
-        // listener yet; re-check so a dead turn never pays for a spawn.
-        if (options?.signal?.aborted) {
-          errorCategory = "aborted";
-          mapper.fail("Claude Code request was aborted", true);
-          return;
-        }
-        const launch = claudeLaunch(installation.executable, args);
-        child = spawn(launch.command, launch.args, {
-          cwd: prepared.directory,
-          env: buildClaudeEnvironment({
-            ...launch.env,
+        // Pi can cancel before asynchronous preparation finishes. An aborted
+        // request fails here without launching Claude or its MCP child, and the
+        // catch path still removes the prepared private directory.
+        await claimClaudeLaunch(options?.signal, claimLaunch);
+        const running = spawnClaudeProcess({
+          installation,
+          args,
+          env: {
             CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(maxOutputTokens),
             ...(prepared.catalogPath ? { PI_CLAUDE_TOOL_CATALOG: prepared.catalogPath } : {}),
-          }),
-          detached: process.platform !== "win32",
-          windowsHide: process.platform === "win32",
-          stdio: ["pipe", "pipe", "pipe"],
-        });
-        metrics.lastPhase = "spawned";
-        supervisor = supervise(child, {
+          },
+          directory: prepared.directory,
+          privatePaths: prepared.imageStoreDirectory ? [prepared.imageStoreDirectory] : [],
+          cwd,
+          stdin: "pipe",
           idleTimeoutMs,
           totalTimeoutMs,
+          signal: options?.signal,
+          supervise,
           onFailure(error) {
+            const vanished = vanishedWorkingDirectory(error, cwd);
             if (error instanceof ProcessTerminationError) errorCategory = "process_cleanup";
+            else if (vanished) errorCategory = "working_directory";
             else errorCategory ??= "process";
-            mapper?.fail(error.message, options?.signal?.aborted === true);
+            mapper?.fail((vanished ?? error).message, options?.signal?.aborted === true);
+          },
+          onAbort() {
+            terminationCause = "caller_abort";
+            errorCategory = "aborted";
+            metrics.terminationExpected = true;
+            mapper?.fail("Claude Code request was aborted", true);
+          },
+          onBackgroundTerminationFailure() {
+            // The supervisor rejects wait() promptly on this same failure; the
+            // catch path owns the complete, non-duplicated user message.
+            errorCategory ??= "process_cleanup";
           },
         });
-
-        // Register cancellation before any further await so no abort can land
-        // between the spawn and its listener.
-        abortHandler = (): void => {
-          terminationCause = "caller_abort";
-          errorCategory = "aborted";
-          metrics.terminationExpected = true;
-          mapper?.fail("Claude Code request was aborted", true);
-          terminateInBackground();
-        };
-        options?.signal?.addEventListener("abort", abortHandler, { once: true });
-        if (options?.signal?.aborted) abortHandler();
-
-        await recordRuntimeChild(prepared.directory, child.pid ?? 0);
+        claude = running;
+        metrics.lastPhase = "spawned";
+        await running.recordOwnership();
 
         // Phase 3 — consume and validate Claude's ordered JSONL protocol.
+        const { child } = running;
         let recordProcessing = Promise.resolve();
         const failProtocol = (error: unknown): void => {
           if (mapper?.isTerminal) return;
           errorCategory ??= error instanceof ClaudeCodeError ? error.code : "protocol";
           mapper?.fail(errorText(error));
-          terminateInBackground();
+          running.terminateInBackground();
         };
         const parser = new JsonlParser((value) => {
           recordProcessing = recordProcessing
             .then(async () => {
               if (mapper?.isTerminal) return;
-              supervisor?.touch();
+              running.supervisor.touch();
               mapper?.accept(value, terminationCause);
               await mapper?.settleResponseAnnouncement();
             })
@@ -374,15 +360,12 @@ export function createClaudeStream(
         child.stdout?.on("end", finishStdout);
         child.stdout?.once("close", finishStdout);
         if (!child.stdout) finishStdout();
-        child.stderr?.on("data", (chunk: Buffer) => {
-          stderr = tailText(stderr, chunk, MAX_STDERR_BYTES);
-        });
 
         if (prepared.readyPath) {
           const currentMapper = mapper;
-          await waitForReadyOrExit(prepared.readyPath, readyTimeoutMs, options?.signal, supervisor.wait(), {
+          await waitForReadyOrExit(prepared.readyPath, readyTimeoutMs, options?.signal, running.supervisor.wait(), {
             bridgeArgv: bridgeArgv(prepared.bunConfigPath),
-            stderr: () => stderr,
+            stderr: () => running.stderrExcerpt(),
             // Claude's validated init record proves the server connected, and a
             // published failure has already decided the request. Either one ends
             // the wait, so a slow marker cannot mask the answer Claude already gave.
@@ -399,15 +382,18 @@ export function createClaudeStream(
           );
         }
 
-        const result = await supervisor.wait();
+        const result = await running.supervisor.wait();
         await stdoutDone;
-        await new Promise<void>((resolve) => setImmediate(resolve));
         exitCode = result.code;
         exitSignal = result.signal;
         metrics.lastPhase = "process_exited";
-        await terminateCurrent();
+        await running.terminate();
 
         // Phase 4 — validate the exit and private state before publishing success.
+        const stderrDetail = (): string => {
+          const excerpt = running.stderrExcerpt();
+          return excerpt ? `: ${excerpt}` : "";
+        };
         if (toolUse) {
           if (prepared.violationPath && (await pathExists(prepared.violationPath))) {
             errorCategory = "mcp_execution";
@@ -416,7 +402,7 @@ export function createClaudeStream(
                 "Security invariant violated: Claude Code attempted to execute a Pi proposal tool internally",
               ),
             );
-          } else if (containsPrivateTransportToolArgument(output, prepared.directory)) {
+          } else if (containsPrivateTransportToolArgument(output, [prepared.directory, ...(prepared.imageStoreDirectory ? [prepared.imageStoreDirectory] : [])])) {
             errorCategory = "private_transport";
             mapper.fail(
               await failureAfterCleanup("Claude Code proposed a Pi tool call against provider-private transport state"),
@@ -437,10 +423,9 @@ export function createClaudeStream(
         } else if (mapper.hasSuccessfulResult) {
           if (result.code !== 0 || result.signal !== null) {
             errorCategory ??= "process_exit";
-            const detail = stderr.trim() ? `: ${stderr.trim()}` : "";
             mapper.fail(
               await failureAfterCleanup(
-                `Claude Code exited after a successful result (code ${String(result.code)}, signal ${String(result.signal)})${detail}`,
+                `Claude Code exited after a successful result (code ${String(result.code)}, signal ${String(result.signal)})${stderrDetail()}`,
               ),
             );
           } else {
@@ -449,39 +434,31 @@ export function createClaudeStream(
           }
         } else if (!mapper.isTerminal) {
           errorCategory ??= mapper.rateLimitFailure ? "rate_limit" : "process_exit";
-          const detail = stderr.trim() ? `: ${stderr.trim()}` : "";
           mapper.fail(
             await failureAfterCleanup(
               mapper.rateLimitFailure ??
-                `Claude Code exited before a terminal event (code ${String(result.code)}, signal ${String(result.signal)})${detail}`,
+                `Claude Code exited before a terminal event (code ${String(result.code)}, signal ${String(result.signal)})${stderrDetail()}`,
             ),
           );
         }
-      } catch (error) {
-        if (error instanceof ProcessTerminationError) {
-          processLivenessUnknown = true;
-          errorCategory = "process_cleanup";
-        } else errorCategory ??= error instanceof ClaudeCodeError
+      } catch (caught) {
+        const error = vanishedWorkingDirectory(caught, cwd) ?? caught;
+        if (error instanceof ProcessTerminationError) errorCategory = "process_cleanup";
+        else errorCategory ??= error instanceof ClaudeCodeError
           ? error.code
           : options?.signal?.aborted
             ? "aborted"
-            : error === terminationFailure
+            : claude?.isTerminationFailure(error)
               ? "process_cleanup"
               : "provider";
-        let failure = errorText(error);
-        if (error instanceof ProcessTerminationError) {
-          failure += "; provider-private runtime state was retained because process death could not be established";
-        }
-        if (!(error instanceof ProcessTerminationError)) {
-          try {
-            await terminateCurrent();
-          } catch (terminationError) {
-            if (terminationError instanceof ProcessTerminationError) processLivenessUnknown = true;
-            if (terminationError !== error) {
-              failure = appendCleanupFailure(failure, "Claude Code process tree", terminationError);
-            }
-          }
-        }
+        const settled = await settleFailure(
+          claude,
+          error,
+          errorText(error),
+          "provider-private runtime state was retained because process death could not be established",
+        );
+        if (settled.livenessUnknown) processLivenessUnknown = true;
+        let failure = settled.message;
         try {
           await cleanupPrepared();
         } catch (cleanupError) {
@@ -523,6 +500,51 @@ export function isExpectedToolHandoffExit(
   return platform === "win32" ? result.code === 1 : result.code === 143;
 }
 
+/**
+ * Claude runs in Pi's session directory, not its private request directory.
+ * Claude Code tells the model its process cwd is the primary working
+ * directory; a private path there contradicts Pi's system prompt and
+ * draws tool calls into provider state. An unusable directory therefore fails
+ * before anything is prepared or launched, because substituting any other
+ * directory would bring that contradiction back.
+ */
+async function requireWorkingDirectory(directory: string | undefined): Promise<string> {
+  if (!directory) {
+    throw new ClaudeCodeError(
+      "working_directory",
+      "Pi's session working directory is not available; the provider can only run inside a started Pi session",
+    );
+  }
+  if (!isAbsolute(directory)) {
+    throw new ClaudeCodeError("working_directory", `Pi's session working directory is not absolute: ${directory}`);
+  }
+  let isDirectory: boolean;
+  try {
+    isDirectory = (await stat(directory)).isDirectory();
+  } catch (error) {
+    throw new ClaudeCodeError(
+      "working_directory",
+      `Pi's session working directory is unavailable: ${directory} (${errorCode(error) ?? errorText(error)}); restart Pi in an existing directory`,
+    );
+  }
+  if (!isDirectory) {
+    throw new ClaudeCodeError("working_directory", `Pi's session working directory is not a directory: ${directory}`);
+  }
+  return directory;
+}
+
+/**
+ * A directory removed after validation makes spawn fail with ENOENT, which reads
+ * as a missing Claude executable. Name the directory instead; never retry elsewhere.
+ */
+function vanishedWorkingDirectory(error: unknown, directory: string | undefined): ClaudeCodeError | undefined {
+  if (!directory || errorCode(error) !== "ENOENT" || existsSync(directory)) return undefined;
+  return new ClaudeCodeError(
+    "working_directory",
+    `Pi's session working directory disappeared before Claude Code could start: ${directory}; restart Pi in an existing directory`,
+  );
+}
+
 function timeoutSetting(name: string, fallback: number): number {
   const raw = process.env[name]?.trim();
   if (!raw) return fallback;
@@ -551,21 +573,14 @@ function estimateTransportTokens(transcriptBytes: number, catalogBytes: number, 
 }
 
 /**
- * The response ceiling this transport gives Claude Code. Two rules, both Pi's own:
- * a requested cap budgets the answer and reasoning is added on top of it
- * (`adjustMaxTokensForThinking`), and the result is clamped to the room the
- * context window actually has left (`clampMaxTokensToContext`). Reserving the
- * model maximum instead used to reject requests whose prompt fit with tens of
- * thousands of tokens to spare, and squeezing reasoning inside a small
- * requested cap truncated the answer it was supposed to protect — a compaction
- * summary cut off mid-sentence is discarded whole, and Pi pays to make another.
+ * The response ceiling before the context window is consulted, following Pi's
+ * own rule (`adjustMaxTokensForThinking`): a requested cap budgets the answer
+ * and reasoning is added on top of it, bounded by the model maximum. Squeezing
+ * reasoning inside a small requested cap truncated the answer it was supposed
+ * to protect — a compaction summary cut off mid-sentence is discarded whole,
+ * and Pi pays to make another.
  */
-export function availableOutputTokens(
-  model: Model<Api>,
-  estimatedInputTokens: number,
-  requested: number | undefined,
-  effort: string,
-): number {
+function outputCeiling(model: Model<Api>, requested: number | undefined, effort: string): number {
   const modelMaximum = model.maxTokens ?? 0;
   if (!Number.isSafeInteger(modelMaximum) || modelMaximum <= 0) {
     throw new ClaudeCodeError("max_tokens", "Pi maxTokens must be a positive integer");
@@ -573,13 +588,84 @@ export function availableOutputTokens(
   if (requested !== undefined && (!Number.isSafeInteger(requested) || requested <= 0)) {
     throw new ClaudeCodeError("max_tokens", "Pi maxTokens must be a positive integer");
   }
-  const ceiling = requested === undefined
+  return requested === undefined
     ? modelMaximum
     : Math.min(requested + (THINKING_BUDGET_TOKENS[effort] ?? 0), modelMaximum);
-  const contextWindow = model.contextWindow ?? 0;
-  if (contextWindow <= 0) return ceiling;
-  const safety = Math.min(CONTEXT_SAFETY_TOKENS, Math.floor(contextWindow / 10));
-  const available = contextWindow - estimatedInputTokens - safety;
+}
+
+/**
+ * A served context window is required rather than assumed. Skipping validation
+ * when none is reported would leave the request with no bound at all, and
+ * inventing a fallback ceiling would add a second unexplained limit that still
+ * could not show the request fits a window nobody stated.
+ *
+ * Only positivity and finiteness are required, because the value is compared
+ * and never propagated; a fractional override is harmless. Pi rejects a
+ * non-positive `contextWindow` when a custom model is defined but not when one
+ * overrides a registered model, so an override is the reachable cause here and
+ * the message names it.
+ */
+function requireContextWindow(model: Model<Api>): number {
+  const contextWindow = model.contextWindow;
+  if (typeof contextWindow !== "number" || !Number.isFinite(contextWindow) || contextWindow <= 0) {
+    throw new ClaudeCodeError(
+      "context_window",
+      `Pi model ${model.id} reports no usable context window (${String(contextWindow)}); ` +
+        `a positive number is required. Check for a contextWindow override on this model in Pi's model configuration.`,
+    );
+  }
+  return contextWindow;
+}
+
+/** Pi's context safety margin for a window, bounded by a tenth of it. */
+function contextSafetyTokens(contextWindow: number): number {
+  return Math.min(CONTEXT_SAFETY_TOKENS, Math.floor(contextWindow / 10));
+}
+
+/**
+ * Reject a system prompt that cannot fit even alone: once the context safety
+ * margin and the smallest reply the ceiling allows are set aside, no transcript
+ * could ever follow it. The whole output ceiling is not reserved here, for the
+ * same reason `availableOutputTokens` clamps it rather than reserving it. The
+ * wording deliberately avoids `context_length_exceeded`: that phrase matches
+ * Pi's context-overflow patterns, which would spend a summarization request
+ * compacting history that can never make room for the system prompt.
+ */
+function validateSystemPromptBudget(
+  model: Model<Api>,
+  systemTokens: number,
+  requested: number | undefined,
+  effort: string,
+): void {
+  const minimumReply = Math.min(MIN_ANSWER_TOKENS, outputCeiling(model, requested, effort));
+  const contextWindow = requireContextWindow(model);
+  const safety = contextSafetyTokens(contextWindow);
+  if (systemTokens + safety + minimumReply > contextWindow) {
+    throw new ClaudeCodeError(
+      "system_prompt_budget",
+      `Pi system prompt alone needs about ${systemTokens} tokens; with the ${minimumReply}-token minimum reply ` +
+        `and ${safety}-token safety margin that exceeds the ${contextWindow}-token context of ${model.id}. ` +
+        `Reduce loaded system instructions, project context, or skill descriptions, or select a larger-context model.`,
+    );
+  }
+}
+
+/**
+ * The response ceiling this transport gives Claude Code: `outputCeiling`,
+ * clamped to the room the context window actually has left
+ * (`clampMaxTokensToContext`). Reserving the model maximum instead used to
+ * reject requests whose prompt fit with tens of thousands of tokens to spare,
+ * and each refusal made Pi compact.
+ */
+export function availableOutputTokens(
+  model: Model<Api>,
+  estimatedInputTokens: number,
+  requested: number | undefined,
+  effort: string,
+): number {
+  const ceiling = outputCeiling(model, requested, effort);
+  const contextWindow = requireContextWindow(model);
+  const available = contextWindow - estimatedInputTokens - contextSafetyTokens(contextWindow);
   if (available < Math.min(MIN_ANSWER_TOKENS, ceiling)) {
     throw new ClaudeCodeError(
       "context_budget",
@@ -592,7 +678,7 @@ export function availableOutputTokens(
 /** Control and evidence for the readiness wait; evidence is gathered only on failure. */
 export interface ReadyWaitOptions {
   bridgeArgv?: readonly string[];
-  /** Claude Code's stderr so far, read lazily so a healthy request pays nothing. */
+  /** A bounded, redacted excerpt of Claude Code's stderr so far, read lazily so a healthy request pays nothing. */
   stderr?: () => string;
   /** Another signal that the wait is over, checked beside the ready marker. */
   settled?: () => boolean;
@@ -650,7 +736,7 @@ function readyDiagnosticSuffix(options: ReadyWaitOptions): string {
     ? `; Claude Code was told to launch argv: ${formatBridgeArgv(options.bridgeArgv)}`
     : "";
   const captured = options.stderr?.().trim() ?? "";
-  const stderr = captured ? `; Claude Code stderr: ${captured.slice(-READY_STDERR_BYTES)}` : "";
+  const stderr = captured ? `; Claude Code stderr: ${captured}` : "";
   return `${command}${stderr}; run /pi-claude-code-provider-doctor to complete the handshake directly`;
 }
 
@@ -668,12 +754,12 @@ async function pathExists(path: string): Promise<boolean> {
   }
 }
 
-function containsPrivateTransportToolArgument(output: MutableOutput, directory: string): boolean {
-  // Normalize the needle once: tool arguments can carry hundreds of kilobytes
+function containsPrivateTransportToolArgument(output: MutableOutput, directories: readonly string[]): boolean {
+  // Normalize the needles once: tool arguments can carry hundreds of kilobytes
   // of model-authored text, and this scan runs over every one of them.
-  const normalizedDirectory = directory.normalize("NFC");
+  const normalizedDirectories = directories.map((directory) => directory.normalize("NFC"));
   return output.content.some(
-    (block) => block.type === "toolCall" && containsPrivateTransportPath(block.arguments, normalizedDirectory),
+    (block) => block.type === "toolCall" && normalizedDirectories.some((directory) => containsPrivateTransportPath(block.arguments, directory)),
   );
 }
 
@@ -691,8 +777,9 @@ async function applyPayloadHook(model: Model<Api>, context: Context, options?: S
     tools: context.tools,
   };
   // Pi supplies this callback even when no extension handler replaces the
-  // payload. Validate the effective post-callback object here; serialization
-  // remains a separate fail-closed defense for direct/internal callers.
+  // payload. Only the top-level shape is checked here, because the system-prompt
+  // budget reads it before preparation; prepareRequest owns every per-message,
+  // per-block, and per-tool rule.
   const replacement = await options?.onPayload?.(logical, model);
   return validateLogicalPayload(replacement === undefined ? logical : replacement);
 }
@@ -711,81 +798,5 @@ function validateLogicalPayload(value: unknown): Context {
   if (payload.systemPrompt !== undefined && typeof payload.systemPrompt !== "string") {
     throw new ClaudeCodeError("payload_invalid", "Logical provider systemPrompt must be a string");
   }
-  for (const message of payload.messages as unknown[]) validateLogicalMessage(message);
-  for (const tool of (payload.tools ?? []) as unknown[]) validateLogicalTool(tool);
   return { systemPrompt: payload.systemPrompt, messages: payload.messages, tools: payload.tools };
-}
-
-function validateLogicalMessage(value: unknown): void {
-  const message = logicalObject(value, "message");
-  if (message.role === "user") {
-    if (typeof message.content === "string") return;
-    validateContent(message.content, new Set(["text", "image"]), "user");
-    return;
-  }
-  if (message.role === "assistant") {
-    validateContent(message.content, new Set(["text", "thinking", "toolCall"]), "assistant");
-    return;
-  }
-  if (message.role === "toolResult") {
-    nonemptyString(message.toolCallId, "tool-result ID");
-    nonemptyString(message.toolName, "tool-result name");
-    if (typeof message.isError !== "boolean") invalidPayload("Tool-result isError must be boolean");
-    validateContent(message.content, new Set(["text", "image"]), "toolResult");
-    return;
-  }
-  invalidPayload(`Unsupported logical message role: ${String(message.role)}`);
-}
-
-function validateContent(value: unknown, allowed: ReadonlySet<string>, role: string): void {
-  if (!Array.isArray(value)) invalidPayload(`Logical ${role} content must be an array`);
-  for (const valueBlock of value) {
-    const block = logicalObject(valueBlock, `${role} content block`);
-    if (typeof block.type !== "string" || !allowed.has(block.type)) {
-      invalidPayload(`Unsupported logical ${role} content block: ${String(block.type)}`);
-    }
-    if (block.type === "text") {
-      if (typeof block.text !== "string") invalidPayload("Logical text content must contain text");
-    } else if (block.type === "thinking") {
-      if (typeof block.thinking !== "string") invalidPayload("Logical thinking content must contain thinking");
-      if (block.redacted !== undefined && typeof block.redacted !== "boolean") invalidPayload("Logical thinking redacted must be boolean");
-    } else if (block.type === "toolCall") {
-      nonemptyString(block.id, "tool-call ID");
-      nonemptyString(block.name, "tool-call name");
-      serializableObject(block.arguments, "tool-call arguments");
-    } else if (block.type === "image") {
-      if (typeof block.data !== "string" || typeof block.mimeType !== "string") {
-        invalidPayload("Logical image content must contain string data and mimeType");
-      }
-    }
-  }
-}
-
-function validateLogicalTool(value: unknown): void {
-  const tool = logicalObject(value, "tool");
-  nonemptyString(tool.name, "tool name");
-  if (typeof tool.description !== "string") invalidPayload("Logical tool description must be a string");
-  serializableObject(tool.parameters, "tool schema");
-}
-
-function logicalObject(value: unknown, label: string): Record<string, unknown> {
-  if (!value || typeof value !== "object" || Array.isArray(value)) invalidPayload(`Logical ${label} must be an object`);
-  return value as Record<string, unknown>;
-}
-
-function nonemptyString(value: unknown, label: string): void {
-  if (typeof value !== "string" || !value.trim()) invalidPayload(`Logical ${label} must be a nonempty string`);
-}
-
-function serializableObject(value: unknown, label: string): void {
-  if (!value || typeof value !== "object" || Array.isArray(value)) invalidPayload(`Logical ${label} must be an object`);
-  try {
-    if (typeof JSON.stringify(value) !== "string") invalidPayload(`Logical ${label} must be JSON-serializable`);
-  } catch {
-    invalidPayload(`Logical ${label} must be JSON-serializable`);
-  }
-}
-
-function invalidPayload(message: string): never {
-  throw new ClaudeCodeError("payload_invalid", message);
 }

@@ -3,8 +3,19 @@ import { realpathSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
-import test from "node:test";
-import { isCompiledPi, livePiLaunch, locatePiPackages, piCliEntry } from "../../scripts/lib/pi-installation.js";
+import test, { afterEach, beforeEach } from "node:test";
+import { DEV_PI_ENV, isCompiledPi, livePiLaunch, locatePiPackages, piCliEntry } from "../../scripts/lib/pi-installation.js";
+
+// These cases select Pi through PATH; a maintainer's exported development
+// override would otherwise redirect every one of them.
+const originalDevPi = process.env[DEV_PI_ENV];
+beforeEach(() => {
+  delete process.env[DEV_PI_ENV];
+});
+afterEach(() => {
+  if (originalDevPi === undefined) delete process.env[DEV_PI_ENV];
+  else process.env[DEV_PI_ENV] = originalDevPi;
+});
 
 test("locates Pi packages in the bundled Windows-installer layout", async () => {
   const prefix = await mkdtemp(join(tmpdir(), "pi-installation-layout-"));
@@ -14,10 +25,10 @@ test("locates Pi packages in the bundled Windows-installer layout", async () => 
   const shim = join(prefix, "pi");
   const originalPath = process.env.PATH;
   try {
-    await Promise.all([codingAgent, piAi, typebox, join(codingAgent, "dist")].map((path) => mkdir(path, { recursive: true })));
+    await Promise.all([codingAgent, piAi, typebox, join(codingAgent, "dist", "bundle")].map((path) => mkdir(path, { recursive: true })));
     await writeFile(shim, "#!/bin/sh\n", { mode: 0o700 });
     await chmod(shim, 0o700);
-    await writeFile(join(codingAgent, "package.json"), JSON.stringify({ name: "@earendil-works/pi-coding-agent", bin: { pi: "dist/cli.js" } }));
+    await writeFile(join(codingAgent, "package.json"), JSON.stringify({ name: "@earendil-works/pi-coding-agent", bin: { pi: "dist/bundle/cli.js" } }));
     await writeFile(join(piAi, "package.json"), JSON.stringify({ name: "@earendil-works/pi-ai" }));
     await writeFile(join(typebox, "package.json"), JSON.stringify({ name: "typebox" }));
     process.env.PATH = `${prefix}${delimiter}${originalPath ?? ""}`;
@@ -28,7 +39,7 @@ test("locates Pi packages in the bundled Windows-installer layout", async () => 
       piAi: join(canonicalPrefix, "node_modules", "@earendil-works", "pi-coding-agent", "node_modules", "@earendil-works", "pi-ai"),
       typebox: join(canonicalPrefix, "node_modules", "@earendil-works", "pi-coding-agent", "node_modules", "typebox"),
     });
-    assert.equal(piCliEntry(codingAgent), join(codingAgent, "dist", "cli.js"));
+    assert.equal(piCliEntry(codingAgent), join(codingAgent, "dist", "bundle", "cli.js"));
   } finally {
     if (originalPath === undefined) delete process.env.PATH;
     else process.env.PATH = originalPath;
@@ -124,7 +135,7 @@ test("an npm shim resolves even though it is not a shebang script", async () => 
     // a compiled binary would reject every Windows npm development host.
     await writeFile(shim, "@ECHO off\r\nSETLOCAL\r\n", { mode: 0o700 });
     await chmod(shim, 0o700);
-    await writeFile(join(codingAgent, "package.json"), JSON.stringify({ name: "@earendil-works/pi-coding-agent", bin: { pi: "dist/cli.js" } }));
+    await writeFile(join(codingAgent, "package.json"), JSON.stringify({ name: "@earendil-works/pi-coding-agent", bin: { pi: "dist/bundle/cli.js" } }));
     await writeFile(join(codingAgent, "node_modules", "@earendil-works", "pi-ai", "package.json"), JSON.stringify({ name: "@earendil-works/pi-ai" }));
     await writeFile(join(codingAgent, "node_modules", "typebox", "package.json"), JSON.stringify({ name: "typebox" }));
     process.env.PATH = `${prefix}${delimiter}${originalPath ?? ""}`;
@@ -172,4 +183,61 @@ test("compiled Pi binaries are recognized by executable magic on every target", 
   } finally {
     await rm(prefix, { recursive: true, force: true });
   }
+});
+
+test("the development override takes precedence over PATH", async () => {
+  const prefix = await mkdtemp(join(tmpdir(), "pi-installation-override-"));
+  const codingAgent = join(prefix, "npm", "node_modules", "@earendil-works", "pi-coding-agent");
+  const shim = join(prefix, "npm", "pi");
+  const bin = join(prefix, "bin");
+  const originalPath = process.env.PATH;
+  try {
+    await Promise.all([join(codingAgent, "node_modules", "@earendil-works", "pi-ai"), join(codingAgent, "node_modules", "typebox"), bin]
+      .map((path) => mkdir(path, { recursive: true })));
+    // A pi first on PATH that no package owns: resolving it would fail.
+    for (const executable of [shim, join(bin, "pi")]) {
+      await writeFile(executable, "#!/bin/sh\n", { mode: 0o700 });
+      await chmod(executable, 0o700);
+    }
+    await writeFile(join(codingAgent, "package.json"), JSON.stringify({ name: "@earendil-works/pi-coding-agent", bin: { pi: "dist/bundle/cli.js" } }));
+    await writeFile(join(codingAgent, "node_modules", "@earendil-works", "pi-ai", "package.json"), JSON.stringify({ name: "@earendil-works/pi-ai" }));
+    await writeFile(join(codingAgent, "node_modules", "typebox", "package.json"), JSON.stringify({ name: "typebox" }));
+    process.env.PATH = `${bin}${delimiter}${originalPath ?? ""}`;
+    process.env[DEV_PI_ENV] = shim;
+    assert.equal(
+      locatePiPackages().codingAgent,
+      join(dirname(realpathSync(shim)), "node_modules", "@earendil-works", "pi-coding-agent"),
+    );
+  } finally {
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
+    await rm(prefix, { recursive: true, force: true });
+  }
+});
+
+test("a standalone pi on PATH names the development override", async () => {
+  const prefix = await mkdtemp(join(tmpdir(), "pi-installation-standalone-"));
+  const bin = join(prefix, "bin");
+  const originalPath = process.env.PATH;
+  try {
+    await mkdir(bin, { recursive: true });
+    const standalone = join(bin, "pi");
+    await writeFile(standalone, Buffer.from("7f454c4602010100", "hex"), { mode: 0o700 });
+    await chmod(standalone, 0o700);
+    process.env.PATH = `${bin}${delimiter}${originalPath ?? ""}`;
+    assert.throws(locatePiPackages, (error) => {
+      assert.match(error.message, /compiled standalone/);
+      assert.match(error.message, new RegExp(`set ${DEV_PI_ENV} to its pi executable`));
+      return true;
+    });
+  } finally {
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
+    await rm(prefix, { recursive: true, force: true });
+  }
+});
+
+test("an unusable development override fails by name", () => {
+  process.env[DEV_PI_ENV] = join(tmpdir(), "pi-installation-missing", "pi");
+  assert.throws(locatePiPackages, new RegExp(`^Error: ${DEV_PI_ENV} is set to .*, which is not an executable file$`));
 });

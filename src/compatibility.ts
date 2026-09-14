@@ -1,6 +1,6 @@
 export const VERIFIED_VERSIONS = Object.freeze({
   pi: "0.85.1",
-  claudeCode: "2.1.261",
+  claudeCode: "2.1.270",
 });
 
 // The oldest Pi and Claude Code this provider claims to support. Deliberately
@@ -8,10 +8,10 @@ export const VERIFIED_VERSIONS = Object.freeze({
 // gate has validated and rises on its own schedule. These fall or rise only by
 // an explicit decision about what is supported, so deriving one from the other
 // would turn every baseline bump into a silent, unreviewed support drop. Assert
-// nothing about their relative order: both start above today's baseline.
+// nothing about their relative order.
 export const MINIMUM_VERSIONS = Object.freeze({
   pi: "0.85.1",
-  claudeCode: "2.1.261",
+  claudeCode: "2.1.270",
 });
 
 const VERIFIED_PLATFORMS = "Linux/linux-x64, including WSL2; native Windows/win32-x64; macOS/darwin";
@@ -95,9 +95,9 @@ export function platformStatus(
       warning: `${current} is a compatibility candidate; the verified platform baselines are ${VERIFIED_PLATFORMS}`,
     };
   }
-  // Verified across architectures rather than per-arch: the reported macOS
-  // coverage is a community report, and this package has no darwin-specific
-  // code path that an Intel Mac would take differently.
+  // Verified across architectures rather than per-arch: macOS coverage is the
+  // deterministic CI matrix, and this package has no darwin-specific code path
+  // that an Intel Mac would take differently.
   if (platform === "darwin") {
     return {
       component: "Platform",

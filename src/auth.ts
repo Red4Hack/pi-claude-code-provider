@@ -182,12 +182,16 @@ const ALLOWED_ENVIRONMENT = [
   "LC_ALL",
   "LC_CTYPE",
   "TMPDIR",
+  // A relocated Claude Code configuration directory holds the login to use.
+  "CLAUDE_CONFIG_DIR",
   "HTTP_PROXY",
   "HTTPS_PROXY",
   "NO_PROXY",
   "http_proxy",
   "https_proxy",
   "no_proxy",
+  // The extra CA bundle a TLS-inspecting proxy requires.
+  "NODE_EXTRA_CA_CERTS",
 ] as const;
 
 export function buildClaudeEnvironment(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
@@ -196,6 +200,10 @@ export function buildClaudeEnvironment(extra: NodeJS.ProcessEnv = {}): NodeJS.Pr
     if (process.env[name] !== undefined) env[name] = process.env[name];
   }
   env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1";
+  // Claude Code collects git status, log, and user.name at startup for a default
+  // system prompt this provider replaces. Run in the user's project, that status
+  // can execute a configured Git clean filter before any Pi tool call.
+  env.CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS = "1";
   env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
   return { ...env, ...extra };
 }

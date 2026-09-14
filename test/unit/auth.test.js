@@ -44,6 +44,8 @@ test("builds an allowlisted Claude environment", () => {
         for (const name of forbidden)
             assert.equal(env[name], undefined);
         assert.equal(env.CLAUDE_CODE_DISABLE_AUTO_MEMORY, "1");
+        // Claude runs in the user's project; its startup git status can run configured Git filters.
+        assert.equal(env.CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS, "1");
         assert.equal(env.DISABLE_NON_ESSENTIAL_MODEL_CALLS, undefined);
         assert.equal(env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, "1");
         assert.equal(env.HOME, process.env.HOME);
@@ -54,6 +56,24 @@ test("builds an allowlisted Claude environment", () => {
                 delete process.env[name];
             else
                 process.env[name] = originals[name];
+        }
+    }
+});
+test("forwards a relocated Claude configuration and an extra CA bundle", () => {
+    const forwarded = { CLAUDE_CONFIG_DIR: "/custom/claude-config", NODE_EXTRA_CA_CERTS: "/custom/corporate-ca.pem" };
+    const originals = Object.fromEntries(Object.keys(forwarded).map((name) => [name, process.env[name]]));
+    Object.assign(process.env, forwarded);
+    try {
+        const env = buildClaudeEnvironment();
+        for (const [name, value] of Object.entries(forwarded))
+            assert.equal(env[name], value);
+    }
+    finally {
+        for (const [name, value] of Object.entries(originals)) {
+            if (value === undefined)
+                delete process.env[name];
+            else
+                process.env[name] = value;
         }
     }
 });
@@ -99,8 +119,8 @@ test("matches option aliases and value notation", () => {
 test("compares versions numerically rather than lexically", () => {
     // The failure this guards is real: "2.1.9" sorts above "2.1.241" as strings.
     assert.equal(meetsMinimumVersion("2.1.9", "2.1.241"), false);
-    assert.equal(meetsMinimumVersion("2.1.261", MINIMUM_VERSIONS.claudeCode), true);
-    assert.equal(meetsMinimumVersion("2.1.260", MINIMUM_VERSIONS.claudeCode), false);
+    assert.equal(meetsMinimumVersion("2.1.270", MINIMUM_VERSIONS.claudeCode), true);
+    assert.equal(meetsMinimumVersion("2.1.269", MINIMUM_VERSIONS.claudeCode), false);
     assert.equal(meetsMinimumVersion("2.2.0", MINIMUM_VERSIONS.claudeCode), true);
     assert.equal(meetsMinimumVersion("3.0.0", MINIMUM_VERSIONS.claudeCode), true);
     assert.equal(meetsMinimumVersion("0.85.1", MINIMUM_VERSIONS.pi), true);

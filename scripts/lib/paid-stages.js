@@ -17,6 +17,11 @@ export const PAID_STAGES = {
   full: { label: "full live", cap: 28, script: "live-test.js", args: ["--full"], toolBearing: true },
   "post-tools": { label: "post-tool live", cap: 6, script: "live-test.js", args: ["--post-tools"], toolBearing: true },
   cache: { label: "cache", cap: 3, script: "live-test.js", args: ["--cache"] },
+  // Haiku receives Claude Code's environment block ahead of the transcript, so a
+  // directory that varies per request breaks its reuse while Sonnet still passes.
+  "cache-haiku": { label: "Haiku cache", cap: 3, script: "live-test.js", args: ["--cache", "--cache-model", "haiku:low"] },
+  "cache-images": { label: "Sonnet image cache", cap: 3, script: "live-test.js", args: ["--cache-images", "--cache-model", "sonnet:low"] },
+  "cache-images-haiku": { label: "Haiku image cache", cap: 3, script: "live-test.js", args: ["--cache-images", "--cache-model", "haiku:low"] },
   // Fable 5 availability and included quota vary by subscription tier, so its
   // one-launch case is opt-in and excluded from the blocking gate.
   fable: { label: "fable model", cap: 1, script: "model-matrix.js", args: ["--case", "fable:medium"] },
@@ -24,7 +29,7 @@ export const PAID_STAGES = {
   matrix: { label: "model matrix", cap: 15, script: "model-matrix.js", args: [] },
 };
 
-export const RELEASE_ORDER = ["full", "cache", "bridge", "bridge-standalone", "matrix"];
+export const RELEASE_ORDER = ["full", "cache", "cache-haiku", "cache-images", "cache-images-haiku", "bridge", "bridge-standalone", "matrix"];
 
 /** A tool round trip costs at least two launches: propose, then continue after Pi executes. */
 export const MINIMUM_TOOL_BEARING_CAP = 2;

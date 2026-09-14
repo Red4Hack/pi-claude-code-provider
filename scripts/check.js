@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
+import { claudeExecutable } from "../src/auth.ts";
 import { MINIMUM_VERSIONS, VERIFIED_VERSIONS, versionStatus } from "../src/compatibility.ts";
 import { PI_PEERS, dependencyPolicyErrors } from "./lib/dependency-policy.js";
 import { piLaunch } from "./lib/pi-installation.js";
@@ -94,7 +95,7 @@ function commandVersion(command, args, pattern, required) {
 // without a shell on Windows, and shell interpolation is unnecessary here.
 const piVersionLaunch = piLaunch(["--version"]);
 const piVersion = commandVersion(piVersionLaunch.command, piVersionLaunch.args, /\d+\.\d+\.\d+/, true);
-const claudeVersion = commandVersion("claude", ["--version"], /\d+\.\d+\.\d+/, false);
+const claudeVersion = commandVersion(claudeExecutable(), ["--version"], /\d+\.\d+\.\d+/, false);
 for (const status of [
   versionStatus("Pi", piVersion, VERIFIED_VERSIONS.pi),
   ...(claudeVersion ? [versionStatus("Claude Code", claudeVersion, VERIFIED_VERSIONS.claudeCode)] : []),

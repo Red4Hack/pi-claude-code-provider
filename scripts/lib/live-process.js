@@ -68,6 +68,18 @@ export async function closeLiveRpcProcess(child, supervisor, closed, graceMs = 2
   }
 }
 
+/**
+ * The final assistant message among Pi's events. A turn that ended in a provider
+ * error (usage credits off, a rate limit, a lost login) carries no text, so its
+ * error is reported by name instead of failing a reply assertion on "".
+ */
+export function assistantReply(events, label) {
+  const message = events.filter((event) => event.type === "message_end" && event.message?.role === "assistant").at(-1)?.message;
+  if (!message) throw new Error(`${label} returned no assistant message`);
+  if (message.stopReason === "error") throw new Error(`${label}: ${message.errorMessage ?? "unknown assistant error"}`);
+  return message;
+}
+
 export function consumeJsonl(stream, onValue, onError) {
   const parser = new JsonlParser(onValue);
   let failed = false;

@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { EXPECTED_MODEL_FAMILIES } from "../src/compatibility.ts";
 import { inspectClaudeInstallation } from "../src/auth.ts";
 import { providerModelsForSubscription } from "../src/catalog.ts";
-import { consumeJsonl, superviseLiveProcess } from "./lib/live-process.js";
+import { assistantReply, consumeJsonl, superviseLiveProcess } from "./lib/live-process.js";
 import { livePiLaunch } from "./lib/pi-installation.js";
 import { servedContextWindowMatches } from "./lib/model-matrix-policy.js";
 
@@ -83,8 +83,7 @@ async function runCase(cwd, model, effort) {
     if (protocolError) throw new Error(`${model}:${effort}: ${protocolError}`);
     if (assistantError) throw new Error(`${model}:${effort}: ${assistantError}`);
     if (code !== 0 || signal !== null) throw new Error(`${model}:${effort} exited ${String(code)}, signal ${String(signal)}: ${stderr.trim()}`);
-    const message = events.filter((event) => event.type === "message_end" && event.message?.role === "assistant").at(-1)?.message;
-    if (!message) throw new Error(`${model}:${effort} returned no assistant message`);
+    const message = assistantReply(events, `${model}:${effort}`);
     const text = message.content.filter((block) => block.type === "text").map((block) => block.text).join("").trim();
     assert.match(text, /^OK\.?$/, `${model}:${effort} response text`);
     assert.match(message.responseModel, EXPECTED_MODEL_FAMILIES[model], `${model}:${effort} resolved model`);

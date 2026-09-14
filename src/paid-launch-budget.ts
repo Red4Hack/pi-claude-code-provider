@@ -1,5 +1,6 @@
 import { open } from "node:fs/promises";
 import { join } from "node:path";
+import { errorCode } from "./errors.ts";
 
 export const PAID_LAUNCH_BUDGET_ENV = Object.freeze({
   child: "PI_CLAUDE_CODE_PROVIDER_PAID_TEST_CHILD",
@@ -75,10 +76,4 @@ async function claimSlot(budget: LaunchBudget): Promise<void> {
     }
   }
   throw new Error(`Paid-test ${budget.label} cap of ${budget.cap} launches is exhausted; refusing to start Claude`);
-}
-
-function errorCode(error: unknown): string | undefined {
-  return error && typeof error === "object" && "code" in error && typeof error.code === "string"
-    ? error.code
-    : undefined;
 }

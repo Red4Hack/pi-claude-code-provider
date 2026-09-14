@@ -9,9 +9,10 @@ import { bridgeArgv, formatBridgeArgv } from "../../src/claude-args.ts";
 import { formatDoctorSummary, probeBridge } from "../../src/doctor.ts";
 import { ClaudeCodeError } from "../../src/errors.ts";
 import { appendRequestMetrics, appendSearchMetrics, flushMetricsLog, getLastRequestMetrics, getMetricsLogError, recordRequestMetrics, recordSearchMetrics, serializeRequestMetrics, serializeSearchMetrics } from "../../src/metrics.ts";
+import { CAPTURED_CLAUDE_VERSION } from "../support/claude-fixture.js";
 
 const metrics = {
-    schemaVersion: 4, timestamp: "2026-07-12T00:00:00.000Z", platform: "linux", architecture: "x64", nodeVersion: "v24.16.0", claudeVersion: "2.1.207", requestedModel: "sonnet", resolvedModel: "claude-sonnet-5", effort: "medium",
+    schemaVersion: 4, timestamp: "2026-07-12T00:00:00.000Z", platform: "linux", architecture: "x64", nodeVersion: "v24.16.0", claudeVersion: CAPTURED_CLAUDE_VERSION, requestedModel: "sonnet", resolvedModel: "claude-sonnet-5", effort: "medium",
     messageCount: 2, toolCount: 1, imageCount: 0, transcriptBytes: 100, catalogBytes: 50, imageBytes: 0, estimatedInputTokens: 1000,
     servedContextWindow: 1000000, servedMaxOutputTokens: 64000, cacheRead: 10, cacheWrite: 20, inputTokens: 30, outputTokens: 2,
     cacheHitPercent: 16.67, durationMs: 250, lastPhase: "completed", cleanupComplete: true, stopReason: "stop", exitCode: 0, exitSignal: null, terminationExpected: false,
@@ -38,7 +39,7 @@ test("metrics serialization is content-free, appendable, and mode 0600", async (
 test("web-search metrics append a discriminated content-free record", async () => {
     const directory = await mkdtemp(join(tmpdir(), "pi-claude-code-provider-search-metrics-"));
     const path = join(directory, "metrics.jsonl");
-    const search = { schemaVersion: 1, timestamp: metrics.timestamp, platform: "linux", architecture: "x64", nodeVersion: process.version, claudeVersion: "2.1.209", requestBytes: 12, capturedBytes: 34, resultBytes: 56, durationMs: 78, lastPhase: "completed", initialized: true, cleanupComplete: true, exitCode: 0, exitSignal: null };
+    const search = { schemaVersion: 1, timestamp: metrics.timestamp, platform: "linux", architecture: "x64", nodeVersion: process.version, claudeVersion: CAPTURED_CLAUDE_VERSION, requestBytes: 12, capturedBytes: 34, resultBytes: 56, durationMs: 78, lastPhase: "completed", initialized: true, cleanupComplete: true, exitCode: 0, exitSignal: null };
     try {
         assert.doesNotMatch(serializeSearchMetrics(search), /query|result text|secret/i);
         await appendSearchMetrics(path, search);
@@ -55,7 +56,7 @@ test("recording web-search metrics honors the configured private log", async () 
     const directory = await mkdtemp(join(tmpdir(), "pi-claude-code-provider-record-search-metrics-"));
     const path = join(directory, "metrics.jsonl");
     const original = process.env.PI_CLAUDE_CODE_PROVIDER_METRICS_LOG;
-    const search = { schemaVersion: 1, timestamp: metrics.timestamp, platform: "linux", architecture: "x64", nodeVersion: process.version, claudeVersion: "2.1.209", requestBytes: 1, capturedBytes: 2, resultBytes: 3, durationMs: 4, lastPhase: "completed", initialized: true, cleanupComplete: true };
+    const search = { schemaVersion: 1, timestamp: metrics.timestamp, platform: "linux", architecture: "x64", nodeVersion: process.version, claudeVersion: CAPTURED_CLAUDE_VERSION, requestBytes: 1, capturedBytes: 2, resultBytes: 3, durationMs: 4, lastPhase: "completed", initialized: true, cleanupComplete: true };
     process.env.PI_CLAUDE_CODE_PROVIDER_METRICS_LOG = path;
     try {
         recordSearchMetrics(search);
@@ -72,7 +73,7 @@ test("metrics flush serializes every queued provider and search record", async (
     const directory = await mkdtemp(join(tmpdir(), "pi-claude-code-provider-flush-metrics-"));
     const path = join(directory, "metrics.jsonl");
     const original = process.env.PI_CLAUDE_CODE_PROVIDER_METRICS_LOG;
-    const search = { schemaVersion: 1, timestamp: metrics.timestamp, platform: "linux", architecture: "x64", nodeVersion: process.version, claudeVersion: "2.1.209", requestBytes: 1, capturedBytes: 2, resultBytes: 3, durationMs: 4, lastPhase: "completed", initialized: true, cleanupComplete: true };
+    const search = { schemaVersion: 1, timestamp: metrics.timestamp, platform: "linux", architecture: "x64", nodeVersion: process.version, claudeVersion: CAPTURED_CLAUDE_VERSION, requestBytes: 1, capturedBytes: 2, resultBytes: 3, durationMs: 4, lastPhase: "completed", initialized: true, cleanupComplete: true };
     process.env.PI_CLAUDE_CODE_PROVIDER_METRICS_LOG = path;
     try {
         recordRequestMetrics(metrics);
@@ -133,7 +134,7 @@ test("doctor names the model each alias would be served, or says it cannot", () 
     assert.doesNotMatch(formatDoctorSummary(base), /Claude Code install/);
     const versions = { sonnet: "claude-sonnet-5", fable: "claude-fable-5-1", opus: "claude-opus-5", haiku: "claude-haiku-4-5" };
     const pro = formatDoctorSummary({ ...base, modelVersions: versions });
-    assert.match(pro, /models \(Claude Code install\): sonnet claude-sonnet-5, fable claude-fable-5-1 \(Pro: requires usage credits enabled\), opus claude-opus-5, haiku claude-haiku-4-5/);
+    assert.match(pro, /^Served models \(Claude Code install\): sonnet claude-sonnet-5, fable claude-fable-5-1 \(Pro: requires usage credits enabled\), opus claude-opus-5, haiku claude-haiku-4-5$/m);
     // The caveat is about entitlement, not detection: auth status exposes no
     // credit field, so the wording must not claim to know either way.
     assert.doesNotMatch(pro, /credits (?:are|enabled and|disabled)/);
@@ -152,13 +153,35 @@ test("doctor summary handles absent, successful, and failed request diagnostics"
     assert.match(formatDoctorSummary({ ...base, metrics: { ...metrics, inputTokens: 0, cacheRead: 0, cacheWrite: 0, cacheHitPercent: undefined } }), /reported token usage unavailable/);
     const failed = formatDoctorSummary({ ...base, metrics: { ...metrics, stopReason: "error", errorCategory: "protocol" } });
     assert.match(failed, /error \(protocol\)/);
-    assert.match(formatDoctorSummary({ ...base, metricsLogError: "EACCES" }), /metrics log error: EACCES/);
-    assert.match(formatDoctorSummary({ ...base, runtimeCleanup: { removed: 2, failures: 1, reaped: 0 } }), /stale runtime cleanup: 2 removed, 0 abandoned Claude processes terminated, 1 failure/);
+    assert.match(formatDoctorSummary({ ...base, metricsLogError: "EACCES" }), /^Metrics log error: EACCES$/m);
+    assert.match(formatDoctorSummary({ ...base, runtimeCleanup: { removed: 2, failures: 1, reaped: 0 } }), /^Stale runtime cleanup: 2 removed, 1 failure$/m);
     // An abandoned Claude process group that outlived its Pi host is reported on
     // its own: it explains both a reclaimed machine and a spent subscription slot.
-    assert.match(formatDoctorSummary({ ...base, runtimeCleanup: { removed: 1, failures: 0, reaped: 1 } }), /1 removed, 1 abandoned Claude process terminated, 0 failures/);
+    assert.match(formatDoctorSummary({ ...base, runtimeCleanup: { removed: 1, failures: 0, reaped: 1 } }), /^Stale runtime cleanup: 1 removed, 1 abandoned Claude process terminated, 0 failures$/m);
     assert.match(formatDoctorSummary({ ...base, metrics: { ...metrics, cleanupComplete: false, errorCategory: "process_cleanup" } }), /process_cleanup.*cleanup incomplete/);
     assert.doesNotMatch(failed, /prompt|secret|pi-claude-code-provider-/i);
+});
+
+test("doctor summary puts one labeled fact on each line", () => {
+    const lines = formatDoctorSummary({ ...doctorBase(), metrics, metricsLogError: "EACCES" }).split("\n");
+    assert.equal(lines[0], "Platform linux/x64 (verified); Pi 1 (verified); Claude Code 2 (unverified; tested 1)");
+    assert.deepEqual(lines.slice(1).map((line) => line.slice(0, line.indexOf(":"))), ["Runtime", "Claude", "Models", "Last request", "Metrics log error"]);
+    assert.equal(lines[2], "Claude: /usr/bin/claude (pro subscription)");
+});
+
+test("the diagnostic report records whether the transcript breakpoint is disabled", async () => {
+    const original = process.env.PI_CLAUDE_CODE_PROVIDER_TRANSCRIPT_BREAKPOINT;
+    process.env.PI_CLAUDE_CODE_PROVIDER_TRANSCRIPT_BREAKPOINT = "off";
+    let path;
+    try {
+        path = await writeDiagnosticReport(doctorBase());
+        assert.equal(JSON.parse(await readFile(path, "utf8")).overrides.transcriptBreakpointDisabled, true);
+    }
+    finally {
+        if (original === undefined) delete process.env.PI_CLAUDE_CODE_PROVIDER_TRANSCRIPT_BREAKPOINT;
+        else process.env.PI_CLAUDE_CODE_PROVIDER_TRANSCRIPT_BREAKPOINT = original;
+        if (path) await rm(dirname(path), { recursive: true, force: true });
+    }
 });
 
 test("diagnostic reports are bounded, private, redacted, and content-free", async () => {
@@ -197,13 +220,13 @@ test("the doctor completes a real bridge handshake under the hosting runtime", a
     // A version or path check passes on an install whose bridge can never start,
     // so the summary must surface the handshake result and the resolved command.
     const summary = formatDoctorSummary({ ...doctorBase(), bridgeProbe: probe });
-    assert.match(summary, /bridge ok via /);
-    assert.match(summary, new RegExp(`runtime ${process.versions.bun ? "Bun" : "Node"} `));
+    assert.match(summary, /^Bridge: ok via /m);
+    assert.match(summary, new RegExp(`^Runtime: ${process.versions.bun ? "Bun" : "Node"} `, "m"));
     const broken = formatDoctorSummary({
         ...doctorBase(),
         bridgeProbe: { ok: false, argv: probe.argv, detail: "handshake failed (no tools/list result, ready marker missing)" },
     });
-    assert.match(broken, /bridge BROKEN via .*ready marker missing/);
+    assert.match(broken, /^Bridge: BROKEN via .*ready marker missing\)\)$/m);
 });
 
 test("the diagnostic report records the distribution that decides bridge launching", async () => {

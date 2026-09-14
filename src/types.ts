@@ -17,6 +17,7 @@ export interface ClaudeAuthStatus {
 
 export interface PreparedRequest {
   directory: string;
+  imageStoreDirectory?: string;
   transcriptBlocks: string[];
   attachmentPaths: string[];
   systemPromptPath: string;
@@ -89,6 +90,5 @@ export interface LogicalProviderPayload {
   tools?: Tool[];
 }
 
-export interface MutableOutput extends AssistantMessage {
-  content: AssistantMessage["content"];
-}
+/** The assistant message a provider request builds up and publishes. */
+export type MutableOutput = AssistantMessage;

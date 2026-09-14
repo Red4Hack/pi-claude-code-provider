@@ -1,7 +1,7 @@
 import { chmod, lstat, mkdtemp, readFile, readdir, readlink, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { isProcessAlive, isValidPid } from "./process-utils.ts";
+import { isProcessAlive, validPid } from "./process-utils.ts";
 
 const MARKER_NAME = ".pi-claude-code-provider-runtime.json";
 const MARKER_SCHEMA = "pi-claude-code-provider-runtime-v1";
@@ -12,10 +12,11 @@ const MAX_CLEANUP_CANDIDATES = 256;
 const MAX_REAPED_PROCESSES = 8;
 const REAP_GRACE_MS = 250;
 
-export type RuntimeDirectoryKind = "provider_request" | "web_search_request" | "web_search_output";
+export type RuntimeDirectoryKind = "provider_request" | "provider_image_store" | "web_search_request" | "web_search_output";
 
 const PREFIXES: Record<RuntimeDirectoryKind, string> = {
   provider_request: "pi-claude-code-provider-request-",
+  provider_image_store: "pi-claude-code-provider-images-",
   web_search_request: "pi-claude-code-provider-search-",
   web_search_output: "pi-claude-code-provider-search-output-",
 };
@@ -42,8 +43,8 @@ interface CleanupRuntimeDirectoryOptions {
   maxCandidates?: number;
   maxReaped?: number;
   processAlive?: (pid: number) => boolean;
-  /** Internal seam: the working directory a live process reports, or undefined. */
-  processDirectory?: (pid: number) => Promise<string | undefined>;
+  /** Internal seam: whether a live process proves it belongs to a runtime directory. */
+  processOwnsDirectory?: (pid: number, directory: string) => Promise<boolean>;
   /** Internal seam: terminate an abandoned process group, reporting whether it died. */
   terminateGroup?: (pid: number) => Promise<boolean>;
 }
@@ -82,7 +83,7 @@ export async function createRuntimeDirectory(
 }
 
 export async function recordRuntimeChild(directory: string, childPid: number): Promise<void> {
-  if (!isValidPid(childPid)) throw new Error("Claude Code child process has no valid process ID");
+  if (!validPid(childPid)) throw new Error("Claude Code child process has no valid process ID");
   const marker = await readMarker(directory);
   if (!marker) throw new Error("Private runtime directory marker is missing or invalid");
   await writeFile(markerPath(directory), `${JSON.stringify({ ...marker, childPid })}\n`, { mode: 0o600 });
@@ -100,7 +101,7 @@ export async function cleanupStaleRuntimeDirectories(
   const minimumAgeMs = options.minimumAgeMs ?? MINIMUM_STALE_AGE_MS;
   const maxCandidates = options.maxCandidates ?? MAX_CLEANUP_CANDIDATES;
   const processAlive = options.processAlive ?? isProcessAlive;
-  const processDirectory = options.processDirectory ?? processWorkingDirectory;
+  const processOwnsDirectory = options.processOwnsDirectory ?? processReferencesDirectory;
   const terminateGroup = options.terminateGroup ?? terminateAbandonedGroup;
   const maxReaped = options.maxReaped ?? MAX_REAPED_PROCESSES;
   let entries;
@@ -109,9 +110,29 @@ export async function cleanupStaleRuntimeDirectories(
   } catch {
     return { removed: 0, failures: 1, reaped: 0 };
   }
-  const candidates = entries
-    .filter((entry) => entry.isDirectory() && runtimeKind(entry.name) !== undefined)
-    .slice(0, Math.max(0, maxCandidates));
+  const eligible = entries.filter((entry) => entry.isDirectory() && runtimeKind(entry.name) !== undefined);
+  const candidates = eligible.slice(0, Math.max(0, maxCandidates));
+  // An image store is shared by its owner's requests. If an uncertain-live
+  // Claude child still owns a retained request directory, reclaiming the image
+  // store would remove files that child may still read. Scan the whole bounded
+  // candidate set before deleting anything, because the request can sort after
+  // the store. When the scan is truncated, retain image stores conservatively.
+  const candidateScanTruncated = eligible.length > candidates.length;
+  const ownersWithLiveProviderChildren = new Set<number>();
+  if (!candidateScanTruncated && candidates.some((entry) => runtimeKind(entry.name) === "provider_image_store")) {
+    for (const entry of candidates) {
+      if (runtimeKind(entry.name) !== "provider_request") continue;
+      const directory = join(temporaryRoot, entry.name);
+      try {
+        const info = await lstat(directory);
+        if (!info.isDirectory() || info.uid !== currentUid) continue;
+        const marker = await readMarker(directory);
+        if (marker?.kind === "provider_request" && marker.childPid !== undefined && processAlive(marker.childPid)) {
+          ownersWithLiveProviderChildren.add(marker.ownerPid);
+        }
+      } catch { /* An unreadable request is left to the ordinary cleanup pass. */ }
+    }
+  }
   let removed = 0;
   let failures = 0;
   let reaped = 0;
@@ -123,6 +144,7 @@ export async function cleanupStaleRuntimeDirectories(
       const marker = await readMarker(directory);
       const kind = runtimeKind(entry.name);
       if (!marker || marker.kind !== kind) continue;
+      if (kind === "provider_image_store" && (candidateScanTruncated || ownersWithLiveProviderChildren.has(marker.ownerPid))) continue;
       const createdAt = Date.parse(marker.createdAt);
       if (!Number.isFinite(createdAt) || now - createdAt < minimumAgeMs) continue;
       if (processAlive(marker.ownerPid)) continue;
@@ -133,7 +155,7 @@ export async function cleanupStaleRuntimeDirectories(
         // to. Terminate it only once the live process still proves it is this
         // request's child, so a reused process identifier can never be signalled.
         if (reaped >= maxReaped) continue;
-        if ((await processDirectory(marker.childPid)) !== directory) continue;
+        if (!(await processOwnsDirectory(marker.childPid, directory))) continue;
         if (!(await terminateGroup(marker.childPid))) {
           failures += 1;
           continue;
@@ -154,18 +176,33 @@ export async function cleanupStaleRuntimeDirectories(
 
 /**
  * Prove that a live process is the child this marker recorded. Every Claude
- * process this package starts runs with its private request directory as its
- * working directory, and that directory name carries `mkdtemp` randomness, so
- * matching it rules out an unrelated process that inherited a reused
- * identifier. Linux only: `/proc` is the one reading that needs no subprocess,
- * and elsewhere an unproven process is left alone exactly as before.
+ * process this package starts names its private runtime directory where
+ * `/proc` can see it: web search runs with that directory as its working
+ * directory, and a provider request, which runs in Pi's session directory,
+ * passes its system-prompt file from it on the command line. The directory name
+ * carries `mkdtemp` randomness, so either reading rules out an unrelated process
+ * that inherited a reused identifier. Linux only: `/proc` is the one reading
+ * that needs no subprocess, and elsewhere an unproven process is left alone
+ * exactly as before.
  */
-async function processWorkingDirectory(pid: number): Promise<string | undefined> {
-  if (process.platform !== "linux") return undefined;
+async function processReferencesDirectory(pid: number, directory: string): Promise<boolean> {
+  if (process.platform !== "linux") return false;
+  const candidates = new Set([directory]);
   try {
-    return await readlink(`/proc/${pid}/cwd`);
+    candidates.add(await realpath(directory));
   } catch {
-    return undefined;
+    // The unresolved path still counts; removal re-checks the directory itself.
+  }
+  try {
+    if (candidates.has(await readlink(`/proc/${pid}/cwd`))) return true;
+  } catch {
+    // An unreadable working directory leaves the command line as the proof.
+  }
+  try {
+    const argv = (await readFile(`/proc/${pid}/cmdline`, "utf8")).split("\0");
+    return argv.some((argument) => [...candidates].some((candidate) => argument.startsWith(`${candidate}/`)));
+  } catch {
+    return false;
   }
 }
 
@@ -209,8 +246,8 @@ async function readMarker(directory: string): Promise<RuntimeMarker | undefined>
     if (
       value.schema !== MARKER_SCHEMA ||
       !isRuntimeKind(value.kind) ||
-      !isValidPid(value.ownerPid) ||
-      (value.childPid !== undefined && !isValidPid(value.childPid)) ||
+      !validPid(value.ownerPid) ||
+      (value.childPid !== undefined && !validPid(value.childPid)) ||
       typeof value.createdAt !== "string" ||
       !basename(directory).startsWith(PREFIXES[value.kind])
     ) return undefined;
@@ -227,4 +264,3 @@ function markerPath(directory: string): string {
 function isRuntimeKind(value: unknown): value is RuntimeDirectoryKind {
   return typeof value === "string" && value in PREFIXES;
 }
-

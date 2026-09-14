@@ -1,14 +1,15 @@
 import assert from "node:assert/strict";
-import { access, chmod, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { availableOutputTokens, createClaudeStream, isExpectedToolHandoffExit, waitForReadyOrExit } from "../../src/provider.ts";
+import { isContextOverflow } from "@earendil-works/pi-ai";
+import { availableOutputTokens, createClaudeStream as createProviderStream, isExpectedToolHandoffExit, waitForReadyOrExit } from "../../src/provider.ts";
 import { getLastRequestMetrics } from "../../src/metrics.ts";
 import { normalizeClaudeFailure } from "../../src/errors.ts";
 import { superviseProcess, terminateProcessGroup } from "../../src/process-utils.ts";
 import { nodeFixtureSource } from "../support/node-fixture.js";
-import { PROVIDER_INIT_FIELDS, initRecord } from "../support/claude-fixture.js";
+import { CAPTURED_CLAUDE_VERSION, PROVIDER_INIT_FIELDS, initRecord, toolUseEvents } from "../support/claude-fixture.js";
 const model = {
     id: "sonnet",
     name: "Sonnet",
@@ -59,10 +60,28 @@ const toolTerminationResult = {
     usage: { input_tokens: 4, output_tokens: 2 },
     modelUsage: { sonnet: { contextWindow: 1000000, maxOutputTokens: 64000 } },
 };
+// The last request's metrics are process-global, so a waiter could match an
+// earlier request's record. Snapshot them as each request starts and accept only
+// a different record. Two requests started in one millisecond could record
+// identical metrics, so each start first waits out the previous request's.
+let metricsBeforeRequest;
+let lastRequestStartedAt = 0;
+// Every provider request runs Claude in Pi's session directory; tests that are
+// not about that directory use the temporary root as the session.
+function createClaudeStream(installation, dependencies = {}) {
+    const streamSimple = createProviderStream(installation, { workingDirectory: () => tmpdir(), ...dependencies });
+    return (...request) => {
+        while (Date.now() <= lastRequestStartedAt) { /* wait out the millisecond */ }
+        metricsBeforeRequest = JSON.stringify(getLastRequestMetrics() ?? null);
+        const stream = streamSimple(...request);
+        lastRequestStartedAt = Date.now();
+        return stream;
+    };
+}
 async function waitForRequestMetrics(predicate) {
     for (let attempt = 0; attempt < 200; attempt++) {
         const metrics = getLastRequestMetrics();
-        if (metrics && predicate(metrics)) return metrics;
+        if (metrics && JSON.stringify(metrics) !== metricsBeforeRequest && predicate(metrics)) return metrics;
         await new Promise((resolve) => setTimeout(resolve, 10));
     }
     throw new Error("request metrics did not settle");
@@ -81,10 +100,11 @@ function supervisorWithCleanupFailure(child, options) {
 test("provider streams a fake response after accepting a rich payload replacement", async () => {
     const fake = await fakeClaude(`
 const path = require("node:path");
+const privateDirectory = path.dirname(process.argv[process.argv.indexOf("--system-prompt-file") + 1]);
 fs.writeFileSync(path.join(__dirname, "captured-preparation"), JSON.stringify({
-  systemPrompt: fs.readFileSync(path.join(process.cwd(), "system-prompt.txt"), "utf8"),
-  catalog: JSON.parse(fs.readFileSync(path.join(process.cwd(), "tools.json"), "utf8")),
-  files: fs.readdirSync(process.cwd()),
+  systemPrompt: fs.readFileSync(path.join(privateDirectory, "system-prompt.txt"), "utf8"),
+  catalog: JSON.parse(fs.readFileSync(path.join(privateDirectory, "tools.json"), "utf8")),
+  files: fs.readdirSync(privateDirectory),
 }));
 setTimeout(() => {
   process.stdout.write(JSON.stringify(${JSON.stringify(toolInit)}) + "\\n");
@@ -112,7 +132,7 @@ setTimeout(() => {
     let claims = 0;
     try {
         const stream = createClaudeStream(
-            { executable: fake.executable, version: "2.1.206", subscriptionType: "pro" },
+            { executable: fake.executable, version: CAPTURED_CLAUDE_VERSION, subscriptionType: "pro" },
             { claimLaunch: async () => { claims++; } },
         )(model, context, { reasoning: "medium", onPayload: () => replacement });
         const eventTypes = [];
@@ -146,29 +166,32 @@ test("provider rejects malformed logical payloads before claim or spawn", async 
     const fake = await fakeClaude(`fs.writeFileSync(${JSON.stringify(marker)}, "spawned");`);
     const circular = {};
     circular.self = circular;
-    const invalidMessages = [
-        [{ role: "future", content: [] }],
-        [{ role: "user", content: [{ type: "text", text: 42 }] }],
-        [{ role: "assistant", content: [{ type: "thinking", thinking: false }] }],
-        [{ role: "assistant", content: [{ type: "toolCall", id: 1, name: "read", arguments: {} }] }],
-        [{ role: "assistant", content: [{ type: "toolCall", id: "call", name: "read", arguments: [] }] }],
-        [{ role: "toolResult", toolCallId: "call", toolName: "read", content: [], isError: "false" }],
-        [{ role: "user", content: [{ type: "image", data: "AA==" }] }],
-    ];
-    const replacements = [
-        ...invalidMessages.map((messages) => ({ messages, tools: [] })),
-        { messages: context.messages, tools: [{ name: "read", description: "read", parameters: [] }] },
-        { messages: context.messages, tools: [{ name: "read", description: "read", parameters: circular }] },
+    const cases = [
+        [[null], [], /invalid message/],
+        [[{ role: "future", content: [] }], [], /Unsupported Pi message role: future/],
+        [[{ role: "user", content: [{ type: "text", text: 42 }] }], [], /text content must contain text/],
+        [[{ role: "assistant", content: { type: "text", text: "not an array" } }], [], /assistant content must be an array/],
+        [[{ role: "assistant", content: [{ type: "thinking", thinking: false }] }], [], /thinking content must contain thinking/],
+        [[{ role: "assistant", content: [{ type: "toolCall", id: 1, name: "read", arguments: {} }] }], [], /tool-call ID must be a nonempty string/],
+        [[{ role: "assistant", content: [{ type: "toolCall", id: "call", name: "read", arguments: [] }] }], [], /tool-call arguments must be an object/],
+        [[{ role: "toolResult", toolCallId: "call", toolName: "read", content: [], isError: "false" }], [], /isError must be boolean/],
+        [[{ role: "user", content: [{ type: "image", data: "AA==" }] }], [], /string mimeType/],
+        [[{ role: "user", content: [{ type: "image", data: 12345678, mimeType: "image/png" }] }], [], /not valid base64/],
+        [[{ role: "assistant", content: [{ type: "thinking", thinking: "reasoning", redacted: "true" }] }], [], /thinking redacted must be boolean/],
+        [[{ role: "user", content: [{ type: "image", data: "AA==", mimeType: ["image/png"] }] }], [], /string mimeType/],
+        [context.messages, [null], /invalid active tool/],
+        [context.messages, [{ name: "read", description: "read", parameters: [] }], /active tool schema must be an object/],
+        [context.messages, [{ name: "read", description: "read", parameters: circular }], /must be JSON-serializable/],
     ];
     let claims = 0;
     try {
-        for (const replacement of replacements) {
+        for (const [messages, tools, expected] of cases) {
             const result = await createClaudeStream(
                 { executable: fake.executable, version: "test", subscriptionType: "pro" },
                 { claimLaunch: async () => { claims++; } },
-            )(model, context, { onPayload: () => replacement }).result();
+            )(model, context, { onPayload: () => ({ messages, tools }) }).result();
             assert.equal(result.stopReason, "error");
-            assert.match(result.errorMessage ?? "", /logical|payload|JSON-serializable|Unsupported|boolean/i);
+            assert.match(result.errorMessage ?? "", expected);
         }
         assert.equal(claims, 0);
         await assert.rejects(access(marker));
@@ -189,7 +212,7 @@ process.stdin.on("end", () => {
     try {
         const stream = createClaudeStream({
             executable: fake.executable,
-            version: "2.1.206",
+            version: CAPTURED_CLAUDE_VERSION,
             subscriptionType: "pro",
         })(model, context, { reasoning: "medium" });
         const events = [];
@@ -304,22 +327,31 @@ test("provider settles once and retains marked state when process death is unkno
         await rm(fake.dir, { recursive: true, force: true });
     }
 });
-test("provider commits success only after clean exit and private-state cleanup", async () => {
+test("provider runs Claude in the session directory and commits success only after private-state cleanup", async () => {
+    const sessionDirectory = await mkdtemp(join(tmpdir(), "provider-session-directory-"));
     const fake = await fakeClaude(`
 process.stdin.resume();
 process.stdin.on("end", () => {
+  const reported = JSON.stringify({ cwd: process.cwd(), privateDirectory: require("node:path").dirname(process.argv[process.argv.indexOf("--system-prompt-file") + 1]) });
   process.stdout.write(JSON.stringify(${JSON.stringify(init)}) + "\\n");
-  process.stdout.write(JSON.stringify({type:"result",is_error:false,result:process.cwd(),usage:{input_tokens:1,output_tokens:1}}) + "\\n");
+  process.stdout.write(JSON.stringify({type:"result",is_error:false,result:reported,usage:{input_tokens:1,output_tokens:1}}) + "\\n");
 });`);
     try {
-        const result = await createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, context, { reasoning: "medium" }).result();
-        assert.equal(result.stopReason, "stop");
-        const privateDirectory = result.content.find((block) => block.type === "text")?.text;
-        assert.ok(privateDirectory);
-        await assert.rejects(access(privateDirectory));
+        const result = await createClaudeStream(
+            { executable: fake.executable, version: "test", subscriptionType: "pro" },
+            { workingDirectory: () => sessionDirectory },
+        )(model, context, { reasoning: "medium" }).result();
+        assert.equal(result.stopReason, "stop", result.errorMessage);
+        const reported = JSON.parse(result.content.find((block) => block.type === "text")?.text ?? "{}");
+        // Claude Code reports its cwd to the model, so it must be Pi's directory,
+        // while private request state stays in, and is removed with, its own directory.
+        assert.equal(await realpath(reported.cwd), await realpath(sessionDirectory));
+        assert.notEqual(reported.privateDirectory, reported.cwd);
+        await assert.rejects(access(reported.privateDirectory));
+        await access(sessionDirectory);
     }
     finally {
-        await rm(fake.dir, { recursive: true, force: true });
+        await Promise.all([fake.dir, sessionDirectory].map((directory) => rm(directory, { recursive: true, force: true })));
     }
 });
 test("provider forwards and reserves Pi's effective per-request output limit", async () => {
@@ -443,7 +475,7 @@ setInterval(() => {}, 1000);`);
         const controller = new AbortController();
         const stream = createClaudeStream({
             executable: fake.executable,
-            version: "2.1.206",
+            version: CAPTURED_CLAUDE_VERSION,
             subscriptionType: "pro",
         })(model, context, { reasoning: "medium", signal: controller.signal });
         setTimeout(() => controller.abort(), 50);
@@ -569,7 +601,7 @@ process.stdin.on("end", () => {
   process.stdout.write(JSON.stringify(${JSON.stringify(toolInit)}) + "\\n");
   process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"message_start",message:{id:"msg_private",model:"claude-sonnet-5",usage:{input_tokens:0,output_tokens:0}}}}) + "\\n");
   process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"content_block_start",index:0,content_block:{type:"tool_use",id:"toolu_private",name:"mcp__pi__read",input:{}}}}) + "\\n");
-  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"content_block_delta",index:0,delta:{type:"input_json_delta",partial_json:JSON.stringify({path:process.cwd() + "/request.json"})}}}) + "\\n");
+  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"content_block_delta",index:0,delta:{type:"input_json_delta",partial_json:JSON.stringify({path:require("node:path").dirname(process.argv[process.argv.indexOf("--system-prompt-file") + 1]) + "/request.json"})}}}) + "\\n");
   process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"content_block_stop",index:0}}) + "\\n");
   process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"message_delta",delta:{stop_reason:"tool_use"}}}) + "\\n");
   setInterval(() => {}, 1000);
@@ -577,7 +609,7 @@ process.stdin.on("end", () => {
     try {
         const stream = createClaudeStream({
             executable: fake.executable,
-            version: "2.1.206",
+            version: CAPTURED_CLAUDE_VERSION,
             subscriptionType: "pro",
         })(model, toolContext, { reasoning: "medium" });
         const result = await stream.result();
@@ -604,10 +636,7 @@ else process.on("SIGTERM", () => {
 process.stdin.resume();
 process.stdin.on("end", () => {
   process.stdout.write(JSON.stringify(${JSON.stringify(toolInit)}) + "\\n");
-  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"message_start",message:{id:"msg_violation",model:"claude-sonnet-5",usage:{}}}}) + "\\n");
-  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"content_block_start",index:0,content_block:{type:"tool_use",id:"toolu_violation",name:"mcp__pi__read",input:{}}}}) + "\\n");
-  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"content_block_stop",index:0}}) + "\\n");
-  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"message_delta",delta:{stop_reason:"tool_use"}}}) + "\\n");
+  for (const record of ${JSON.stringify(toolUseEvents({ messageId: "msg_violation", toolUseId: "toolu_violation" }))}) process.stdout.write(JSON.stringify(record) + "\\n");
   setInterval(() => {}, 1000);
 });`);
     try {
@@ -632,10 +661,7 @@ else process.on("SIGTERM", () => {
 process.stdin.resume();
 process.stdin.on("end", () => {
   process.stdout.write(JSON.stringify(${JSON.stringify(toolInit)}) + "\\n");
-  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"message_start",message:{id:"msg_cleanup_violation",model:"claude-sonnet-5",usage:{}}}}) + "\\n");
-  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"content_block_start",index:0,content_block:{type:"tool_use",id:"toolu_cleanup_violation",name:"mcp__pi__read",input:{}}}}) + "\\n");
-  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"content_block_stop",index:0}}) + "\\n");
-  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"message_delta",delta:{stop_reason:"tool_use"}}}) + "\\n");
+  for (const record of ${JSON.stringify(toolUseEvents({ messageId: "msg_cleanup_violation", toolUseId: "toolu_cleanup_violation" }))}) process.stdout.write(JSON.stringify(record) + "\\n");
   setInterval(() => {}, 1000);
 });`);
     let privateDirectory;
@@ -681,11 +707,7 @@ test("provider accepts an exact-PID Windows tool handoff", { skip: process.platf
 process.stdin.resume();
 process.stdin.on("end", () => {
   process.stdout.write(JSON.stringify(${JSON.stringify(toolInit)}) + "\\n");
-  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"message_start",message:{id:"msg_windows_tool",model:"claude-sonnet-5",usage:{}}}}) + "\\n");
-  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"content_block_start",index:0,content_block:{type:"tool_use",id:"toolu_windows",name:"mcp__pi__read",input:{}}}}) + "\\n");
-  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"content_block_delta",index:0,delta:{type:"input_json_delta",partial_json:'{"path":"package.json"}'}}}) + "\\n");
-  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"content_block_stop",index:0}}) + "\\n");
-  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"message_delta",delta:{stop_reason:"tool_use"}}}) + "\\n");
+  for (const record of ${JSON.stringify(toolUseEvents({ messageId: "msg_windows_tool", toolUseId: "toolu_windows", partialJson: '{"path":"package.json"}' }))}) process.stdout.write(JSON.stringify(record) + "\\n");
   setInterval(() => {}, 1000);
 });`);
     try {
@@ -709,7 +731,7 @@ process.stdin.resume();
 process.stdin.on("end", () => {
   process.stdout.write(JSON.stringify(${JSON.stringify(toolInit)}) + "\\n");
   process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"message_start",message:{id:"msg_tool",model:"claude-sonnet-5",usage:{input_tokens:0,output_tokens:0}}}}) + "\\n");
-  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"content_block_start",index:0,content_block:{type:"tool_use",id:process.cwd(),name:"mcp__pi__read",input:{}}}}) + "\\n");
+  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"content_block_start",index:0,content_block:{type:"tool_use",id:require("node:path").dirname(process.argv[process.argv.indexOf("--system-prompt-file") + 1]),name:"mcp__pi__read",input:{}}}}) + "\\n");
   process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"content_block_delta",index:0,delta:{type:"input_json_delta",partial_json:'{"path":"README.md"}'}}}) + "\\n");
   process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"content_block_stop",index:0}}) + "\\n");
   process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"message_delta",delta:{stop_reason:"tool_use"}}}) + "\\n");
@@ -718,7 +740,7 @@ process.stdin.on("end", () => {
     try {
         const stream = createClaudeStream({
             executable: fake.executable,
-            version: "2.1.212",
+            version: CAPTURED_CLAUDE_VERSION,
             subscriptionType: "pro",
         })(model, toolContext, { reasoning: "medium" });
         const result = await stream.result();
@@ -746,12 +768,7 @@ test("provider settles and retains marked state when tool-handoff termination fa
 process.stdin.resume();
 process.stdin.on("end", () => {
   process.stdout.write(JSON.stringify(${JSON.stringify(toolInit)}) + "\\n");
-  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"message_start",message:{id:"msg_tool_cleanup",model:"claude-sonnet-5",usage:{}}}}) + "\\n");
-  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"content_block_start",index:0,content_block:{type:"tool_use",id:"toolu_cleanup",name:"mcp__pi__read",input:{}}}}) + "\\n");
-  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"content_block_delta",index:0,delta:{type:"input_json_delta",partial_json:'{"path":"package.json"}'}}}) + "\\n");
-  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"content_block_stop",index:0}}) + "\\n");
-  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"message_delta",delta:{stop_reason:"tool_use"}}}) + "\\n");
-  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"message_stop"}}) + "\\n");
+  for (const record of ${JSON.stringify(toolUseEvents({ messageId: "msg_tool_cleanup", toolUseId: "toolu_cleanup", partialJson: '{"path":"package.json"}', messageStop: true }))}) process.stdout.write(JSON.stringify(record) + "\\n");
   setInterval(() => {}, 1000);
 });`);
     let capturedChild;
@@ -805,15 +822,11 @@ process.on("SIGTERM", () => process.exit(143));
 process.stdin.resume();
 process.stdin.on("end", () => {
   process.stdout.write(JSON.stringify(${JSON.stringify(toolInit)}) + "\\n");
-  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"message_start",message:{id:"msg_missing_ack",model:"claude-sonnet-5",usage:{}}}}) + "\\n");
-  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"content_block_start",index:0,content_block:{type:"tool_use",id:"toolu_missing_ack",name:"mcp__pi__read",input:{}}}}) + "\\n");
-  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"content_block_delta",index:0,delta:{type:"input_json_delta",partial_json:'{"path":"package.json"}'}}}) + "\\n");
-  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"content_block_stop",index:0}}) + "\\n");
-  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"message_delta",delta:{stop_reason:"tool_use"}}}) + "\\n");
+  for (const record of ${JSON.stringify(toolUseEvents({ messageId: "msg_missing_ack", toolUseId: "toolu_missing_ack", partialJson: '{"path":"package.json"}' }))}) process.stdout.write(JSON.stringify(record) + "\\n");
   setInterval(() => {}, 1000);
 });`);
     try {
-        const result = await createClaudeStream({ executable: fake.executable, version: "2.1.212", subscriptionType: "pro" })(model, toolContext, { reasoning: "medium" }).result();
+        const result = await createClaudeStream({ executable: fake.executable, version: CAPTURED_CLAUDE_VERSION, subscriptionType: "pro" })(model, toolContext, { reasoning: "medium" }).result();
         assert.equal(result.stopReason, "toolUse");
         const metrics = await waitForRequestMetrics((entry) => entry.stopReason === "toolUse" && entry.exitCode === 143);
         assert.equal(metrics.lastPhase, "completed");
@@ -831,15 +844,11 @@ process.on("SIGTERM", () => {
 process.stdin.resume();
 process.stdin.on("end", () => {
   process.stdout.write(JSON.stringify(${JSON.stringify(toolInit)}) + "\\n");
-  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"message_start",message:{id:"msg_bad_exit",model:"claude-sonnet-5",usage:{}}}}) + "\\n");
-  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"content_block_start",index:0,content_block:{type:"tool_use",id:"toolu_bad_exit",name:"mcp__pi__read",input:{}}}}) + "\\n");
-  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"content_block_delta",index:0,delta:{type:"input_json_delta",partial_json:'{"path":"package.json"}'}}}) + "\\n");
-  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"content_block_stop",index:0}}) + "\\n");
-  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"message_delta",delta:{stop_reason:"tool_use"}}}) + "\\n");
+  for (const record of ${JSON.stringify(toolUseEvents({ messageId: "msg_bad_exit", toolUseId: "toolu_bad_exit", partialJson: '{"path":"package.json"}' }))}) process.stdout.write(JSON.stringify(record) + "\\n");
   setInterval(() => {}, 1000);
 });`);
     try {
-        const result = await createClaudeStream({ executable: fake.executable, version: "2.1.212", subscriptionType: "pro" })(model, toolContext, { reasoning: "medium" }).result();
+        const result = await createClaudeStream({ executable: fake.executable, version: CAPTURED_CLAUDE_VERSION, subscriptionType: "pro" })(model, toolContext, { reasoning: "medium" }).result();
         assert.equal(result.stopReason, "error");
         assert.match(result.errorMessage ?? "", /tool handoff exited unexpectedly.*code 1/);
         const metrics = await waitForRequestMetrics((entry) => entry.errorCategory === "process_exit" && entry.exitCode === 1);
@@ -855,15 +864,11 @@ process.on("SIGTERM", () => {});
 process.stdin.resume();
 process.stdin.on("end", () => {
   process.stdout.write(JSON.stringify(${JSON.stringify(toolInit)}) + "\\n");
-  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"message_start",message:{id:"msg_bad_signal",model:"claude-sonnet-5",usage:{}}}}) + "\\n");
-  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"content_block_start",index:0,content_block:{type:"tool_use",id:"toolu_bad_signal",name:"mcp__pi__read",input:{}}}}) + "\\n");
-  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"content_block_delta",index:0,delta:{type:"input_json_delta",partial_json:'{"path":"package.json"}'}}}) + "\\n");
-  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"content_block_stop",index:0}}) + "\\n");
-  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"message_delta",delta:{stop_reason:"tool_use"}}}) + "\\n");
+  for (const record of ${JSON.stringify(toolUseEvents({ messageId: "msg_bad_signal", toolUseId: "toolu_bad_signal", partialJson: '{"path":"package.json"}' }))}) process.stdout.write(JSON.stringify(record) + "\\n");
   setInterval(() => {}, 1000);
 });`);
     try {
-        const result = await createClaudeStream({ executable: fake.executable, version: "2.1.212", subscriptionType: "pro" })(model, toolContext, { reasoning: "medium" }).result();
+        const result = await createClaudeStream({ executable: fake.executable, version: CAPTURED_CLAUDE_VERSION, subscriptionType: "pro" })(model, toolContext, { reasoning: "medium" }).result();
         assert.equal(result.stopReason, "error");
         assert.match(result.errorMessage ?? "", /tool handoff exited unexpectedly.*SIGKILL/);
         const metrics = await waitForRequestMetrics((entry) => entry.errorCategory === "process_exit" && entry.exitSignal === "SIGKILL");
@@ -884,16 +889,12 @@ process.on("SIGTERM", () => {
 process.stdin.resume();
 process.stdin.on("end", () => {
   process.stdout.write(JSON.stringify(${JSON.stringify(toolInit)}) + "\\n");
-  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"message_start",message:{id:"msg_abort_ack",model:"claude-sonnet-5",usage:{}}}}) + "\\n");
-  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"content_block_start",index:0,content_block:{type:"tool_use",id:"toolu_abort_ack",name:"mcp__pi__read",input:{}}}}) + "\\n");
-  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"content_block_delta",index:0,delta:{type:"input_json_delta",partial_json:'{"path":"package.json"}'}}}) + "\\n");
-  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"content_block_stop",index:0}}) + "\\n");
-  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"message_delta",delta:{stop_reason:"tool_use"}}}) + "\\n");
+  for (const record of ${JSON.stringify(toolUseEvents({ messageId: "msg_abort_ack", toolUseId: "toolu_abort_ack", partialJson: '{"path":"package.json"}' }))}) process.stdout.write(JSON.stringify(record) + "\\n");
   setInterval(() => {}, 1000);
 });`);
     try {
         const controller = new AbortController();
-        const stream = createClaudeStream({ executable: fake.executable, version: "2.1.212", subscriptionType: "pro" })(model, toolContext, { reasoning: "medium", signal: controller.signal });
+        const stream = createClaudeStream({ executable: fake.executable, version: CAPTURED_CLAUDE_VERSION, subscriptionType: "pro" })(model, toolContext, { reasoning: "medium", signal: controller.signal });
         for (let attempt = 0; attempt < 200; attempt++) {
             try {
                 await access(marker);
@@ -973,7 +974,7 @@ test("MCP readiness has a bounded timeout even while the process remains alive",
         await rm(directory, { recursive: true, force: true });
     }
 });
-test("provider enforces idle, system-prompt, and context-budget limits", async () => {
+test("provider enforces idle and context-budget limits", async () => {
     const idle = await fakeClaude(`process.stdin.resume(); process.stdout.write(JSON.stringify(${JSON.stringify(init)}) + "\\n"); process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"message_start",message:{id:"idle",model:"claude-sonnet-5",usage:{}}}}) + "\\n"); setInterval(() => {}, 1000);`);
     const originalIdle = process.env.PI_CLAUDE_CODE_PROVIDER_IDLE_TIMEOUT_MS;
     const originalTotal = process.env.PI_CLAUDE_CODE_PROVIDER_TOTAL_TIMEOUT_MS;
@@ -992,13 +993,6 @@ test("provider enforces idle, system-prompt, and context-budget limits", async (
         await new Promise((resolve) => setTimeout(resolve, 5));
     }
     const installation = { executable: "/does/not/run", version: "test", subscriptionType: "pro" };
-    const systemResult = await createClaudeStream(installation)(model, { ...context, systemPrompt: "x".repeat(120 * 1024 + 1) }, { reasoning: "medium" }).result();
-    for (let attempt = 0; attempt < 20 && getLastRequestMetrics()?.errorCategory !== "system_prompt_size"; attempt++) {
-        await new Promise((resolve) => setTimeout(resolve, 5));
-    }
-    assert.match(systemResult.errorMessage ?? "", /system prompt.*122880/i);
-    assert.equal(getLastRequestMetrics()?.errorCategory, "system_prompt_size");
-    assert.equal(getLastRequestMetrics()?.messageCount, 1);
     const tinyModel = { ...model, contextWindow: 100, maxTokens: 90 };
     const budgetResult = await createClaudeStream(installation)(tinyModel, context, { reasoning: "medium" }).result();
     for (let attempt = 0; attempt < 20 && getLastRequestMetrics()?.errorCategory !== "context_budget"; attempt++) {
@@ -1040,7 +1034,7 @@ test("provider retains a caught failure category when private cleanup also fails
 test("provider cleans private transport state after an early process failure", async () => {
     const markerDirectory = await mkdtemp(join(tmpdir(), "provider-cleanup-marker-"));
     const marker = join(markerDirectory, "cwd");
-    const fake = await fakeClaude(`const index = process.argv.indexOf("--system-prompt-file"); const marker = fs.readFileSync(process.argv[index + 1], "utf8"); fs.writeFileSync(marker, process.cwd()); process.exit(9);`);
+    const fake = await fakeClaude(`const index = process.argv.indexOf("--system-prompt-file"); const marker = fs.readFileSync(process.argv[index + 1], "utf8"); fs.writeFileSync(marker, require("node:path").dirname(process.argv[index + 1])); process.exit(9);`);
     try {
         const result = await createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, { ...context, systemPrompt: marker }, { reasoning: "medium" }).result();
         assert.equal(result.stopReason, "error");
@@ -1069,7 +1063,7 @@ test("provider reports a synthetic response to Pi before streaming content", asy
         const responses = [];
         const stream = createClaudeStream({
             executable: fake.executable,
-            version: "2.1.206",
+            version: CAPTURED_CLAUDE_VERSION,
             subscriptionType: "pro",
         })(model, context, {
             reasoning: "medium",
@@ -1106,7 +1100,7 @@ test("provider waits for Pi's async response handler before streaming content", 
         const events = [];
         const stream = createClaudeStream({
             executable: fake.executable,
-            version: "2.1.206",
+            version: CAPTURED_CLAUDE_VERSION,
             subscriptionType: "pro",
         })(model, context, {
             reasoning: "medium",
@@ -1147,7 +1141,7 @@ test("provider fails before streaming when Pi's async response handler rejects",
         const events = [];
         const stream = createClaudeStream({
             executable: fake.executable,
-            version: "2.1.206",
+            version: CAPTURED_CLAUDE_VERSION,
             subscriptionType: "pro",
         })(model, context, {
             reasoning: "medium",
@@ -1222,6 +1216,288 @@ test("the output ceiling is clamped to remaining context instead of reserving th
     assert.throws(() => availableOutputTokens(opus, 199_000, undefined, "max"), /context_length_exceeded/);
     assert.throws(() => availableOutputTokens({ ...opus, maxTokens: 0 }, 10, undefined, "max"), /maxTokens must be a positive integer/);
     assert.throws(() => availableOutputTokens(opus, 10, -1, "max"), /maxTokens must be a positive integer/);
-    // An unknown context window cannot be budgeted against; the ceiling stands.
-    assert.equal(availableOutputTokens({ ...opus, contextWindow: 0 }, 10_000, 2_048, "high"), 2_048 + 16_384);
+    // A context window is required, not assumed: without one nothing bounds the request.
+    assert.throws(() => availableOutputTokens({ ...opus, contextWindow: 0 }, 10_000, 2_048, "high"), /reports no usable context window/);
+});
+
+// A system prompt alone must leave a 200K-window model its 4,096-token safety
+// margin and a 1,024-token minimum reply, so at most 194,880 estimated tokens
+// are admitted, which the byte estimator reaches at exactly 425,191 bytes.
+const BUDGET_MODEL = { ...model, contextWindow: 200_000, maxTokens: 32_000 };
+const LARGEST_ADMITTED_SYSTEM_PROMPT_BYTES = 425_191;
+const DEAD_INSTALLATION = { executable: "/does/not/run", version: "test", subscriptionType: "pro" };
+function markedSystemPrompt(bytes) {
+    const head = "ALPHA-MARKER-4417\n";
+    const tail = "\nOMEGA-MARKER-9308";
+    return head + "F".repeat(bytes - head.length - tail.length) + tail;
+}
+test("provider transports a system prompt far above the former size cap", async () => {
+    // 146,101 bytes is the size reported in issue #4, which the removed fixed
+    // cap refused outright. Both ends of the file must survive the transport,
+    // and the prompt must travel by path rather than in the argument vector.
+    const systemPrompt = markedSystemPrompt(146_101);
+    const fake = await fakeClaude(`
+const path = require("node:path");
+const text = fs.readFileSync(process.argv[process.argv.indexOf("--system-prompt-file") + 1], "utf8");
+fs.writeFileSync(path.join(__dirname, "captured-large"), JSON.stringify({
+  bytes: Buffer.byteLength(text),
+  head: text.slice(0, 32),
+  tail: text.slice(-32),
+  argv: process.argv.slice(2),
+}));
+setTimeout(() => {
+  process.stdout.write(JSON.stringify(${JSON.stringify(init)}) + "\\n");
+  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"message_start",message:{id:"msg_large",model:"claude-sonnet-5",usage:{input_tokens:0,output_tokens:0}}}}) + "\\n");
+  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"content_block_start",index:0,content_block:{type:"text",text:""}}}) + "\\n");
+  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"content_block_delta",index:0,delta:{type:"text_delta",text:"large ok"}}}) + "\\n");
+  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"content_block_stop",index:0}}) + "\\n");
+  process.stdout.write(JSON.stringify({type:"result",is_error:false,result:"large ok",usage:{input_tokens:4,output_tokens:2}}) + "\\n");
+}, 20);`);
+    try {
+        const result = await createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, { ...context, systemPrompt }, { reasoning: "medium" }).result();
+        assert.equal(result.stopReason, "stop", result.errorMessage);
+        const captured = JSON.parse(await readFile(join(fake.dir, "captured-large"), "utf8"));
+        assert.equal(captured.bytes, 146_101);
+        assert.ok(captured.head.startsWith("ALPHA-MARKER-4417"), captured.head);
+        assert.ok(captured.tail.endsWith("OMEGA-MARKER-9308"), captured.tail);
+        const flag = captured.argv.indexOf("--system-prompt-file");
+        assert.ok(flag >= 0);
+        assert.ok(captured.argv[flag + 1].endsWith("system-prompt.txt"));
+        assert.ok(captured.argv.every((entry) => !entry.includes("ALPHA-MARKER-4417")));
+        const metrics = await waitForRequestMetrics((entry) => entry.stopReason === "stop");
+        assert.equal(metrics.cleanupComplete, true);
+    }
+    finally {
+        await rm(fake.dir, { recursive: true, force: true });
+    }
+});
+test("provider rejects a system prompt the served model cannot hold", async () => {
+    const systemPrompt = "y".repeat(LARGEST_ADMITTED_SYSTEM_PROMPT_BYTES + 3);
+    const result = await createClaudeStream(DEAD_INSTALLATION)(BUDGET_MODEL, { ...context, systemPrompt }, { reasoning: "medium" }).result();
+    const metrics = await waitForRequestMetrics((entry) => entry.errorCategory === "system_prompt_budget");
+    assert.match(result.errorMessage ?? "", /system prompt alone needs about \d+ tokens/);
+    assert.match(result.errorMessage ?? "", /Reduce loaded system instructions, project context, or skill descriptions/);
+    // Rejected before preparation, so no private directory was ever created and
+    // the estimate that drove the decision is still reported.
+    assert.equal(metrics.lastPhase, "payload_applied");
+    assert.equal(metrics.transcriptBytes, 0);
+    assert.ok(metrics.estimatedInputTokens > 0);
+    assert.equal(metrics.cleanupComplete, true);
+});
+test("the system-prompt precheck admits the boundary and the full budget still decides", async () => {
+    const systemPrompt = "y".repeat(LARGEST_ADMITTED_SYSTEM_PROMPT_BYTES);
+    const result = await createClaudeStream(DEAD_INSTALLATION)(BUDGET_MODEL, { ...context, systemPrompt }, { reasoning: "medium" }).result();
+    const metrics = await waitForRequestMetrics((entry) => entry.errorCategory === "context_budget");
+    // The precheck is necessary, not sufficient: preparation ran, and the
+    // transcript's own bytes then carried the request over the window.
+    assert.equal(metrics.lastPhase, "prepared");
+    assert.match(result.errorMessage ?? "", /context_length_exceeded/);
+});
+test("the system-prompt budget measures bytes rather than characters", async () => {
+    const systemPrompt = "。".repeat(200_000);
+    assert.equal(systemPrompt.length, 200_000);
+    assert.equal(Buffer.byteLength(systemPrompt), 600_000);
+    const result = await createClaudeStream(DEAD_INSTALLATION)(BUDGET_MODEL, { ...context, systemPrompt }, { reasoning: "medium" }).result();
+    await waitForRequestMetrics((entry) => entry.errorCategory === "system_prompt_budget");
+    assert.match(result.errorMessage ?? "", /system prompt alone needs about \d+ tokens/);
+});
+test("budget failures classify correctly for Pi's overflow recovery", async () => {
+    const oversized = await createClaudeStream(DEAD_INSTALLATION)(BUDGET_MODEL, { ...context, systemPrompt: "y".repeat(LARGEST_ADMITTED_SYSTEM_PROMPT_BYTES + 3) }, { reasoning: "medium" }).result();
+    await waitForRequestMetrics((entry) => entry.errorCategory === "system_prompt_budget");
+    const overBudget = await createClaudeStream(DEAD_INSTALLATION)({ ...model, contextWindow: 100, maxTokens: 90 }, context, { reasoning: "medium" }).result();
+    await waitForRequestMetrics((entry) => entry.errorCategory === "context_budget");
+    const asMessage = (result) => ({ stopReason: "error", errorMessage: result.errorMessage ?? "", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } });
+    // Compaction cannot shrink a system prompt, so the system-only failure must
+    // not look like a recoverable overflow; the transcript one must.
+    assert.equal(isContextOverflow(asMessage(oversized), BUDGET_MODEL.contextWindow), false);
+    assert.equal(isContextOverflow(asMessage(overBudget), 100), true);
+});
+test("provider requires a usable model context window", async () => {
+    for (const contextWindow of [undefined, 0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+        const candidate = { ...model, contextWindow };
+        if (contextWindow === undefined) delete candidate.contextWindow;
+        const result = await createClaudeStream(DEAD_INSTALLATION)(candidate, context, { reasoning: "medium" }).result();
+        const metrics = await waitForRequestMetrics((entry) => entry.errorCategory === "context_window");
+        assert.match(result.errorMessage ?? "", /reports no usable context window/);
+        assert.match(result.errorMessage ?? "", /contextWindow override/);
+        assert.equal(metrics.lastPhase, "payload_applied");
+    }
+    // Only positivity and finiteness are required: the window is compared and
+    // never propagated, so a fractional Pi override must still run.
+    const fractional = await createClaudeStream(DEAD_INSTALLATION)({ ...model, contextWindow: 1_000_000.5 }, context, { reasoning: "medium" }).result();
+    const metrics = await waitForRequestMetrics((entry) => entry.errorCategory !== "context_window");
+    assert.notEqual(metrics.errorCategory, "context_window");
+    assert.notEqual(metrics.lastPhase, "payload_applied");
+    assert.ok(fractional.errorMessage);
+});
+test("the system-prompt budget is measured after Pi's payload hook", async () => {
+    const oversized = "y".repeat(LARGEST_ADMITTED_SYSTEM_PROMPT_BYTES + 3);
+    const inflated = await createClaudeStream(DEAD_INSTALLATION)(BUDGET_MODEL, context, { reasoning: "medium", onPayload: (payload) => ({ ...payload, systemPrompt: oversized }) }).result();
+    await waitForRequestMetrics((entry) => entry.errorCategory === "system_prompt_budget");
+    assert.match(inflated.errorMessage ?? "", /system prompt alone needs about \d+ tokens/);
+    // The reverse direction proves the caller's own prompt is not what is
+    // measured: a hook that replaces an oversized prompt must let the request run.
+    await createClaudeStream(DEAD_INSTALLATION)(BUDGET_MODEL, { ...context, systemPrompt: oversized }, { reasoning: "medium", onPayload: (payload) => ({ ...payload, systemPrompt: "small" }) }).result();
+    const metrics = await waitForRequestMetrics((entry) => entry.errorCategory !== "system_prompt_budget");
+    assert.notEqual(metrics.errorCategory, "system_prompt_budget");
+    assert.notEqual(metrics.lastPhase, "payload_applied");
+});
+test("provider rejects an invalid transcript-breakpoint setting before claiming a launch", async () => {
+    const original = process.env.PI_CLAUDE_CODE_PROVIDER_TRANSCRIPT_BREAKPOINT;
+    process.env.PI_CLAUDE_CODE_PROVIDER_TRANSCRIPT_BREAKPOINT = "maybe";
+    let claims = 0;
+    try {
+        const result = await createClaudeStream(DEAD_INSTALLATION, { claimLaunch: async () => { claims++; } })(model, context, { reasoning: "medium" }).result();
+        assert.equal(result.stopReason, "error");
+        assert.match(result.errorMessage ?? "", /PI_CLAUDE_CODE_PROVIDER_TRANSCRIPT_BREAKPOINT must be "on" or "off"/);
+        const metrics = await waitForRequestMetrics((entry) => entry.errorCategory === "breakpoint_config");
+        assert.equal(metrics.lastPhase, "prepared");
+        assert.equal(claims, 0);
+    }
+    finally {
+        if (original === undefined) delete process.env.PI_CLAUDE_CODE_PROVIDER_TRANSCRIPT_BREAKPOINT;
+        else process.env.PI_CLAUDE_CODE_PROVIDER_TRANSCRIPT_BREAKPOINT = original;
+    }
+});
+test("provider sends Claude no transcript breakpoint when the setting is off", async () => {
+    const fake = await fakeClaude(`
+const path = require("node:path");
+const NL = String.fromCharCode(10);
+let input = "";
+process.stdin.on("data", (chunk) => { input += chunk; });
+process.stdin.on("end", () => {
+  fs.writeFileSync(path.join(__dirname, "captured-stdin"), input);
+  process.stdout.write(JSON.stringify(${JSON.stringify(init)}) + NL);
+  process.stdout.write(JSON.stringify({type:"result",is_error:false,result:"ok",usage:{}}) + NL);
+});`);
+    const original = process.env.PI_CLAUDE_CODE_PROVIDER_TRANSCRIPT_BREAKPOINT;
+    process.env.PI_CLAUDE_CODE_PROVIDER_TRANSCRIPT_BREAKPOINT = "off";
+    try {
+        const result = await createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, context, { reasoning: "medium" }).result();
+        assert.equal(result.stopReason, "stop", result.errorMessage);
+        const prompt = JSON.parse(await readFile(join(fake.dir, "captured-stdin"), "utf8")).message.content;
+        assert.ok(prompt.length > 0);
+        assert.equal(prompt.some((block) => "cache_control" in block), false);
+    }
+    finally {
+        if (original === undefined) delete process.env.PI_CLAUDE_CODE_PROVIDER_TRANSCRIPT_BREAKPOINT;
+        else process.env.PI_CLAUDE_CODE_PROVIDER_TRANSCRIPT_BREAKPOINT = original;
+        await rm(fake.dir, { recursive: true, force: true });
+    }
+});
+test("provider records a cache-breakpoint limit rejection as its own category", async () => {
+    const rejection = { type: "result", is_error: true, api_error_status: 400, result: "API Error: 400 A maximum of 4 blocks with cache_control may be provided. Found 5." };
+    const fake = await fakeClaude(`
+const NL = String.fromCharCode(10);
+process.stdin.resume();
+process.stdin.on("end", () => {
+  process.stdout.write(JSON.stringify(${JSON.stringify(init)}) + NL);
+  process.stdout.write(JSON.stringify(${JSON.stringify(rejection)}) + NL);
+});`);
+    try {
+        const result = await createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, context, { reasoning: "medium" }).result();
+        assert.equal(result.stopReason, "error");
+        assert.match(result.errorMessage ?? "", /PI_CLAUDE_CODE_PROVIDER_TRANSCRIPT_BREAKPOINT=off/);
+        const metrics = await waitForRequestMetrics((entry) => entry.errorCategory === "cache_breakpoint_limit");
+        assert.equal(metrics.stopReason, "error");
+    }
+    finally {
+        await rm(fake.dir, { recursive: true, force: true });
+    }
+});
+
+test("provider refuses an unusable session working directory before preparing or launching", async () => {
+    const root = await mkdtemp(join(tmpdir(), "provider-session-cwd-"));
+    const regularFile = join(root, "not-a-directory");
+    await writeFile(regularFile, "file");
+    const spawnMarker = join(root, "spawned");
+    const fake = await fakeClaude(`fs.writeFileSync(${JSON.stringify(spawnMarker)}, "spawned"); process.exit(0);`);
+    try {
+        // No fallback: another directory would again contradict Pi's own.
+        const cases = [
+            [undefined, /not available/],
+            ["relative/project", /not absolute/],
+            [join(root, "missing"), /unavailable: .*missing \(ENOENT\)/],
+            [regularFile, /not a directory/],
+        ];
+        for (const [workingDirectory, message] of cases) {
+            let claims = 0;
+            const result = await createClaudeStream(
+                { executable: fake.executable, version: "test", subscriptionType: "pro" },
+                { workingDirectory: () => workingDirectory, claimLaunch: async () => { claims += 1; } },
+            )(model, context, { reasoning: "medium" }).result();
+            assert.equal(result.stopReason, "error");
+            assert.match(result.errorMessage ?? "", message);
+            assert.equal(claims, 0);
+            const metrics = await waitForRequestMetrics((entry) => entry.errorCategory === "working_directory");
+            // Validation precedes preparation, so no private request state was created.
+            assert.equal(metrics.lastPhase, "payload_applied");
+            assert.equal(metrics.transcriptBytes, 0);
+        }
+        await assert.rejects(access(spawnMarker));
+    }
+    finally {
+        await Promise.all([root, fake.dir].map((directory) => rm(directory, { recursive: true, force: true })));
+    }
+});
+
+test("provider does not retry elsewhere when the session directory disappears after validation", async () => {
+    const root = await mkdtemp(join(tmpdir(), "provider-vanishing-cwd-"));
+    const sessionDirectory = join(root, "project");
+    await mkdir(sessionDirectory);
+    const spawnMarker = join(root, "spawned");
+    const fake = await fakeClaude(`fs.writeFileSync(${JSON.stringify(spawnMarker)}, process.cwd()); process.exit(0);`);
+    try {
+        let claims = 0;
+        const result = await createClaudeStream(
+            { executable: fake.executable, version: "test", subscriptionType: "pro" },
+            {
+                workingDirectory: () => sessionDirectory,
+                claimLaunch: async () => {
+                    claims += 1;
+                    await rm(sessionDirectory, { recursive: true, force: true });
+                },
+            },
+        )(model, context, { reasoning: "medium" }).result();
+        assert.equal(result.stopReason, "error");
+        assert.match(result.errorMessage ?? "", /disappeared before Claude Code could start/);
+        assert.doesNotMatch(result.errorMessage ?? "", /spawn .*ENOENT/);
+        assert.equal(claims, 1);
+        const metrics = await waitForRequestMetrics((entry) => entry.errorCategory !== undefined);
+        assert.equal(metrics.errorCategory, "working_directory");
+        assert.equal(metrics.cleanupComplete, true);
+        await assert.rejects(access(spawnMarker));
+    }
+    finally {
+        await Promise.all([root, fake.dir].map((directory) => rm(directory, { recursive: true, force: true })));
+    }
+});
+
+test("provider rejects image attachments from a temporary directory containing a double quote before launch", { skip: process.platform === "win32" }, async () => {
+    const root = await mkdtemp(join(tmpdir(), "provider-quoted-temp-"));
+    const quotedRoot = join(root, 'temp"root');
+    await mkdir(quotedRoot);
+    const originalTmpdir = process.env.TMPDIR;
+    process.env.TMPDIR = quotedRoot;
+    try {
+        let claims = 0;
+        const imageContext = {
+            messages: [{ role: "user", content: [{ type: "text", text: "look" }, { type: "image", data: "AA==", mimeType: "image/png" }], timestamp: 1 }],
+            tools: [],
+        };
+        const result = await createClaudeStream(
+            { executable: join(root, "never-launched"), version: "test", subscriptionType: "pro" },
+            { workingDirectory: () => root, claimLaunch: async () => { claims += 1; } },
+        )(model, imageContext, { reasoning: "medium" }).result();
+        assert.equal(result.stopReason, "error");
+        assert.match(result.errorMessage ?? "", /double quote/);
+        assert.equal(claims, 0);
+        await waitForRequestMetrics((entry) => entry.errorCategory === "image_path");
+        assert.deepEqual(await readdir(quotedRoot), []);
+    }
+    finally {
+        if (originalTmpdir === undefined) delete process.env.TMPDIR;
+        else process.env.TMPDIR = originalTmpdir;
+        await rm(root, { recursive: true, force: true });
+    }
 });

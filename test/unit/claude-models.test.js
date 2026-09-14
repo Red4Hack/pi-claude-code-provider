@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { MODEL_ALIASES, clearModelAliasCache, readClaudeModelAliases } from "../../src/claude-models.ts";
+import { CAPTURED_CLAUDE_VERSION } from "../support/claude-fixture.js";
 
 // A synthetic table in the shape the scanner parses, written by this test and
 // read back by it. These ids are sample values, NOT a pin on what Claude Code
@@ -17,7 +18,7 @@ const ALIAS_TABLE = 'sonnet:{default:"claude-sonnet-5",per_provider:{gateway:"cl
     + 'fable:{default:"claude-fable-5-1",per_provider:{gateway:"claude-fable-5"}}';
 
 function installation(executable) {
-    return { executable, version: "2.1.261", subscriptionType: "pro" };
+    return { executable, version: CAPTURED_CLAUDE_VERSION, subscriptionType: "pro" };
 }
 
 async function scan(directory, contents, name = "claude") {

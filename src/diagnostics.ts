@@ -6,6 +6,7 @@ import { promisify } from "node:util";
 import type { ModelAliasVersions } from "./claude-models.ts";
 import type { VersionStatus } from "./compatibility.ts";
 import { ClaudeCodeError } from "./errors.ts";
+import { TRANSCRIPT_BREAKPOINT_ENV } from "./claude-args.ts";
 import { hostRuntimeDescription } from "./host-runtime.ts";
 import type { BridgeProbeResult } from "./doctor.ts";
 import type { RuntimeCleanupResult } from "./runtime-directories.ts";
@@ -65,6 +66,7 @@ export async function writeDiagnosticReport(input: DiagnosticReportInput): Promi
     overrides: {
       claudeExecutable: Boolean(process.env.PI_CLAUDE_CODE_PROVIDER_PATH?.trim()),
       metricsLog: Boolean(process.env.PI_CLAUDE_CODE_PROVIDER_METRICS_LOG?.trim()),
+      transcriptBreakpointDisabled: process.env[TRANSCRIPT_BREAKPOINT_ENV]?.trim() === "off",
     },
     installation: input.installation
       ? {

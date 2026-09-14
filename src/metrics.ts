@@ -1,4 +1,5 @@
 import { open } from "node:fs/promises";
+import { errorCode } from "./errors.ts";
 import type { RequestMetrics, SearchMetrics } from "./types.ts";
 
 let lastRequestMetrics: RequestMetrics | undefined;
@@ -59,14 +60,9 @@ function queueMetricsWrite(generation: number, append: () => Promise<void>): voi
       if (generation === metricsLogGeneration) metricsLogError = undefined;
     },
     (error: unknown) => {
-      if (generation === metricsLogGeneration) metricsLogError = errorCode(error);
+      if (generation === metricsLogGeneration) metricsLogError = errorCode(error) ?? "write_failed";
     },
   );
-}
-
-function errorCode(error: unknown): string {
-  if (error && typeof error === "object" && "code" in error && typeof error.code === "string") return error.code;
-  return "write_failed";
 }
 
 export function serializeRequestMetrics(metrics: RequestMetrics): string {

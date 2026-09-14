@@ -10,8 +10,8 @@
 - A tool call whose streamed input never closes its JSON now reports the evidence — how many bytes arrived and that the input ended mid-JSON, which is what a response truncated at its output-token limit looks like — instead of a bare `Claude emitted invalid arguments for tool <name>`. Model-authored tool input is never included in the message.
 - A turn Claude Code continued past its output cap is no longer reported as truncated. Claude Code caps a response at `CLAUDE_CODE_MAX_OUTPUT_TOKENS`, reports `max_tokens` on that message, then continues and finishes the turn under a different stop reason; the mapper kept the first stop reason it saw and reported `length` for a completed answer. Pi discards a compaction summary that stopped at its cap and pays for another one, so a finished summary was thrown away on every compaction once the requested budget was small enough to be hit. The terminal result envelope now states how the turn ended, and a turn that really did end at its cap still reports `length`. Captured from a real Claude Code run.
 - Compaction no longer fails and re-runs at full token cost. Pi treats its requested `maxTokens` as the budget for the answer and adds the thinking budget to the response ceiling, because thinking is output too; this transport was passing the request through as the total ceiling, so reasoning ate the summary's room and the summary was cut off. Pi discards a summary that stopped at its token cap and pays for another one, which turned every compaction into a repeated charge. A requested cap now budgets the answer and reasoning is added on top of it, exactly as `adjustMaxTokensForThinking` does in pi-ai.
-- A request whose prompt fits is no longer rejected for lack of an output reserve. The budget guard reserved the model's full output maximum, so on a 200K window it refused any prompt above roughly 136K estimated tokens while tens of thousands of tokens were still free — and each refusal made Pi compact. The ceiling is now clamped to the room the window actually has left, and only a prompt that leaves no room for a reply is refused before launch.
-- Stale-state recovery terminates an abandoned Claude process group whose Pi process is gone, rather than leaving it running and its private directory in place. An abruptly killed Pi previously left a detached Claude process and its proposal bridge alive indefinitely. The group is signalled only when the live process still proves it owns that private directory, so a reused process identifier is never signalled; the proof reads `/proc` on Linux, and other platforms leave an unproven process alone exactly as before. `/pi-claude-code-provider-doctor` reports how many were reclaimed.
+- A request whose prompt fits is no longer rejected for lack of an output reserve. The budget guard reserved the model's full output maximum, so on a 200K window it refused any prompt above roughly 136K estimated tokens while tens of thousands of tokens were still free — and each refusal made Pi compact. The ceiling is now clamped to the room the window actually has left, and only a prompt that leaves no room for a reply is refused before launch. The system-prompt precheck from 0.3.0 follows the same rule: it refuses a system prompt only when it leaves no room for the context safety margin and a minimal reply, instead of reserving the model's whole output maximum beside it.
+- Stale-state recovery terminates an abandoned Claude process group whose Pi process is gone, rather than leaving it running and its private directory in place. An abruptly killed Pi previously left a detached Claude process and its proposal bridge alive indefinitely. The group is signalled only when the live process still proves it owns that private directory, so a reused process identifier is never signalled; the proof reads the process's working directory or command line from `/proc` on Linux, and other platforms leave an unproven process alone exactly as before. `/pi-claude-code-provider-doctor` reports how many were reclaimed.
 
 ### Added
 
@@ -21,9 +21,41 @@
 ### Changed
 
 - Linux is verified on `x64` across distributions rather than for WSL2 Ubuntu alone, so a native Linux install no longer raises a startup platform advisory. WSL2 Ubuntu is `linux/x64`, and nothing in this package takes a different code path on another distribution or kernel — the same reasoning already applied to macOS architectures.
-- A streaming tool-input preview stops being re-parsed past 64 KiB. Re-parsing every delta is quadratic in the size of the input, which a large file write reaches; the complete input is still parsed exactly once when the block closes.
 - The pre-launch token estimate is calibrated rather than assumed. Measured against a real session transcript by comparing this transport's serialized bytes with Claude's own reported prompt counters over the same messages, dense agent history tokenizes at 2.12 bytes per token; the previous 3-byte ratio, described as conservative, under-counted such a transcript by about a fifth, so the guard did not bound what it claimed to. The ratio is now 2.4 bytes per token with the existing 10% margin.
 - Protocol activity postpones the idle deadline through a timestamp read by one long-lived timer, instead of clearing and recreating a timer for every record.
+
+## [0.3.0] - 2026-09-13
+
+### Added
+
+- `PI_CLAUDE_CODE_PROVIDER_TRANSCRIPT_BREAKPOINT=off` turns off the provider's prompt-cache marker. It is an escape hatch in case a future Claude Code release rejects requests for carrying too many cache markers; that error names this setting.
+- `CLAUDE_CONFIG_DIR` and `NODE_EXTRA_CA_CERTS` are passed to Claude when set, so a relocated Claude Code configuration and TLS-inspecting proxies work. Logins through `CLAUDE_CODE_OAUTH_TOKEN` remain unsupported.
+- For development: `PI_CLAUDE_CODE_PROVIDER_DEV_PI` selects the npm-installed Pi that checks and tests use, `npm run capture:claude-breakpoints` inspects prompt-cache markers without using quota, and the paid release gate adds Haiku and image-cache stages.
+
+### Changed
+
+- Claude now starts in Pi's session working directory, the project Pi's tools work in, instead of a private temporary directory. Private request files stay separate, and `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1` stops Claude Code's startup Git status collection, so a project's Git filters don't run. If that directory is deleted while Pi is running, requests fail with `working_directory`; restart Pi from an existing directory.
+- Conversations with images now reuse Claude's prompt cache, because each image keeps the same private path for the whole Pi session. The 20-image and size limits are unchanged.
+- The first request after upgrading builds a fresh prompt cache, because the transcript format is now `pi-claude-code-provider-context-v4`.
+- The minimum supported Claude Code version is now 2.1.270. Older versions still run, and `/pi-claude-code-provider-doctor` flags them.
+- `/pi-claude-code-provider-doctor` prints one fact per line.
+- Pi's startup `[Extensions]` list shows `pi-claude-code-provider` instead of `pi-claude-code-provider:pi-claude-code-provider.ts`.
+- The package summary on npm and pi.dev now reads: "The convenience of your Claude subscription in Pi, with the fewest possible surprises. Uses Claude Code's CLI under the hood."
+- Web-search rate-limit errors include the overage-disabled reason, as provider requests already did.
+- A Pi `modelOverrides` entry with a missing or non-positive `contextWindow` now fails with `context_window` instead of skipping the context check. The provider's own models are unaffected.
+- Invalid request content, for example from another extension's payload hook, reports `content_shape`, `content_type`, or an image error category instead of `payload_invalid`.
+- An image request fails with `image_path` if the temporary directory's path contains a double quote; point `TMPDIR` (or `TEMP` on Windows) at another directory.
+
+### Fixed
+
+- On Claude Code 2.1.268 and later, Claude no longer proposes tool calls into the provider's private directory, which made those calls fail.
+- Prompt caching works again on Claude Code 2.1.268 and later: later turns reuse about 97–99% of the conversation instead of rewriting it.
+- Large system prompts, for example from many skills or context files, are no longer refused by a fixed 120 KiB limit; only the model's context window applies ([#4](https://github.com/chem/pi-claude-code-provider/issues/4)).
+- Pi tools whose names contain characters such as `.` no longer make every request fail with `isolation_tools`.
+- Pi no longer stalls while a large tool call, such as a big `write`, streams in, and the call preview fills in as it arrives.
+- A rate-limit warning that looks the same is shown once per session instead of on every tool round trip.
+- Error messages include a short, path-redacted excerpt of Claude Code's error output instead of up to 64 KiB of it.
+- Web search no longer counts discarded partial messages against its 2 MiB output limit.
 
 ## [0.2.0] - 2026-09-05
 
