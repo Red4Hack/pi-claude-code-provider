@@ -13,7 +13,9 @@ This document owns the maintained architecture and security model. Code is autho
 
 ## Request and transcript transport
 
-`streamSimple(model, context, options)` receives Pi's prepared context and applies Pi's logical `before_provider_request` replacement when present. The provider does not parse session files or rebuild Pi state.
+`streamSimple(model, context, options)` receives Pi's normalized transcript and applies Pi's logical `before_provider_request` replacement when present. The provider does not parse session files or rebuild Pi state.
+
+Pi carries the system prompt and the tool declarations in that transcript's system messages, and either can change mid-conversation. Claude Code takes the prompt outside the message list, through `--system-prompt-file`, and its transport cannot express a later change, so every system message is replayed into one effective prompt and tool set before a request is built: later instructions are appended, named sections are replaced or removed, and added and removed tools resolve to the current set. The logical payload `before_provider_request` sees and replaces keeps its `systemPrompt`, `messages`, and `tools` shape, and a system message never reaches the serialized transcript.
 
 Validated initialization is the transport's response boundary: capabilities are known and no content has been published. The provider announces it to Pi's `after_provider_response` observers with a synthetic success status and no headers, because the headless protocol exposes no HTTP response. The observer completes before body events are mapped; a failing observer fails the request.
 

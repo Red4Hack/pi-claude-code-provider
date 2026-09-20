@@ -123,8 +123,8 @@ test("compares versions numerically rather than lexically", () => {
     assert.equal(meetsMinimumVersion("2.1.269", MINIMUM_VERSIONS.claudeCode), false);
     assert.equal(meetsMinimumVersion("2.2.0", MINIMUM_VERSIONS.claudeCode), true);
     assert.equal(meetsMinimumVersion("3.0.0", MINIMUM_VERSIONS.claudeCode), true);
-    assert.equal(meetsMinimumVersion("0.85.1", MINIMUM_VERSIONS.pi), true);
-    assert.equal(meetsMinimumVersion("0.84.10", MINIMUM_VERSIONS.pi), false);
+    assert.equal(meetsMinimumVersion("0.86.0", MINIMUM_VERSIONS.pi), true);
+    assert.equal(meetsMinimumVersion("0.85.10", MINIMUM_VERSIONS.pi), false);
 });
 
 // Fake Claude programs use synchronous test-only stdio because some restricted

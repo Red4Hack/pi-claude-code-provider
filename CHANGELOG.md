@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Every request failed with `Unsupported Pi message role: system` on Pi 0.86.0. Pi now hands providers a normalized transcript that carries the system prompt and the tool declarations in its system messages, instead of the `systemPrompt` and `tools` fields this transport read, so the prompt and the tools went missing and the system message itself reached the serializer as an unknown role. Claude Code takes the prompt outside the message list and cannot express a mid-conversation change, so every system message is now replayed into one effective prompt and tool set before the request is built: later instructions are appended, named sections are replaced or removed, and added and removed tools resolve to the current set. The logical payload `before_provider_request` sees and replaces keeps its `systemPrompt`, `messages`, and `tools` shape.
 - An exhausted Claude subscription window now ends the turn instead of being retried. Claude Code reports it as HTTP 429, which Pi's retry classifier reads as transient throttling, so a session or weekly limit was restarted on a backoff, spending one Claude launch per attempt against a window that could not open before its reset. Provider failures now carry the account-limit marker Pi stops on, and genuinely transient failures keep their retryable wording.
 - The MCP tool-catalog readiness deadline rose from five to twenty seconds, and it now also ends on Claude's own validated initialization record or on a failure Claude already reported. An ordinary slow Claude Code start was failing requests that were about to succeed, and the report named the deadline rather than the answer Claude had already given.
 - A readiness timeout reports its deadline in seconds. Pi classifies a failed turn by matching HTTP status substrings in its text, so the previous `5000ms` read as a retryable `500` and restarted a request that needed a fix.
@@ -20,6 +21,7 @@
 
 ### Changed
 
+- Pi 0.86.0 is now the minimum supported version, and the verified baseline advances to it with the Pi version CI installs. The transcript contract it introduced is not expressible on 0.85.1, so this release does not run there.
 - Linux is verified on `x64` across distributions rather than for WSL2 Ubuntu alone, so a native Linux install no longer raises a startup platform advisory. WSL2 Ubuntu is `linux/x64`, and nothing in this package takes a different code path on another distribution or kernel — the same reasoning already applied to macOS architectures.
 - The pre-launch token estimate is calibrated rather than assumed. Measured against a real session transcript by comparing this transport's serialized bytes with Claude's own reported prompt counters over the same messages, dense agent history tokenizes at 2.12 bytes per token; the previous 3-byte ratio, described as conservative, under-counted such a transcript by about a fifth, so the guard did not bound what it claimed to. The ratio is now 2.4 bytes per token with the existing 10% margin.
 - Protocol activity postpones the idle deadline through a timestamp read by one long-lived timer, instead of clearing and recreating a timer for every record.

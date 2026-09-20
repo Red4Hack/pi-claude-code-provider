@@ -3,7 +3,7 @@ import { access, chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFi
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { isContextOverflow } from "@earendil-works/pi-ai";
+import { isContextOverflow, normalizeContext } from "@earendil-works/pi-ai";
 import { availableOutputTokens, createClaudeStream as createProviderStream, isExpectedToolHandoffExit, waitForReadyOrExit } from "../../src/provider.ts";
 import { getLastRequestMetrics } from "../../src/metrics.ts";
 import { normalizeClaudeFailure } from "../../src/errors.ts";
@@ -68,12 +68,16 @@ let metricsBeforeRequest;
 let lastRequestStartedAt = 0;
 // Every provider request runs Claude in Pi's session directory; tests that are
 // not about that directory use the temporary root as the session.
+// Pi normalizes its public `{ systemPrompt, messages, tools }` request shape
+// into a transcript before any provider sees it, so these fixtures stay written
+// the way a caller states a request and reach the provider the way Pi delivers
+// one: the prompt and the tools carried by a leading system message.
 function createClaudeStream(installation, dependencies = {}) {
     const streamSimple = createProviderStream(installation, { workingDirectory: () => tmpdir(), ...dependencies });
-    return (...request) => {
+    return (model, context, options) => {
         while (Date.now() <= lastRequestStartedAt) { /* wait out the millisecond */ }
         metricsBeforeRequest = JSON.stringify(getLastRequestMetrics() ?? null);
-        const stream = streamSimple(...request);
+        const stream = streamSimple(model, normalizeContext(context), options);
         lastRequestStartedAt = Date.now();
         return stream;
     };
@@ -155,6 +159,81 @@ setTimeout(() => {
         assert.equal(metrics.toolCount, 1);
         assert.equal(metrics.imageCount, 1);
         assert.equal(metrics.terminationExpected, false);
+    }
+    finally {
+        await rm(fake.dir, { recursive: true, force: true });
+    }
+});
+// Pi carries the system prompt and the tool declarations in the transcript's
+// system messages and can change either mid-conversation. Claude Code takes the
+// prompt through --system-prompt-file and its transport cannot express a later
+// change, so the replayed state is what must reach the request: the added
+// instructions, the current sections, the current tools, and a transcript that
+// still holds only conversation turns.
+test("provider replays the transcript's system messages into one prompt and tool set", async () => {
+    const parameters = { type: "object", properties: { path: { type: "string" } } };
+    const transcript = {
+        messages: [
+            {
+                role: "system",
+                content: "base instructions",
+                sections: { environment: "first environment" },
+                toolsAdded: [
+                    { name: "read", description: "read", parameters },
+                    { name: "write", description: "write", parameters },
+                ],
+                timestamp: 1,
+            },
+            { role: "user", content: "first turn", timestamp: 2 },
+            {
+                role: "system",
+                content: "later instructions",
+                sections: { environment: "second environment" },
+                toolsAdded: [{ name: "search", description: "search", parameters }],
+                toolsRemoved: [{ name: "write" }],
+                timestamp: 3,
+            },
+            { role: "user", content: "second turn", timestamp: 4 },
+        ],
+    };
+    const replayInit = { ...init, tools: ["mcp__pi__read", "mcp__pi__search"], mcp_servers: [{ name: "pi", status: "connected" }] };
+    const fake = await fakeClaude(`
+const path = require("node:path");
+const privateDirectory = path.dirname(process.argv[process.argv.indexOf("--system-prompt-file") + 1]);
+let received = "";
+process.stdin.on("data", (chunk) => { received += chunk; });
+process.stdin.on("end", () => {
+  fs.writeFileSync(path.join(__dirname, "captured-replay"), JSON.stringify({
+    systemPrompt: fs.readFileSync(path.join(privateDirectory, "system-prompt.txt"), "utf8"),
+    catalog: JSON.parse(fs.readFileSync(path.join(privateDirectory, "tools.json"), "utf8")),
+    received,
+  }));
+  process.stdout.write(JSON.stringify(${JSON.stringify(replayInit)}) + "\\n");
+  process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"message_start",message:{id:"msg_replay",model:"claude-sonnet-5",usage:{input_tokens:0,output_tokens:0}}}}) + "\\n");
+  process.stdout.write(JSON.stringify({type:"result",is_error:false,result:"",usage:{input_tokens:4,output_tokens:2}}) + "\\n");
+});`);
+    try {
+        const result = await createClaudeStream({ executable: fake.executable, version: CAPTURED_CLAUDE_VERSION, subscriptionType: "pro" })(
+            model,
+            transcript,
+            { reasoning: "medium" },
+        ).result();
+        assert.equal(result.stopReason, "stop", result.errorMessage);
+        const captured = JSON.parse(await readFile(join(fake.dir, "captured-replay"), "utf8"));
+        // Later content is appended to the base prompt and a section is
+        // replaced by name, never duplicated.
+        assert.equal(captured.systemPrompt, "base instructions\n\nlater instructions\n\nsecond environment");
+        // The removed tool is gone and the added one is callable. Claude Code's
+        // initialization announces exactly these two, so a wrong replay would
+        // also fail the isolation check.
+        assert.deepEqual(captured.catalog.map((tool) => tool.name), ["read", "search"]);
+        const blocks = JSON.parse(captured.received).message.content.map((block) => block.text);
+        assert.ok(blocks.some((text) => text.includes("first turn")));
+        assert.ok(blocks.some((text) => text.includes("second turn")));
+        assert.equal(blocks.some((text) => text.includes('"role":"system"')), false);
+        const metrics = await waitForRequestMetrics((entry) => entry.stopReason === "stop");
+        assert.equal(metrics.messageCount, 2);
+        assert.equal(metrics.toolCount, 2);
     }
     finally {
         await rm(fake.dir, { recursive: true, force: true });

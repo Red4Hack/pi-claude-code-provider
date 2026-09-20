@@ -4,6 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { normalizeContext } from "@earendil-works/pi-ai";
 import { createLocalClaudeExecutable } from "../support/local-claude.js";
 import { createClaudeStream } from "../../src/provider.ts";
 import { inspectClaudeInstallation } from "../../src/auth.ts";
@@ -20,11 +21,14 @@ const model = {
   contextWindow: 200_000,
   maxTokens: 64_000,
 };
-const context = { messages: [{ role: "user", content: "hello", timestamp: 1 }], tools: [] };
-const toolContext = {
-  ...context,
+const request = { messages: [{ role: "user", content: "hello", timestamp: 1 }], tools: [] };
+// Pi delivers a normalized transcript, where the prompt and the tool
+// declarations are carried by a leading system message rather than by fields.
+const context = normalizeContext(request);
+const toolContext = normalizeContext({
+  ...request,
   tools: [{ name: "read", description: "read a file", parameters: { type: "object", properties: { path: { type: "string" } } } }],
-};
+});
 
 /** Stand in for llama.cpp: same OpenAI-compatible surface, no model and no network. */
 async function stubModelServer(reply) {

@@ -8,8 +8,15 @@ import type {
   Model,
   ProviderResponse,
   SimpleStreamOptions,
+  TranscriptContext,
 } from "@earendil-works/pi-ai";
-import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import {
+  collapseSystemMessages,
+  createAssistantMessageEventStream,
+  getCurrentSystemPrompt,
+  getCurrentTools,
+  withoutInitialSystemMessage,
+} from "@earendil-works/pi-ai";
 import { bridgeArgv, formatBridgeArgv, providerArgs, transcriptBreakpointEnabled } from "./claude-args.ts";
 import { claimClaudeLaunch, settleFailure, spawnClaudeProcess, type ClaudeProcess } from "./claude-process.ts";
 import { prepareRequest } from "./context-serializer.ts";
@@ -85,7 +92,7 @@ export function createClaudeStream(
   const claimLaunch = dependencies.claimLaunch ?? claimPaidTestLaunch;
   const supervise = dependencies.supervise ?? superviseProcess;
   const imageStore = dependencies.imageStore;
-  return (model: Model<Api>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream => {
+  return (model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions): AssistantMessageEventStream => {
     const stream = createAssistantMessageEventStream();
     // Read once, when Pi starts the request: a session switch during asynchronous
     // preparation must not move this request to another directory.
@@ -116,8 +123,11 @@ export function createClaudeStream(
         claudeVersion: installation.version,
         requestedModel: model.id,
         effort,
-        messageCount: context.messages.length,
-        toolCount: context.tools?.length ?? 0,
+        // Pi carries the system prompt and the tool declarations inside the
+        // transcript, so both counts are resolved from it in phase 1, below,
+        // rather than read off fields the context no longer has.
+        messageCount: 0,
+        toolCount: 0,
         imageCount: 0,
         transcriptBytes: 0,
         catalogBytes: 0,
@@ -213,7 +223,12 @@ export function createClaudeStream(
 
       try {
         // Phase 1 — prepare Pi's logical payload and private transport state.
-        const effectiveContext = await applyPayloadHook(model, context, options);
+        const requested = logicalPayload(context);
+        // Record the request as Pi stated it before the hook can replace it, so
+        // a failing handler still reports what it was given.
+        metrics.messageCount = requested.messages.length;
+        metrics.toolCount = requested.tools?.length ?? 0;
+        const effectiveContext = await applyPayloadHook(model, requested, options);
         metrics.lastPhase = "payload_applied";
         cwd = await requireWorkingDirectory(sessionCwd);
         imageLease = imageStore?.acquire();
@@ -770,12 +785,26 @@ function containsPrivateTransportPath(value: unknown, directory: string): boolea
   return Object.values(value as Record<string, unknown>).some((item) => containsPrivateTransportPath(item, directory));
 }
 
-async function applyPayloadHook(model: Model<Api>, context: Context, options?: SimpleStreamOptions): Promise<Context> {
-  const logical: LogicalProviderPayload = {
-    systemPrompt: context.systemPrompt,
-    messages: context.messages,
-    tools: context.tools,
+/**
+ * Pi's transcript carries the system prompt and the tool declarations in its
+ * system messages, and can change either mid-conversation. Claude Code takes
+ * the prompt outside the message list, through `--system-prompt-file`, and its
+ * transport has no way to express a later change, so every system message is
+ * replayed into one effective prompt and tool set before the request is built.
+ * That is exactly what Pi asks a transport without mid-conversation system
+ * messages to do, and it keeps this provider's logical payload — the shape
+ * `before_provider_request` sees and replaces — unchanged.
+ */
+function logicalPayload(context: TranscriptContext): LogicalProviderPayload {
+  const collapsed = collapseSystemMessages(context);
+  return {
+    systemPrompt: getCurrentSystemPrompt(collapsed.messages),
+    messages: withoutInitialSystemMessage(collapsed.messages),
+    tools: getCurrentTools(collapsed.messages),
   };
+}
+
+async function applyPayloadHook(model: Model<Api>, logical: LogicalProviderPayload, options?: SimpleStreamOptions): Promise<Context> {
   // Pi supplies this callback even when no extension handler replaces the
   // payload. Only the top-level shape is checked here, because the system-prompt
   // budget reads it before preparation; prepareRequest owns every per-message,

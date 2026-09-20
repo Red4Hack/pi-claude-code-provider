@@ -119,7 +119,7 @@ test("routes rate-limit warnings to the active Pi UI and launches nothing before
             api: "pi-claude-code-provider-headless",
             baseUrl: "pi-claude-code-provider://local",
         };
-        const context = { messages: [{ role: "user", content: "hello", timestamp: 1 }], tools: [] };
+        const context = { messages: [{ role: "user", content: "hello", timestamp: 1 }] };
         // Before any session there is no working directory to run Claude in.
         const early = await provider.streamSimple(model, context, { reasoning: "medium" }).result();
         assert.equal(early.stopReason, "error");
@@ -180,7 +180,7 @@ test("does not report a disabled overage as a rate limit", async () => {
         };
         const notices = [];
         pi.handlers.get("session_start")[0]({}, { cwd: tmpdir(), ui: { notify(message, level) { notices.push({ message, level }); } } });
-        const context = { messages: [{ role: "user", content: "hello", timestamp: 1 }], tools: [] };
+        const context = { messages: [{ role: "user", content: "hello", timestamp: 1 }] };
         assert.equal((await provider.streamSimple(model, context, { reasoning: "medium" }).result()).stopReason, "stop");
         assert.deepEqual(notices.filter(({ message }) => message.includes("rate limit")), []);
     }
@@ -216,7 +216,7 @@ test("reports a repeated rate-limit warning once per session", async () => {
         };
         const notices = [];
         pi.handlers.get("session_start")[0]({}, { cwd: tmpdir(), ui: { notify(message, level) { notices.push({ message, level }); } } });
-        const context = { messages: [{ role: "user", content: "hello", timestamp: 1 }], tools: [] };
+        const context = { messages: [{ role: "user", content: "hello", timestamp: 1 }] };
         await provider.streamSimple(model, context, { reasoning: "medium" }).result();
         await provider.streamSimple(model, context, { reasoning: "medium" }).result();
         assert.deepEqual(notices.filter(({ message }) => message.includes("rate limit")), [{
@@ -257,7 +257,7 @@ test("reports one warning while utilization moves within the displayed percent",
         };
         const notices = [];
         pi.handlers.get("session_start")[0]({}, { cwd: tmpdir(), ui: { notify(message, level) { notices.push({ message, level }); } } });
-        const context = { messages: [{ role: "user", content: "hello", timestamp: 1 }], tools: [] };
+        const context = { messages: [{ role: "user", content: "hello", timestamp: 1 }] };
         await provider.streamSimple(model, context, { reasoning: "medium" }).result();
         assert.deepEqual(notices.filter(({ message }) => message.includes("rate limit")).map(({ message }) => message), [
             `[pi-claude-code-provider] Claude rate limit warning: 87% used (five_hour); resets at ${new Date(1_800_000_000_000).toLocaleString()}`,
@@ -296,7 +296,7 @@ test("converts fractional weekly utilization to a percentage", async () => {
             api: "pi-claude-code-provider-headless",
             baseUrl: "pi-claude-code-provider://local",
         };
-        const context = { messages: [{ role: "user", content: "hello", timestamp: 1 }], tools: [] };
+        const context = { messages: [{ role: "user", content: "hello", timestamp: 1 }] };
         const notices = [];
         pi.handlers.get("session_start")[0]({}, { cwd: tmpdir(), ui: { notify(message, level) { notices.push({ message, level }); } } });
         assert.equal((await provider.streamSimple(model, context, { reasoning: "medium" }).result()).stopReason, "stop");
@@ -495,7 +495,7 @@ test("provider requests run Claude in the current Pi session's directory, never 
             api: "pi-claude-code-provider-headless",
             baseUrl: "pi-claude-code-provider://local",
         };
-        const context = { messages: [{ role: "user", content: "hello", timestamp: 1 }], tools: [] };
+        const context = { messages: [{ role: "user", content: "hello", timestamp: 1 }] };
         const request = () => provider.streamSimple(model, context, { reasoning: "medium" }).result();
         const childCwd = async () => {
             const result = await request();
