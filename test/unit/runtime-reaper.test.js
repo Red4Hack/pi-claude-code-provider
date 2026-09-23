@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { access, lstat, mkdtemp, rm } from "node:fs/promises";
+import { access, lstat, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -32,6 +32,16 @@ function spawnDetached(cwd, extraArgs = []) {
   });
   child.unref();
   return child;
+}
+
+/** A process ID a fixture writes once it is ready, which proves its signal handlers are installed. */
+async function readPid(path) {
+  for (let attempt = 0; attempt < 250; attempt += 1) {
+    const text = await readFile(path, "utf8").catch(() => "");
+    if (/^\d+$/.test(text)) return Number(text);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error("the group member never reported its process ID");
 }
 
 async function waitForExit(pid) {
@@ -120,5 +130,42 @@ test("a live process that does not reference the recorded directory is never sig
       try { process.kill(-child.pid, "SIGKILL"); } catch { /* already gone */ }
     }
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a group member that outlives its leader is killed before the directory is removed", async (t) => {
+  if (process.platform !== "linux") return t.skip("ownership proof reads /proc");
+  const root = await mkdtemp(join(tmpdir(), "pi-runtime-reaper-group-"));
+  const scratch = await mkdtemp(join(tmpdir(), "pi-runtime-reaper-member-"));
+  let leader;
+  try {
+    const directory = await createRuntimeDirectory("provider_request", {
+      temporaryRoot: root,
+      ownerPid: await deadPid(),
+      now: Date.now() - 2 * HOUR,
+    });
+    // The leader stands in for Claude Code and its member for the proposal
+    // bridge. The member shares the leader's process group and ignores SIGTERM,
+    // so the leader dies on the first signal while the group lives on: only the
+    // group probe, not the leader's exit, can say the directory is unowned.
+    const pidFile = join(scratch, "member.pid");
+    const member = `process.on("SIGTERM", () => {}); require("node:fs").writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 1000);`;
+    const leaderSource = `require("node:child_process").spawn(process.execPath, ["-e", ${JSON.stringify(member)}], { stdio: "ignore" }); setInterval(() => {}, 1000);`;
+    leader = spawn(process.execPath, nodeFixtureArgs(["-e", leaderSource]), { cwd: directory, detached: true, stdio: "ignore" });
+    leader.unref();
+    const memberPid = await readPid(pidFile);
+    await recordRuntimeChild(directory, leader.pid);
+
+    const result = await cleanupStaleRuntimeDirectories({ temporaryRoot: root, currentUid: (await lstat(root)).uid });
+    assert.deepEqual(result, { removed: 1, failures: 0, reaped: 1 });
+    assert.equal(await waitForExit(memberPid), true, "a member that ignored SIGTERM must not be orphaned");
+    assert.equal(await waitForExit(leader.pid), true, "the leader should be gone");
+    await assert.rejects(access(directory), "its private state should be removed");
+  } finally {
+    if (leader?.pid) {
+      try { process.kill(-leader.pid, "SIGKILL"); } catch { /* already gone */ }
+    }
+    await rm(root, { recursive: true, force: true });
+    await rm(scratch, { recursive: true, force: true });
   }
 });

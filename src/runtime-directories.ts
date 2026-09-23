@@ -165,7 +165,10 @@ export async function cleanupStaleRuntimeDirectories(
         // left alone, together with its directory, exactly as before.
         if (reaped >= maxReaped) continue;
         if (!(await processOwnsDirectory(marker.childPid, directory))) continue;
-        if (!(await terminateGroup(marker.childPid))) {
+        // The group probe, not the leader's exit, proves the termination: a member
+        // that outlived the leader, the proposal bridge say, still holds this
+        // directory, so it stays until no member of the group is left.
+        if (!(await terminateGroup(marker.childPid)) || childAlive(marker)) {
           failures += 1;
           continue;
         }
@@ -217,6 +220,10 @@ async function processReferencesDirectory(pid: number, directory: string): Promi
 }
 
 async function terminateAbandonedGroup(pid: number): Promise<boolean> {
+  // Wait for the group, not its leader: the leader can die on SIGTERM while a
+  // member that ignores it lives on, and only escalating until the group probe
+  // reports absence leaves nothing running behind a removed directory.
+  const groupAlive = (): boolean => isProcessAlive(pid) || isProcessAlive(-pid);
   for (const signal of ["SIGTERM", "SIGKILL"] as const) {
     try {
       // The group, not the process: Claude Code owns the proposal bridge, and
@@ -227,11 +234,11 @@ async function terminateAbandonedGroup(pid: number): Promise<boolean> {
     }
     const deadline = Date.now() + REAP_GRACE_MS;
     while (Date.now() < deadline) {
-      if (!isProcessAlive(pid)) return true;
+      if (!groupAlive()) return true;
       await new Promise<void>((resolve) => setTimeout(resolve, 10));
     }
   }
-  return !isProcessAlive(pid);
+  return !groupAlive();
 }
 
 function isMissingProcessError(error: unknown): boolean {

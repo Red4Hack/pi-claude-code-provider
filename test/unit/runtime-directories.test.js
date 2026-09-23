@@ -136,6 +136,7 @@ test("reaps an abandoned Claude process group only when the live process proves 
     await recordRuntimeChild(impostor, 504);
     const currentUid = (await lstat(root)).uid;
     const terminated = [];
+    const alive = new Set([502, 504]);
     // 504 is a live process that does not reference the recorded directory, which
     // is what a reused process identifier looks like: it must never be signalled,
     // and its unprovable state must leave the directory in place too.
@@ -143,10 +144,11 @@ test("reaps an abandoned Claude process group only when the live process proves 
       temporaryRoot: root,
       currentUid,
       now,
-      processAlive: (pid) => pid === 502 || pid === 504,
+      processAlive: (pid) => alive.has(Math.abs(pid)),
       processOwnsDirectory: async (pid, directory) => pid === 502 && directory === abandoned,
       terminateGroup: async (pid) => {
         terminated.push(pid);
+        alive.delete(pid);
         return true;
       },
     });
@@ -179,6 +181,32 @@ test("counts a process group that refuses to die as a failure and keeps its dire
   }
 });
 
+test("a directory outlives a termination that left a member of its group running", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-runtime-reap-member-test-"));
+  const now = Date.now();
+  try {
+    const directory = await createRuntimeDirectory("provider_request", { temporaryRoot: root, ownerPid: 901, now: now - 2 * HOUR });
+    await recordRuntimeChild(directory, 902);
+    // Termination reports success because the leader died, while the group probe
+    // still finds a member: removal waits for absence, not for the leader.
+    const alive = new Set([902, -902]);
+    assert.deepEqual(await cleanupStaleRuntimeDirectories({
+      temporaryRoot: root,
+      currentUid: (await lstat(root)).uid,
+      now,
+      processAlive: (pid) => alive.has(pid),
+      processOwnsDirectory: async (pid, candidate) => pid === 902 && candidate === directory,
+      terminateGroup: async (pid) => {
+        alive.delete(pid);
+        return true;
+      },
+    }), { removed: 0, failures: 1, reaped: 0 });
+    await access(directory);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("reaping is bounded per pass so Pi startup cannot stall behind it", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-runtime-reap-budget-test-"));
   const now = Date.now();
@@ -190,15 +218,17 @@ test("reaping is bounded per pass so Pi startup cannot stall behind it", async (
       directories.push(directory);
     }
     const terminated = [];
+    const alive = new Set([800, 801, 802]);
     const result = await cleanupStaleRuntimeDirectories({
       temporaryRoot: root,
       currentUid: (await lstat(root)).uid,
       now,
       maxReaped: 1,
-      processAlive: (pid) => pid >= 800,
+      processAlive: (pid) => alive.has(Math.abs(pid)),
       processOwnsDirectory: async (pid, directory) => directories[pid - 800] === directory,
       terminateGroup: async (pid) => {
         terminated.push(pid);
+        alive.delete(pid);
         return true;
       },
     });
