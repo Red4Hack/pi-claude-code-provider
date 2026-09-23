@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { BRIDGE_PATH, baseClaudeArgs, providerArgs, transcriptBreakpointEnabled } from "../../src/claude-args.ts";
+import { BRIDGE_PATH, baseClaudeArgs, providerArgs, thinkingDisplay, transcriptBreakpointEnabled } from "../../src/claude-args.ts";
 import { NEUTRAL_BUN_CONFIG, needsBunConfig, scriptLaunch } from "../../src/host-runtime.ts";
 test("uses only generated attachment references and replacement prompt", () => {
     const prepared = {
@@ -58,6 +58,17 @@ test("every advertised alias is passed to Claude verbatim", () => {
         const { args } = providerArgs(prepared, model, "low");
         assert.equal(args[args.indexOf("--model") + 1], model);
     }
+});
+
+test("Haiku uses Claude Code's default thinking without an effort flag", () => {
+    const prepared = { transcriptBlocks: [], attachmentPaths: [], systemPromptPath: "/tmp/system.txt" };
+    for (const requested of ["off", "low", "high", "default"]) {
+        const { args } = providerArgs(prepared, "haiku", requested, { thinkingDisplay: "summarized" });
+        assert.equal(args.includes("--effort"), false);
+        assert.equal(args[args.indexOf("--thinking-display") + 1], "summarized");
+    }
+    const { args } = providerArgs(prepared, "sonnet", "low");
+    assert.equal(args[args.indexOf("--effort") + 1], "low");
 });
 
 test("pins cache-stable Claude settings", () => {
@@ -172,4 +183,35 @@ test("the standalone bridge cannot be preloaded from its working directory", () 
     // Every line must be inert: a bunfig this package writes may never itself
     // carry a directive, only comments.
     assert.ok(NEUTRAL_BUN_CONFIG.split("\n").filter(Boolean).every((line) => line.startsWith("#")));
+});
+
+test("asks for summarized thinking, which Claude Code otherwise returns empty", () => {
+    const prepared = {
+        directory: "/tmp/private",
+        transcriptBlocks: ['{"record":0}'],
+        attachmentPaths: [],
+        systemPromptPath: "/tmp/private/system-prompt.txt",
+        toolNames: new Map(),
+        transcriptBytes: 1,
+        catalogBytes: 0,
+        imageBytes: 0,
+    };
+    const displayValue = (options) => {
+        const { args } = providerArgs(prepared, "sonnet", "medium", options);
+        const index = args.indexOf("--thinking-display");
+        // The flag belongs with the other request-shaping options, right after --effort.
+        if (index !== -1) assert.equal(args[index - 1], "medium");
+        return index === -1 ? undefined : args[index + 1];
+    };
+    assert.equal(displayValue({ thinkingDisplay: "summarized" }), "summarized");
+    assert.equal(displayValue({ thinkingDisplay: "omitted" }), "omitted");
+    // Omitted entirely rather than sent empty: an unknown value would be rejected.
+    assert.equal(displayValue({}), undefined);
+
+    const name = "PI_CLAUDE_CODE_PROVIDER_THINKING_DISPLAY";
+    assert.equal(thinkingDisplay({}), "summarized");
+    assert.equal(thinkingDisplay({ [name]: "summarized" }), "summarized");
+    assert.equal(thinkingDisplay({ [name]: " omitted " }), "omitted");
+    assert.equal(thinkingDisplay({ [name]: "off" }), undefined);
+    assert.throws(() => thinkingDisplay({ [name]: "on" }), (error) => error.code === "thinking_display_config");
 });

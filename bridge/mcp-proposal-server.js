@@ -3,7 +3,7 @@
  * Proposal-only MCP bridge: expose Pi schemas, reject every tools/call, and stay dependency-free.
  * Oversized input is fatal so rejected framing state is never reused.
  */
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync, writeSync } from "node:fs";
 
 const MAX_REQUEST_BYTES = 1024 * 1024;
 const catalogPath = process.env.PI_CLAUDE_TOOL_CATALOG;
@@ -134,6 +134,13 @@ function mark(path, contents) {
 }
 
 function failStartup(message) {
-  process.stderr.write(`${message}\n`);
+  // Written synchronously to fd 2: process.stderr is an asynchronous pipe here, and
+  // process.exit drops a queued write. This message is the only first-hand evidence
+  // a startup failure leaves for the readiness diagnostic and the doctor's probe.
+  try {
+    writeSync(2, `${message}\n`);
+  } catch {
+    // stderr is gone; the exit code still reports the failure.
+  }
   process.exit(2);
 }

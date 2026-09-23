@@ -6,12 +6,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { deflateSync } from "node:zlib";
-import { assistantReply, closeLiveRpcProcess, consumeJsonl, superviseLiveProcess } from "./lib/live-process.js";
+import { assistantReply, closeLiveRpcProcess, consumeJsonl, superviseLiveProcess, thinkingTextSeen } from "./lib/live-process.js";
 import { describePiLaunch, livePiLaunch, locatePiPackages, packageEntry } from "./lib/pi-installation.js";
 if (process.env.PI_CLAUDE_CODE_PROVIDER_PAID_TEST_CHILD !== "1") {
     throw new Error("Paid live tests must be started through an npm test:paid:* script");
 }
 const packageRoot = process.cwd();
+const compat = process.argv.includes("--compat");
 const bridge = process.argv.includes("--bridge");
 const postTools = process.argv.includes("--post-tools");
 const cache = process.argv.includes("--cache");
@@ -116,10 +117,36 @@ async function runCacheProbe(cwd) {
         const maxReuseWrite = first.usage.cacheWrite * MAX_REUSE_WRITE_FRACTION;
         assert.ok(second.usage.cacheWrite < maxReuseWrite, `Turn 2 wrote ${second.usage.cacheWrite} cache tokens, not below ${MAX_REUSE_WRITE_FRACTION * 100}% of turn 1's ${first.usage.cacheWrite}; ${timeline}`);
         assert.ok(third.usage.cacheWrite < maxReuseWrite, `Turn 3 wrote ${third.usage.cacheWrite} cache tokens, not below ${MAX_REUSE_WRITE_FRACTION * 100}% of turn 1's ${first.usage.cacheWrite}; ${timeline}`);
-        console.log(`ok - RPC multi-turn cache reuse on ${CACHE_MODEL} (turn 2 ${secondHit.toFixed(1)}% hit; turn 3 ${thirdHit.toFixed(1)}% hit; ${timeline})`);
+        // Report what the empty-thinking check actually saw: a stage where no turn
+        // thought is a stage that did not exercise it, which a green run hides.
+        // These turns ask for one exact word, so reasoning tokens say whether the
+        // model declined to think or thought without its text arriving.
+        const turns = [first, second, third];
+        const thinkingTurns = turns.filter(thinkingTextSeen).length;
+        const reasoning = turns.map((turn) => turn.usage?.reasoning ?? "unreported").join("/");
+        console.log(`ok - RPC multi-turn cache reuse on ${CACHE_MODEL} (turn 2 ${secondHit.toFixed(1)}% hit; turn 3 ${thirdHit.toFixed(1)}% hit; ${timeline}; thinking text on ${thinkingTurns} of 3 turns, reasoning tokens ${reasoning})`);
         completed = true;
     }
     finally {
+        await rpc.close(completed);
+    }
+}
+async function runCompatProbe(cwd) {
+    const rpc = openPiRpc(cwd, [
+        "--mode", "rpc", "--no-session", "-e", packageRoot,
+        "--provider", "pi-claude-code-provider", "--model", "sonnet:low", "--tools", "write",
+    ], "Sonnet low compatibility probe");
+    let completed = false;
+    try {
+        const events = await rpc.turn("Use write once to create compat-probe.txt containing exactly COMPAT-7319. Then reply exactly COMPAT-OK.");
+        const reply = assistantReply(events, "Sonnet low compatibility probe");
+        assert.deepEqual(events.filter((event) => event.type === "tool_execution_start").map((event) => event.toolName), ["write"]);
+        assert.equal((await readFile(join(cwd, "compat-probe.txt"), "utf8")).trim(), "COMPAT-7319");
+        assert.match(messageText(reply), /^COMPAT-OK\.?$/);
+        assert.match(reply.responseModel ?? "", /^claude-sonnet-/);
+        console.log(`ok - Sonnet low tool round trip on ${describePiLaunch()} (${reply.responseModel})`);
+        completed = true;
+    } finally {
         await rpc.close(completed);
     }
 }
@@ -321,7 +348,10 @@ if (full && !cache && !bridge && !postTools)
     await requireBashTool();
 const directory = await mkdtemp(join(tmpdir(), "pi-claude-code-provider-live-"));
 try {
-    if (cacheImages) {
+    if (compat) {
+        await runCompatProbe(directory);
+    }
+    else if (cacheImages) {
         await runImageCacheProbe(directory);
     }
     else if (cache) {

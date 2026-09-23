@@ -9,7 +9,7 @@ import type { PreparedRequest } from "./types.ts";
 // Claude Code otherwise appends a changing <total_tokens> reminder that breaks
 // append-only cache reuse across this provider's fresh print-mode processes.
 const SETTINGS = JSON.stringify({ disableAllHooks: true, autoMemoryEnabled: false, totalTokensReminder: "off" });
-const EMPTY_MCP = JSON.stringify({ mcpServers: {} });
+export const EMPTY_MCP = JSON.stringify({ mcpServers: {} });
 export const BRIDGE_PATH = fileURLToPath(new URL("../bridge/mcp-proposal-server.js", import.meta.url));
 
 // Claude Code places no cache breakpoint inside the history this provider
@@ -30,6 +30,24 @@ export function transcriptBreakpointEnabled(environment: NodeJS.ProcessEnv = pro
   if (!raw || raw === "on") return true;
   if (raw === "off") return false;
   throw new ClaudeCodeError("breakpoint_config", `${TRANSCRIPT_BREAKPOINT_ENV} must be "on" or "off"`);
+}
+
+/**
+ * Claude 5 and Opus 4.7+ return thinking blocks whose text is empty unless the
+ * request asks for summarized display, so Pi shows a signature and nothing else.
+ * `--thinking-display` is hidden from `--help` on purpose, which is also why it
+ * is absent from REQUIRED_HEADLESS_FLAGS; `off` is the escape hatch for a
+ * release that changes it.
+ */
+const THINKING_DISPLAY_ENV = "PI_CLAUDE_CODE_PROVIDER_THINKING_DISPLAY";
+
+/** Unset or `summarized` shows thinking text; `omitted` hides it; `off` sends no flag. */
+export function thinkingDisplay(environment: NodeJS.ProcessEnv = process.env): "summarized" | "omitted" | undefined {
+  const raw = environment[THINKING_DISPLAY_ENV]?.trim();
+  if (!raw || raw === "summarized") return "summarized";
+  if (raw === "omitted") return "omitted";
+  if (raw === "off") return undefined;
+  throw new ClaudeCodeError("thinking_display_config", `${THINKING_DISPLAY_ENV} must be "summarized", "omitted", or "off"`);
 }
 
 interface PromptBlock {
@@ -75,7 +93,7 @@ export function providerArgs(
   prepared: PreparedRequest,
   model: string,
   effort: string,
-  options: { transcriptBreakpoint?: boolean } = {},
+  options: { transcriptBreakpoint?: boolean; thinkingDisplay?: "summarized" | "omitted" } = {},
 ): { args: string[]; prompt: PromptBlock[] } {
   // Quoted absolute references: Claude runs in Pi's session directory, where a
   // relative reference would resolve against the project, and the quotes keep a
@@ -122,8 +140,8 @@ export function providerArgs(
     "",
     "--model",
     model,
-    "--effort",
-    effort,
+    ...(model === "haiku" ? [] : ["--effort", effort]),
+    ...(options.thinkingDisplay ? ["--thinking-display", options.thinkingDisplay] : []),
     "--input-format",
     "stream-json",
     "--output-format",

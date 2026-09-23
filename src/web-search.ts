@@ -2,7 +2,7 @@ import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { finished } from "node:stream/promises";
 import type { ClaudeInstallation, SearchMetrics } from "./types.ts";
-import { baseClaudeArgs } from "./claude-args.ts";
+import { baseClaudeArgs, EMPTY_MCP } from "./claude-args.ts";
 import { claimClaudeLaunch, settleFailure, spawnClaudeProcess, type ClaudeProcess } from "./claude-process.ts";
 import { appendCleanupFailure, ClaudeCodeError, errorCode, errorText } from "./errors.ts";
 import { JsonlParser } from "./jsonl.ts";
@@ -94,7 +94,7 @@ export async function searchWithClaude(
       ...baseClaudeArgs(),
       prompt,
       "--mcp-config",
-      JSON.stringify({ mcpServers: {} }),
+      EMPTY_MCP,
       "--tools",
       "WebSearch,WebFetch",
       "--allowedTools",

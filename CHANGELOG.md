@@ -4,12 +4,10 @@
 
 ### Fixed
 
-- Every request failed with `Unsupported Pi message role: system` on Pi 0.86.0. Pi now hands providers a normalized transcript that carries the system prompt and the tool declarations in its system messages, instead of the `systemPrompt` and `tools` fields this transport read, so the prompt and the tools went missing and the system message itself reached the serializer as an unknown role. Claude Code takes the prompt outside the message list and cannot express a mid-conversation change, so every system message is now replayed into one effective prompt and tool set before the request is built: later instructions are appended, named sections are replaced or removed, and added and removed tools resolve to the current set. The logical payload `before_provider_request` sees and replaces keeps its `systemPrompt`, `messages`, and `tools` shape.
 - An exhausted Claude subscription window now ends the turn instead of being retried. Claude Code reports it as HTTP 429, which Pi's retry classifier reads as transient throttling, so a session or weekly limit was restarted on a backoff, spending one Claude launch per attempt against a window that could not open before its reset. Provider failures now carry the account-limit marker Pi stops on, and genuinely transient failures keep their retryable wording.
 - The MCP tool-catalog readiness deadline rose from five to twenty seconds, and it now also ends on Claude's own validated initialization record or on a failure Claude already reported. An ordinary slow Claude Code start was failing requests that were about to succeed, and the report named the deadline rather than the answer Claude had already given.
 - A readiness timeout reports its deadline in seconds. Pi classifies a failed turn by matching HTTP status substrings in its text, so the previous `5000ms` read as a retryable `500` and restarted a request that needed a fix.
 - A tool call whose streamed input never closes its JSON now reports the evidence — how many bytes arrived and that the input ended mid-JSON, which is what a response truncated at its output-token limit looks like — instead of a bare `Claude emitted invalid arguments for tool <name>`. Model-authored tool input is never included in the message.
-- A turn Claude Code continued past its output cap is no longer reported as truncated. Claude Code caps a response at `CLAUDE_CODE_MAX_OUTPUT_TOKENS`, reports `max_tokens` on that message, then continues and finishes the turn under a different stop reason; the mapper kept the first stop reason it saw and reported `length` for a completed answer. Pi discards a compaction summary that stopped at its cap and pays for another one, so a finished summary was thrown away on every compaction once the requested budget was small enough to be hit. The terminal result envelope now states how the turn ended, and a turn that really did end at its cap still reports `length`. Captured from a real Claude Code run.
 - Compaction no longer fails and re-runs at full token cost. Pi treats its requested `maxTokens` as the budget for the answer and adds the thinking budget to the response ceiling, because thinking is output too; this transport was passing the request through as the total ceiling, so reasoning ate the summary's room and the summary was cut off. Pi discards a summary that stopped at its token cap and pays for another one, which turned every compaction into a repeated charge. A requested cap now budgets the answer and reasoning is added on top of it, exactly as `adjustMaxTokensForThinking` does in pi-ai.
 - A request whose prompt fits is no longer rejected for lack of an output reserve. The budget guard reserved the model's full output maximum, so on a 200K window it refused any prompt above roughly 136K estimated tokens while tens of thousands of tokens were still free — and each refusal made Pi compact. The ceiling is now clamped to the room the window actually has left, and only a prompt that leaves no room for a reply is refused before launch. The system-prompt precheck from 0.3.0 follows the same rule: it refuses a system prompt only when it leaves no room for the context safety margin and a minimal reply, instead of reserving the model's whole output maximum beside it.
 - Stale-state recovery terminates an abandoned Claude process group whose Pi process is gone, rather than leaving it running and its private directory in place. An abruptly killed Pi previously left a detached Claude process and its proposal bridge alive indefinitely. The group is signalled only when the live process still proves it owns that private directory, so a reused process identifier is never signalled; the proof reads the process's working directory or command line from `/proc` on Linux, and other platforms leave an unproven process alone exactly as before. `/pi-claude-code-provider-doctor` reports how many were reclaimed.
@@ -21,10 +19,42 @@
 
 ### Changed
 
-- Pi 0.86.0 is now the minimum supported version, and the verified baseline advances to it with the Pi version CI installs. The transcript contract it introduced is not expressible on 0.85.1, so this release does not run there.
 - Linux is verified on `x64` across distributions rather than for WSL2 Ubuntu alone, so a native Linux install no longer raises a startup platform advisory. WSL2 Ubuntu is `linux/x64`, and nothing in this package takes a different code path on another distribution or kernel — the same reasoning already applied to macOS architectures.
 - The pre-launch token estimate is calibrated rather than assumed. Measured against a real session transcript by comparing this transport's serialized bytes with Claude's own reported prompt counters over the same messages, dense agent history tokenizes at 2.12 bytes per token; the previous 3-byte ratio, described as conservative, under-counted such a transcript by about a fifth, so the guard did not bound what it claimed to. The ratio is now 2.4 bytes per token with the existing 10% margin.
 - Protocol activity postpones the idle deadline through a timestamp read by one long-lived timer, instead of clearing and recreating a timer for every record.
+
+## [0.4.0] - 2026-09-20
+
+### Changed
+
+- **Breaking.** Pi 0.86.1 is now the minimum supported version; upgrade Pi before this package. Older versions can still load, but are unsupported and flagged by the doctor. Pi 0.85.1 is no longer tested.
+- Haiku no longer offers Pi effort levels or sends `--effort` to Claude Code. Claude Code may still use its default extended thinking even when Pi displays thinking as off.
+- Claude Code 2.1.278 is now the validated baseline; the minimum supported version remains 2.1.270.
+- Optional metrics log schema 5 counts image content blocks in `imageCount`, matching the 20-image limit rather than the number of stored files.
+
+### Added
+
+- `PI_CLAUDE_CODE_PROVIDER_BORROW_SOLE_DIRECTORY=on` restores sole-session cwd borrowing for tool-bearing side requests without a recognized cwd. It is off by default because the borrowed directory may be wrong.
+- The doctor now reports how the last request's directory was chosen, its prompt-cache reuse, and any mismatch between served and configured context windows.
+- Maintainers can capture stream-recovery cases without quota using `npm run capture:claude-stream-recovery`; `test:paid:compat-npm` and `test:paid:compat-standalone` check both Pi distributions.
+
+### Fixed
+
+- Private runtime directory removal now retries brief filesystem conflicts before failing a completed request or leaving temporary state behind.
+- Requests recover the current prompt and tools from Pi's transcript system messages, including later edits. Tool-call arguments follow Pi's JSON-compatible type.
+- Parallel Pi sessions use their own working directories, image stores, and rate-limit notices. Ending one session no longer fails a request already running through another.
+- Tool-bearing side requests without a registered session or recognized cwd now fail with `working_directory` instead of borrowing another session's directory. A tool-free request that gains tools in `before_provider_request` is also refused before launch.
+- Image requests reject a temporary path containing a double quote before writing to the session image store; correcting the path lets the session continue.
+- The doctor bridge probe reports an unsuccessful child exit and retains private state when process liveness is uncertain.
+- Invalid timeout settings above Node's timer limit fail before launch instead of expiring almost immediately.
+- Failed process-tree cleanup retains private state while a child may still be alive. Stale image recovery now makes progress even with more than 256 leftover stores.
+- Quitting Pi during a turn no longer waits for Claude to finish. Its image directory remains available to the active request for deferred cleanup.
+- New, resumed, forked, and cloned RPC sessions no longer report an extension error when Pi binds the session twice.
+- Responses that reach the output limit keep their text and end with a `length` stop, including when Claude Code exits before the provider stops it.
+- Other extensions can run their own agent loops or call `completeSimple` with this provider without exiting Pi; they use the same cwd routing rules.
+- Thinking summaries are visible in Pi again. Set `PI_CLAUDE_CODE_PROVIDER_THINKING_DISPLAY=omitted` to hide the text.
+- Compaction and other one-shot summaries no longer write a prompt-cache entry they cannot reuse.
+- Mid-response interruptions, including drops inside streamed tool arguments, are reported as retryable failures under Pi's retry settings. API errors take precedence over unfinished-block errors.
 
 ## [0.3.0] - 2026-09-13
 

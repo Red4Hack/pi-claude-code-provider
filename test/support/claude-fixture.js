@@ -10,6 +10,18 @@ export const CAPTURED_CLAUDE_HELP_PATH = fileURLToPath(
 );
 export const CLAUDE_HEADLESS_HELP = readFileSync(CAPTURED_CLAUDE_HELP_PATH, "utf8");
 
+// Claude Code stdout for the mid-response recovery scenarios, captured from this
+// version and sanitized. Regenerate with `npm run capture:claude-stream-recovery`; these
+// shapes are only worth testing against because Claude Code really emitted them.
+export const CAPTURED_STREAM_RECOVERY_VERSION = "2.1.274";
+
+export function streamRecoveryRecords(scenario) {
+  const path = fileURLToPath(
+    new URL(`./captured/claude-${CAPTURED_STREAM_RECOVERY_VERSION}-stream-${scenario}.jsonl`, import.meta.url),
+  );
+  return readFileSync(path, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+}
+
 export const PROVIDER_INIT_FIELDS = Object.freeze({
   tools: Object.freeze([]),
   mcp_servers: Object.freeze([]),

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import { providerModelsForSubscription } from "../../src/catalog.ts";
 
 test("derives only the Opus context window from the subscription type", () => {
@@ -15,9 +16,15 @@ test("derives only the Opus context window from the subscription type", () => {
             ],
         );
         for (const model of models) {
-            assert.equal(model.reasoning, true);
             assert.deepEqual(model.input, ["text", "image"]);
             assert.deepEqual(model.cost, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+            if (model.id === "haiku") {
+                assert.equal(model.reasoning, false);
+                assert.equal(model.thinkingLevelMap, undefined);
+                assert.deepEqual(getSupportedThinkingLevels(model), ["off"]);
+                continue;
+            }
+            assert.equal(model.reasoning, true);
             assert.deepEqual(model.thinkingLevelMap, {
                 off: null,
                 minimal: null,
@@ -27,6 +34,7 @@ test("derives only the Opus context window from the subscription type", () => {
                 xhigh: "xhigh",
                 max: "max",
             });
+            assert.deepEqual(getSupportedThinkingLevels(model), ["low", "medium", "high", "xhigh", "max"]);
         }
     }
 });

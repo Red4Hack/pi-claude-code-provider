@@ -6,19 +6,20 @@ import { isProcessAlive, validPid } from "./process-utils.ts";
 const MARKER_NAME = ".pi-claude-code-provider-runtime.json";
 const MARKER_SCHEMA = "pi-claude-code-provider-runtime-v1";
 const MINIMUM_STALE_AGE_MS = 60 * 60_000;
-const MAX_CLEANUP_CANDIDATES = 256;
+const MAX_DELETION_ATTEMPTS = 256;
 // Reaping runs while Pi is starting, so bound both how many abandoned groups one
 // pass will chase and how long it waits for each to die.
 const MAX_REAPED_PROCESSES = 8;
 const REAP_GRACE_MS = 250;
 
-export type RuntimeDirectoryKind = "provider_request" | "provider_image_store" | "web_search_request" | "web_search_output";
+export type RuntimeDirectoryKind = "provider_request" | "provider_image_store" | "web_search_request" | "web_search_output" | "bridge_probe";
 
 const PREFIXES: Record<RuntimeDirectoryKind, string> = {
   provider_request: "pi-claude-code-provider-request-",
   provider_image_store: "pi-claude-code-provider-images-",
   web_search_request: "pi-claude-code-provider-search-",
   web_search_output: "pi-claude-code-provider-search-output-",
+  bridge_probe: "pi-claude-code-provider-bridge-probe-",
 };
 
 interface RuntimeMarker {
@@ -40,13 +41,17 @@ interface CleanupRuntimeDirectoryOptions {
   currentUid?: number;
   now?: number;
   minimumAgeMs?: number;
-  maxCandidates?: number;
+  maxDeletionAttempts?: number;
   maxReaped?: number;
+  /** Existence probe: negative IDs identify POSIX process groups. */
   processAlive?: (pid: number) => boolean;
   /** Internal seam: whether a live process proves it belongs to a runtime directory. */
   processOwnsDirectory?: (pid: number, directory: string) => Promise<boolean>;
   /** Internal seam: terminate an abandoned process group, reporting whether it died. */
   terminateGroup?: (pid: number) => Promise<boolean>;
+  /** Internal seams for deterministic filesystem-failure tests. */
+  inspectDirectory?: typeof lstat;
+  removeDirectory?: typeof removeRuntimeDirectory;
 }
 
 export interface RuntimeCleanupResult {
@@ -57,7 +62,8 @@ export interface RuntimeCleanupResult {
 }
 
 export async function removeRuntimeDirectory(directory: string): Promise<void> {
-  await rm(directory, { recursive: true, force: true });
+  // A just-exited child can briefly hold files here; retry transient removal errors.
+  await rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 }
 
 export async function createRuntimeDirectory(
@@ -99,61 +105,64 @@ export async function cleanupStaleRuntimeDirectories(
   const temporaryRoot = options.temporaryRoot ?? tmpdir();
   const now = options.now ?? Date.now();
   const minimumAgeMs = options.minimumAgeMs ?? MINIMUM_STALE_AGE_MS;
-  const maxCandidates = options.maxCandidates ?? MAX_CLEANUP_CANDIDATES;
+  const maxDeletionAttempts = options.maxDeletionAttempts ?? MAX_DELETION_ATTEMPTS;
+  if (maxDeletionAttempts <= 0) return { removed: 0, failures: 0, reaped: 0 };
   const processAlive = options.processAlive ?? isProcessAlive;
   const processOwnsDirectory = options.processOwnsDirectory ?? processReferencesDirectory;
   const terminateGroup = options.terminateGroup ?? terminateAbandonedGroup;
   const maxReaped = options.maxReaped ?? MAX_REAPED_PROCESSES;
+  const inspectDirectory = options.inspectDirectory ?? lstat;
+  const removeDirectory = options.removeDirectory ?? removeRuntimeDirectory;
+  const childAlive = (marker: RuntimeMarker): boolean => marker.childPid !== undefined &&
+    (processAlive(marker.childPid) || processAlive(-marker.childPid));
   let entries;
   try {
     entries = await readdir(temporaryRoot, { withFileTypes: true });
   } catch {
     return { removed: 0, failures: 1, reaped: 0 };
   }
-  const eligible = entries.filter((entry) => entry.isDirectory() && runtimeKind(entry.name) !== undefined);
-  const candidates = eligible.slice(0, Math.max(0, maxCandidates));
-  // An image store is shared by its owner's requests. If an uncertain-live
-  // Claude child still owns a retained request directory, reclaiming the image
-  // store would remove files that child may still read. Scan the whole bounded
-  // candidate set before deleting anything, because the request can sort after
-  // the store. When the scan is truncated, retain image stores conservatively.
-  const candidateScanTruncated = eligible.length > candidates.length;
+  const eligible = entries.filter((entry) => entry.isDirectory() && runtimeKind(entry.name) !== undefined)
+    .sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0);
+  // Inspect all ownership before deleting: a request beyond the deletion budget
+  // can protect images earlier in the ordering. Budget deletions, not inspection,
+  // so an accumulation of stale images can drain across successive passes.
+  const candidates: Array<{ directory: string; marker: RuntimeMarker }> = [];
   const ownersWithLiveProviderChildren = new Set<number>();
-  if (!candidateScanTruncated && candidates.some((entry) => runtimeKind(entry.name) === "provider_image_store")) {
-    for (const entry of candidates) {
-      if (runtimeKind(entry.name) !== "provider_request") continue;
-      const directory = join(temporaryRoot, entry.name);
-      try {
-        const info = await lstat(directory);
-        if (!info.isDirectory() || info.uid !== currentUid) continue;
-        const marker = await readMarker(directory);
-        if (marker?.kind === "provider_request" && marker.childPid !== undefined && processAlive(marker.childPid)) {
-          ownersWithLiveProviderChildren.add(marker.ownerPid);
-        }
-      } catch { /* An unreadable request is left to the ordinary cleanup pass. */ }
-    }
-  }
+  let ownershipIncomplete = false;
   let removed = 0;
   let failures = 0;
   let reaped = 0;
-  for (const entry of candidates) {
+  for (const entry of eligible) {
     const directory = join(temporaryRoot, entry.name);
     try {
-      const info = await lstat(directory);
+      const info = await inspectDirectory(directory);
       if (!info.isDirectory() || info.uid !== currentUid) continue;
       const marker = await readMarker(directory);
       const kind = runtimeKind(entry.name);
       if (!marker || marker.kind !== kind) continue;
-      if (kind === "provider_image_store" && (candidateScanTruncated || ownersWithLiveProviderChildren.has(marker.ownerPid))) continue;
+      candidates.push({ directory, marker });
+      if (kind === "provider_request" && childAlive(marker)) ownersWithLiveProviderChildren.add(marker.ownerPid);
+    } catch {
+      if (runtimeKind(entry.name) === "provider_request") ownershipIncomplete = true;
+      failures += 1;
+    }
+  }
+  let attempts = 0;
+  for (const { directory, marker } of candidates) {
+    if (attempts >= maxDeletionAttempts) break;
+    try {
+      if (marker.kind === "provider_image_store" && (ownershipIncomplete || ownersWithLiveProviderChildren.has(marker.ownerPid))) continue;
       const createdAt = Date.parse(marker.createdAt);
       if (!Number.isFinite(createdAt) || now - createdAt < minimumAgeMs) continue;
       if (processAlive(marker.ownerPid)) continue;
-      if (marker.childPid !== undefined && processAlive(marker.childPid)) {
+      if (marker.childPid !== undefined && childAlive(marker)) {
         // The Pi process that owned this request is gone while its Claude
         // process group is still running: an abruptly killed host leaves that
         // group holding memory and a subscription slot with nothing to report
         // to. Terminate it only once the live process still proves it is this
         // request's child, so a reused process identifier can never be signalled.
+        // A group whose leader already exited cannot offer that proof and is
+        // left alone, together with its directory, exactly as before.
         if (reaped >= maxReaped) continue;
         if (!(await processOwnsDirectory(marker.childPid, directory))) continue;
         if (!(await terminateGroup(marker.childPid))) {
@@ -162,9 +171,10 @@ export async function cleanupStaleRuntimeDirectories(
         }
         reaped += 1;
       }
-      const current = await lstat(directory);
+      const current = await inspectDirectory(directory);
       if (!current.isDirectory() || current.uid !== currentUid) continue;
-      await rm(directory, { recursive: true, force: true });
+      attempts += 1;
+      await removeDirectory(directory);
       removed += 1;
     } catch {
       // Report only an aggregate count: cleanup diagnostics must not expose paths.
@@ -244,6 +254,7 @@ async function readMarker(directory: string): Promise<RuntimeMarker | undefined>
     if (!info.isFile() || info.size > 1024) return undefined;
     const value = JSON.parse(await readFile(path, "utf8")) as Partial<RuntimeMarker>;
     if (
+      !value || typeof value !== "object" || Array.isArray(value) ||
       value.schema !== MARKER_SCHEMA ||
       !isRuntimeKind(value.kind) ||
       !validPid(value.ownerPid) ||
@@ -252,8 +263,11 @@ async function readMarker(directory: string): Promise<RuntimeMarker | undefined>
       !basename(directory).startsWith(PREFIXES[value.kind])
     ) return undefined;
     return value as RuntimeMarker;
-  } catch {
-    return undefined;
+  } catch (error) {
+    // Missing/invalid markers grant no deletion authority. Other filesystem
+    // errors must reach the ownership scan so it cannot silently delete images.
+    if (error instanceof SyntaxError || (error && typeof error === "object" && "code" in error && error.code === "ENOENT")) return undefined;
+    throw error;
   }
 }
 

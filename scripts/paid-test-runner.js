@@ -16,6 +16,11 @@ import {
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 
+// Phases a request reaches before its launch slot is claimed. A request that fails
+// in one of these records metrics without ever starting Claude, so counting log
+// lines would overstate the launches a stage actually spent.
+const PRE_LAUNCH_PHASES = new Set(["received", "payload_applied", "prepared"]);
+
 const stages = PAID_STAGES;
 
 const selected = process.argv[2];
@@ -30,7 +35,7 @@ const missingPiBin = planned.filter((stage) => stage.requiresPiBin && !piBinOver
 if (missingPiBin.length) {
   throw new Error(
     `The ${missingPiBin.map((stage) => stage.label).join(" and ")} stage runs against a standalone Pi, so ` +
-    `${PI_BIN_ENV} must point at an extracted tar.gz pi executable (for example ${PI_BIN_ENV}=~/pi-0.86.0/pi).`,
+    `${PI_BIN_ENV} must point at an extracted tar.gz pi executable (for example ${PI_BIN_ENV}=~/pi-standalone/pi).`,
   );
 }
 const totalCap = planned.reduce((total, stage) => total + stage.cap, 0);
@@ -78,7 +83,7 @@ try {
   for (const [stageIndex, stage] of planned.entries()) {
     const stageBudgetDirectory = join(directory, `stage-${stageIndex + 1}-budget`);
     await mkdir(stageBudgetDirectory);
-    const before = await metricCount(metricsLog);
+    const before = await launchCount(metricsLog);
     await run(stage.script, stage.args, {
       ...process.env,
       PI_CODING_AGENT_DIR: agentDirectory,
@@ -93,7 +98,7 @@ try {
       [PAID_LAUNCH_BUDGET_ENV.aggregateCap]: String(totalCap),
       PI_CLAUDE_CODE_PROVIDER_METRICS_LOG: metricsLog,
     });
-    const after = await metricCount(metricsLog);
+    const after = await launchCount(metricsLog);
     const stageObserved = after - before;
     const stageClaimed = await claimCount(stageBudgetDirectory);
     const aggregateClaimed = await claimCount(aggregateBudgetDirectory);
@@ -101,10 +106,14 @@ try {
     if (stageClaimed > stage.cap || aggregateClaimed > totalCap) {
       throw new Error("Paid launch budget invariant failed after a stage completed");
     }
-    if (stageObserved !== stageClaimed || observed !== aggregateClaimed) {
+    // Only the safety direction is an error: a launch must never escape a claim.
+    // The converse is ordinary, because a request that fails after claiming its
+    // slot and before spawning records no launch, and a claim nothing spent is
+    // wasted budget rather than a breach of the cap.
+    if (stageObserved > stageClaimed || observed > aggregateClaimed) {
       throw new Error(
-        `${stage.label} launch accounting mismatch: ${stageClaimed} claimed, ${stageObserved} metrics; ` +
-        `${aggregateClaimed} aggregate claims, ${observed} metrics`,
+        `${stage.label} launch accounting mismatch: ${stageObserved} launches exceed ${stageClaimed} claims; ` +
+        `${observed} aggregate launches exceed ${aggregateClaimed} aggregate claims`,
       );
     }
     console.error(`Paid usage: ${stage.label} recorded ${stageObserved}/${stage.cap}; aggregate ${observed}/${totalCap}.`);
@@ -117,13 +126,19 @@ async function claimCount(directory) {
   return (await readdir(directory)).filter((name) => name.endsWith(".claim")).length;
 }
 
-async function metricCount(path) {
+async function launchCount(path) {
+  let contents;
   try {
-    return (await readFile(path, "utf8")).split("\n").filter(Boolean).length;
+    contents = await readFile(path, "utf8");
   } catch (error) {
     if (error?.code === "ENOENT") return 0;
     throw error;
   }
+  return contents
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line))
+    .filter((entry) => !PRE_LAUNCH_PHASES.has(entry.lastPhase)).length;
 }
 
 function run(script, args, env) {

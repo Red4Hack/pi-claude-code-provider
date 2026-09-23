@@ -172,6 +172,18 @@ function windowsExecutableSuffixes(): string[] {
   return [...new Set([...configured, ""])];
 }
 
+/**
+ * The complete environment a Claude child receives, besides the pinned variables
+ * below and each caller's own additions.
+ *
+ * Deliberately POSIX-shaped. On Windows the child still receives SystemRoot,
+ * SystemDrive, USERPROFILE, TEMP, HOMEDRIVE and HOMEPATH, because Node's process
+ * spawner injects a fixed set of required variables into any replacement
+ * environment; they are not listed here and are not this package's to grant.
+ * APPDATA and LOCALAPPDATA are outside that set and are deliberately not
+ * forwarded, so a Windows Claude Code that came to need one would fail loudly
+ * rather than read a configuration this package never intended to expose.
+ */
 const ALLOWED_ENVIRONMENT = [
   "HOME",
   "PATH",
@@ -194,7 +206,31 @@ const ALLOWED_ENVIRONMENT = [
   "NODE_EXTRA_CA_CERTS",
 ] as const;
 
+/**
+ * Variables README and DESIGN.md promise are never forwarded to a Claude child.
+ * The allowlist above cannot enforce that on its own, because `extra` is merged
+ * last and would silently win; this makes the promise a property of the function
+ * rather than of caller discipline. The capture scripts override these
+ * deliberately and do so after this call, where the override is visible.
+ */
+const DENIED_ENVIRONMENT = [
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_AUTH_TOKEN",
+  "ANTHROPIC_BASE_URL",
+  "CLAUDE_CODE_OAUTH_TOKEN",
+  "CLAUDE_CODE_USE_BEDROCK",
+  "CLAUDE_CODE_USE_VERTEX",
+] as const;
+
 export function buildClaudeEnvironment(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  // Compared case-insensitively: Windows environment names are, so an exact
+  // match alone would leave a bypass open on one supported platform.
+  const denied = Object.keys(extra).find((name) =>
+    DENIED_ENVIRONMENT.some((forbidden) => forbidden.toLowerCase() === name.toLowerCase()),
+  );
+  if (denied !== undefined) {
+    throw new ClaudeCodeError("environment_denied", `${denied} must never be forwarded to a Claude Code child process`);
+  }
   const env: NodeJS.ProcessEnv = {};
   for (const name of ALLOWED_ENVIRONMENT) {
     if (process.env[name] !== undefined) env[name] = process.env[name];

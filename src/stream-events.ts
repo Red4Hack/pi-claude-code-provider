@@ -1,5 +1,5 @@
 import { parseStreamingJson } from "@earendil-works/pi-ai";
-import type { AssistantMessageEventStream, JsonObject, ToolCall } from "@earendil-works/pi-ai";
+import type { AssistantMessageEventStream, ToolCall } from "@earendil-works/pi-ai";
 import { TRANSCRIPT_BREAKPOINT_ENV } from "./claude-args.ts";
 import { ClaudeCodeError } from "./errors.ts";
 import {
@@ -46,6 +46,8 @@ export interface ClaudeEventMapperOptions {
   expectedTools: Set<string>;
   toolNames: Map<string, string>;
   onToolUse: () => void;
+  /** Omitted only by tests: without it a max_tokens stop falls back to failing on Claude Code's continuation. */
+  onLengthStop?: () => void;
   onRateLimitNotice?: RateLimitNoticeSink;
   onResponseAnnouncement?: ResponseAnnouncementSink;
   privatePaths?: readonly string[];
@@ -68,12 +70,15 @@ export class ClaudeEventMapper {
   private responseStarted = false;
   private responseAnnouncement: Promise<void> | undefined;
   private messageStarted = false;
+  private streamMessageId: string | undefined;
   private messageStopped = false;
+  private handoffLatched = false;
   private terminal = false;
   private resultReceived = false;
   private successfulResult: "stop" | "length" | undefined;
   private stopReason: string | undefined;
   private rejectedRateLimit: string | undefined;
+  private deferredToolArguments: string | undefined;
   private breakpointLimitRejected = false;
   private servedContextWindow: number | undefined;
   private servedMaxOutputTokens: number | undefined;
@@ -82,6 +87,7 @@ export class ClaudeEventMapper {
   private readonly expectedTools: Set<string>;
   private readonly toolNames: Map<string, string>;
   private readonly onToolUse: () => void;
+  private readonly onLengthStop: () => void;
   private readonly onRateLimitNotice: RateLimitNoticeSink;
   private readonly onResponseAnnouncement: ResponseAnnouncementSink;
   private assistantDiagnostic: string | undefined;
@@ -93,6 +99,7 @@ export class ClaudeEventMapper {
     this.expectedTools = options.expectedTools;
     this.toolNames = options.toolNames;
     this.onToolUse = options.onToolUse;
+    this.onLengthStop = options.onLengthStop ?? (() => {});
     this.onRateLimitNotice = options.onRateLimitNotice ?? (() => {});
     this.onResponseAnnouncement = options.onResponseAnnouncement ?? (() => {});
     this.privatePaths = options.privatePaths ?? [];
@@ -123,6 +130,18 @@ export class ClaudeEventMapper {
     return this.rejectedRateLimit;
   }
 
+  /** A held tool-argument failure, for the provider to report when no recovery signal claimed it. */
+  get deferredFailure(): string | undefined {
+    return this.deferredToolArguments;
+  }
+
+  private throwDeferredFailure(): void {
+    const message = this.deferredToolArguments;
+    if (!message) return;
+    this.deferredToolArguments = undefined;
+    throw new ClaudeCodeError("tool_arguments", message);
+  }
+
   /** Whether the API rejected the request for carrying too many cache breakpoints. */
   get cacheBreakpointLimit(): boolean {
     return this.breakpointLimitRejected;
@@ -130,8 +149,12 @@ export class ClaudeEventMapper {
 
   /** Wait for an asynchronous response observer before mapping Claude's response body. */
   async settleResponseAnnouncement(): Promise<void> {
-    if (!this.responseAnnouncement) return;
-    await this.responseAnnouncement;
+    const announcement = this.responseAnnouncement;
+    if (!announcement) return;
+    await announcement;
+    // Cleared only once it resolves, so the rest of the response stops re-awaiting
+    // a settled promise on every record while a rejection still reaches each caller.
+    this.responseAnnouncement = undefined;
     this.startResponse();
   }
 
@@ -150,6 +173,11 @@ export class ClaudeEventMapper {
     }
     if (this.resultReceived) throw new ClaudeCodeError("protocol_order", "Claude emitted a record after its result");
     if (record.type === "stream_event") {
+      // Once a handoff is latched the provider is terminating Claude, but records
+      // already in the pipe still arrive. Claude Code answers a tool denial or an output
+      // limit with another message of its own, so these events belong to a turn Pi never
+      // asked for: they must neither be published nor rejected as protocol drift.
+      if (this.handoffLatched) return;
       if (!record.event || typeof record.event !== "object") {
         throw new ClaudeCodeError("protocol_shape", "Claude stream_event did not contain an event");
       }
@@ -159,8 +187,10 @@ export class ClaudeEventMapper {
     } else if (record.type === "rate_limit_event") {
       this.acceptRateLimit(record.rate_limit_info);
     } else if (record.type === "assistant") {
+      this.rejectInterruptedStream(record);
       this.acceptAssistant(record);
     } else if (record.type === "user" || record.type === "system") {
+      this.rejectInterruptedStream(record);
       // Completed user echoes and non-init system status records are redundant
       // because include-partial-messages supplies the canonical stream events.
     } else {
@@ -200,6 +230,60 @@ export class ClaudeEventMapper {
     this.stream.push({ type: "start", partial: this.output });
   }
 
+  /**
+   * Claude Code recovers from an API failure that arrives after this response began
+   * streaming by replaying the request, by continuing from the partial it kept, or by
+   * re-requesting without streaming. Pi has already received the blocks streamed so far
+   * and its events are append-only, so none of those recoveries can be published here:
+   * rewriting content breaks Pi's contract, and content produced after the interruption
+   * follows internal prompts Pi never saw. The provider instead reports one failure
+   * whose wording Pi's own retry policy accepts, and Pi re-runs the turn from the
+   * unchanged context in a fresh process. The replayed transcript is a prompt-cache hit,
+   * so only the output tokens are produced twice.
+   */
+  private rejectInterruptedStream(record: StreamEventEnvelope): void {
+    // Before the response starts, a retry is an ordinary pre-stream retry that costs
+    // nothing to let through. After a tool-use stop the provider is already terminating
+    // Claude for handoff, and records about Claude's own next request must not
+    // invalidate a complete proposal. A max_tokens stop is followed by Claude Code's own
+    // continuation, which the length handoff owns.
+    if (!this.messageStarted || this.stopReason === "tool_use" || this.stopReason === "max_tokens") return;
+    const raw = record as Record<string, unknown>;
+    let cause: string | undefined;
+    if (record.type === "system" && record.subtype === "api_retry") {
+      const category = typeof raw.error === "string" && raw.error.length > 0 ? raw.error : "unknown";
+      const status = typeof raw.error_status === "number" && Number.isFinite(raw.error_status) ? `, HTTP ${raw.error_status}` : "";
+      // A recorded rate-limit rejection already carries the reset time; it is both more
+      // useful than the category alone and retryable.
+      if (category === "rate_limit" && this.rejectedRateLimit) throw new ClaudeCodeError("stream_interrupted", this.rejectedRateLimit);
+      if (!RETRYABLE_INTERRUPTIONS.has(category)) {
+        throw new ClaudeCodeError("stream_interrupted", `Claude Code API request failed mid-response (${category}${status})`);
+      }
+      cause = `Claude Code began retrying: ${category}${status}`;
+    } else if (record.type === "assistant") {
+      if (typeof raw.error === "string" || raw.is_api_error_message === true) {
+        cause = "Claude Code reported a mid-response API error";
+      } else {
+        const message = raw.message && typeof raw.message === "object" && !Array.isArray(raw.message)
+          ? raw.message as Record<string, unknown>
+          : undefined;
+        // A different message id before this stream stops is Claude Code's non-streaming
+        // replacement. Mid-stream echoes of the open message carry its own id, and the
+        // completed echo of a finished message arrives only after message_stop.
+        if (!this.messageStopped && typeof message?.id === "string" && message.id !== this.streamMessageId) {
+          cause = "Claude Code replaced the stream with a non-streaming request";
+        }
+      }
+    } else if (record.type === "user" && raw.isSynthetic === true) {
+      // Claude Code's synthetic user turns ("Resume directly ...") each start another
+      // internal model turn. Tool results in a normal handoff are not synthetic.
+      cause = "Claude Code asked the model to continue a cut-off response";
+    }
+    // The fixed "stream ended before message_stop" phrasing is what Pi's retry
+    // classifier matches; the cause alone is not enough.
+    if (cause) throw new ClaudeCodeError("stream_interrupted", `Claude Code API stream ended before message_stop (${cause})`);
+  }
+
   private acceptStreamEvent(event: Record<string, unknown>): void {
     const type = event.type;
     if (type === "message_start") {
@@ -207,6 +291,7 @@ export class ClaudeEventMapper {
       const message = requireRecord(event.message, "message_start.message");
       if (typeof message.model === "string") this.output.responseModel = message.model;
       if (typeof message.id === "string") this.output.responseId = message.id;
+      this.streamMessageId = typeof message.id === "string" ? message.id : undefined;
       this.applyUsage(message.usage);
       this.messageStarted = true;
       return;
@@ -221,7 +306,8 @@ export class ClaudeEventMapper {
     else if (type === "message_stop") {
       if (this.blocks.size > 0) throw new ClaudeCodeError("protocol_blocks", "Claude stopped with unclosed content blocks");
       this.messageStopped = true;
-      if (this.stopReason === "tool_use") this.onToolUse();
+      if (this.stopReason === "tool_use") this.latchHandoff(this.onToolUse);
+      else if (this.stopReason === "max_tokens") this.latchHandoff(this.onLengthStop);
     } else throw new ClaudeCodeError("protocol_event", `Unsupported Claude stream event: ${String(type)}`);
   }
 
@@ -231,7 +317,14 @@ export class ClaudeEventMapper {
       this.stopReason = stopReason(delta.stop_reason);
     }
     this.applyUsage(event.usage);
-    if (this.stopReason === "tool_use") this.onToolUse();
+    if (this.stopReason === "tool_use") this.latchHandoff(this.onToolUse);
+    else if (this.stopReason === "max_tokens") this.latchHandoff(this.onLengthStop);
+  }
+
+  /** Stop mapping this response's stream and ask the provider to terminate Claude. */
+  private latchHandoff(notify: () => void): void {
+    this.handoffLatched = true;
+    notify();
   }
 
   private startBlock(event: Record<string, unknown>): void {
@@ -268,7 +361,7 @@ export class ClaudeEventMapper {
       if (!name) throw new ClaudeCodeError("tool_unknown", `Claude proposed an unknown tool: ${qualifiedName}`);
       if (typeof source.id !== "string" || source.id.length === 0) throw new ClaudeCodeError("tool_id", "Claude emitted a tool without an ID");
       const initial = source.input && typeof source.input === "object" && !Array.isArray(source.input)
-        ? source.input as JsonObject
+        ? source.input as ToolCall["arguments"]
         : {};
       this.output.content.push({ type: "toolCall", id: source.id, name, arguments: initial });
       this.stream.push({ type: "toolcall_start", contentIndex, partial: this.output });
@@ -300,7 +393,7 @@ export class ClaudeEventMapper {
         // A preview only; content_block_stop parses the complete arguments strictly.
         const preview = parseStreamingJson<unknown>(partialJson);
         if (preview && typeof preview === "object" && !Array.isArray(preview)) {
-          block.arguments = preview as JsonObject;
+          block.arguments = preview as ToolCall["arguments"];
         }
       }
       this.stream.push({ type: "toolcall_delta", contentIndex: indexed.contentIndex, delta: delta.partial_json, partial: this.output });
@@ -323,12 +416,17 @@ export class ClaudeEventMapper {
         try {
           const parsed = JSON.parse(indexed.partialJson) as unknown;
           if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not a JSON object");
-          block.arguments = parsed as JsonObject;
+          block.arguments = parsed as ToolCall["arguments"];
         } catch (error) {
-          throw new ClaudeCodeError(
-            "tool_arguments",
-            `Claude emitted invalid arguments for tool ${block.name}: ${toolArgumentDetail(error, indexed.partialJson)}`,
-          );
+          // A connection drop inside streamed tool arguments truncates the JSON. Claude
+          // Code then closes the block, stops the message and announces its recovery, so
+          // hold this failure: if a recovery signal follows, the retryable interruption
+          // is the accurate explanation. Nothing publishes the block either way. When no
+          // recovery follows, the detail names the evidence (size, never content).
+          this.deferredToolArguments =
+            `Claude emitted invalid arguments for tool ${block.name}: ${toolArgumentDetail(error, indexed.partialJson)}`;
+          this.blocks.delete(sourceIndex);
+          return;
         }
       }
       this.stream.push({ type: "toolcall_end", contentIndex: indexed.contentIndex, toolCall: block as ToolCall, partial: this.output });
@@ -338,7 +436,6 @@ export class ClaudeEventMapper {
 
   private acceptResult(record: StreamEventEnvelope, terminationCause: ClaudeTerminationCause): void {
     if (this.terminal) return;
-    if (this.blocks.size > 0) throw new ClaudeCodeError("protocol_blocks", "Claude result arrived with unclosed content blocks");
     // Stream envelopes are untrusted JSON despite the TypeScript interface.
     // Validate terminal fields before they can cross into Pi's typed output.
     if (typeof record.is_error !== "boolean") {
@@ -351,7 +448,8 @@ export class ClaudeEventMapper {
     this.applyUsage(record.usage);
     this.applyModelUsage(record.modelUsage);
     if (record.is_error) {
-      if (this.isExpectedToolTermination(record, terminationCause)) return;
+      if (this.isExpectedHandoffTermination(record, terminationCause)) return;
+      this.throwDeferredFailure();
       const status = typeof record.api_error_status === "number" && Number.isFinite(record.api_error_status)
         ? ` (${record.api_error_status})`
         : "";
@@ -365,13 +463,12 @@ export class ClaudeEventMapper {
       this.fail(`Claude Code request failed${status}: ${detail}`);
       return;
     }
-    // The terminal envelope states how the whole turn ended, so it outranks any
-    // stop reason seen mid-stream. Claude Code caps a response at
-    // CLAUDE_CODE_MAX_OUTPUT_TOKENS, reports `max_tokens` on that message, then
-    // continues and finishes the turn under a different stop reason. Keeping the
-    // first one reported a completed answer as truncated, and Pi discards a
-    // truncated compaction summary whole and pays for another one.
-    if (record.stop_reason !== null && record.stop_reason !== undefined) {
+    this.throwDeferredFailure();
+    // Only a successful result must account for every block it opened. An error result
+    // is reported as itself: the API failure is the useful message, and checking the
+    // block shape first hid it behind a protocol complaint.
+    if (this.blocks.size > 0) throw new ClaudeCodeError("protocol_blocks", "Claude result arrived with unclosed content blocks");
+    if (record.stop_reason !== null && record.stop_reason !== undefined && this.stopReason === undefined) {
       this.stopReason = stopReason(record.stop_reason);
     }
     // Claude result envelopes make success explicit. Do not infer it from an
@@ -394,6 +491,7 @@ export class ClaudeEventMapper {
 
   completeToolUse(): boolean {
     if (this.terminal) return false;
+    this.throwDeferredFailure();
     if (this.blocks.size > 0) throw new ClaudeCodeError("protocol_blocks", "Tool use completed with unclosed content blocks");
     if (!this.output.content.some((block) => block.type === "toolCall")) {
       throw new ClaudeCodeError("protocol_tool", "Claude reported tool use without a tool call");
@@ -405,16 +503,34 @@ export class ClaudeEventMapper {
     return true;
   }
 
-  private isExpectedToolTermination(record: StreamEventEnvelope, terminationCause: ClaudeTerminationCause): boolean {
-    return terminationCause === "tool_handoff" &&
-      this.stopReason === "tool_use" &&
-      this.output.content.some((block) => block.type === "toolCall") &&
-      record.subtype === "error_during_execution" &&
-      record.is_error === true &&
-      record.api_error_status === undefined &&
+  /**
+   * Publish a response that reached the output limit, after the provider has terminated
+   * Claude. Claude Code answers a max_tokens stop with a synthetic "Output token limit
+   * hit" turn and another message, so the provider stops it at the stop reason and
+   * returns Pi the ordinary `length` stop the response earned.
+   */
+  completeLength(): boolean {
+    if (this.terminal) return false;
+    this.throwDeferredFailure();
+    if (this.blocks.size > 0) throw new ClaudeCodeError("protocol_blocks", "Output limit stop completed with unclosed content blocks");
+    if (this.stopReason !== "max_tokens") throw new ClaudeCodeError("protocol_stop", "Claude did not report an output limit stop");
+    this.terminal = true;
+    this.output.stopReason = "length";
+    this.stream.push({ type: "done", reason: "length", message: this.output });
+    this.stream.end();
+    return true;
+  }
+
+  /** Whether an error result is only the provider's own handoff termination, for a tool call or an output limit. */
+  private isExpectedHandoffTermination(record: StreamEventEnvelope, terminationCause: ClaudeTerminationCause): boolean {
+    if (terminationCause !== "tool_handoff") return false;
+    if (record.subtype !== "error_during_execution" || record.is_error !== true) return false;
+    if (record.api_error_status !== undefined || record.result !== undefined) return false;
+    if (record.terminal_reason !== "aborted_streaming") return false;
+    if (this.stopReason === "max_tokens") return record.stop_reason === "max_tokens";
+    return this.stopReason === "tool_use" &&
       record.stop_reason === "tool_use" &&
-      record.terminal_reason === "aborted_streaming" &&
-      record.result === undefined;
+      this.output.content.some((block) => block.type === "toolCall");
   }
 
   private pushFallbackText(text: string): void {
@@ -517,6 +633,10 @@ function endedPrematurely(message: string, partialJson: string): boolean {
   const position = Number(/position (\d+)/.exec(message)?.[1]);
   return Number.isInteger(position) && position >= partialJson.length - 1;
 }
+// api_retry categories that describe a transient transport or server failure. Every
+// other documented category (billing_error, authentication_failed, invalid_request, ...)
+// describes a condition that repeating the turn cannot clear.
+const RETRYABLE_INTERRUPTIONS = new Set(["overloaded", "server_error", "unknown"]);
 
 function stopReason(value: unknown): string {
   // Claude exposes this as a string rather than a closed enum. Pi only gives

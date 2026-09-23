@@ -1,4 +1,5 @@
 import type { AssistantMessage, Context, Tool } from "@earendil-works/pi-ai";
+import type { SessionResolution } from "./session-registry.ts";
 
 export type ClaudeSubscriptionType = "pro" | "max" | "team" | "enterprise";
 
@@ -28,11 +29,15 @@ export interface PreparedRequest {
   toolNames: Map<string, string>;
   transcriptBytes: number;
   catalogBytes: number;
+  /** Image content blocks, which is what the per-request image limit counts. */
+  imageCount: number;
+  /** Bytes actually written, so identical images are counted once. */
   imageBytes: number;
 }
 
 export interface RequestMetrics {
-  schemaVersion: 4;
+  /** 5 changed `imageCount` from written attachments to image content blocks. */
+  schemaVersion: 5;
   timestamp: string;
   platform: NodeJS.Platform;
   architecture: string;
@@ -43,6 +48,9 @@ export interface RequestMetrics {
   effort: string;
   messageCount: number;
   toolCount: number;
+  /** Where this request's working directory came from; absent when no session was resolved. */
+  sessionResolution?: SessionResolution;
+  /** Image content blocks, matching what an `image_count` rejection counted. */
   imageCount: number;
   transcriptBytes: number;
   catalogBytes: number;

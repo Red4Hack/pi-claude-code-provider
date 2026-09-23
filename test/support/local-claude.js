@@ -22,9 +22,9 @@ import { nodeFixtureSource } from "./node-fixture.js";
 export const DEFAULT_LOCAL_BASE_URL = "http://127.0.0.1:8080";
 export const DEFAULT_LOCAL_MODEL = "openbmb/MiniCPM5-2B-GGUF:Q4_K_M";
 const MODULE_PATH = fileURLToPath(import.meta.url);
-/** Claude Code closes a correlated tool handoff as 143 on POSIX; so must this. */
-const TOOL_HANDOFF_EXIT = 143;
-const TOOL_HANDOFF_FALLBACK_MS = 30_000;
+/** Claude Code closes a correlated handoff, for a tool call or an output limit, as 143 on POSIX; so must this. */
+const HANDOFF_EXIT = 143;
+const HANDOFF_FALLBACK_MS = 30_000;
 
 /**
  * Write an executable Claude Code stand-in whose configuration is baked in.
@@ -77,9 +77,10 @@ async function runHeadlessTurn(argv, config) {
   const systemPrompt = systemPromptFile ? await readFile(systemPromptFile, "utf8") : "";
   const maxTokens = Number(process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS) || 1024;
   // Install the close handler before anything the provider could react to. It
-  // terminates a tool handoff the moment it sees the stop reason, and a signal
-  // that arrives before this is registered kills the process by default action
-  // — reported as a signal death rather than the 143 a handoff closes with.
+  // terminates a handoff, for a tool call or an output limit, the moment it sees
+  // the stop reason, and a signal that arrives before this is registered kills
+  // the process by default action — reported as a signal death rather than the
+  // 143 a handoff closes with.
   const handoff = installCloseHandler();
   const proposals = await connectProposalServer(optionValue(argv, "--mcp-config"));
   handoff.own(proposals);
@@ -109,11 +110,17 @@ async function runHeadlessTurn(argv, config) {
   };
   emit({ type: "stream_event", event: { type: "message_start", message: { id: `msg_local_${Date.now()}`, model: config.model, usage: {} } } });
 
+  const toolCall = completion.toolCalls[0];
+  const stopReason = toolCall ? "tool_use" : completion.truncated ? "max_tokens" : "end_turn";
+  // The provider terminates Claude Code the moment it reads either handoff stop:
+  // a tool call, or an output limit that Claude Code would otherwise answer with
+  // a continuation turn of its own. Both close as a handoff, armed before either
+  // stop reason can be read.
+  const handsOff = stopReason !== "end_turn";
+  if (handsOff) handoff.expectHandoffClose();
   let index = 0;
   if (completion.reasoning) index = emitBlock(index, { type: "thinking", thinking: "" }, "thinking_delta", "thinking", completion.reasoning);
-  const toolCall = completion.toolCalls[0];
   if (toolCall) {
-    handoff.expectToolClose();
     emit({ type: "stream_event", event: { type: "content_block_start", index, content_block: { type: "tool_use", id: toolCall.id, name: `mcp__pi__${toolCall.name}` } } });
     for (const chunk of split(toolCall.argumentsJson)) {
       emit({ type: "stream_event", event: { type: "content_block_delta", index, delta: { type: "input_json_delta", partial_json: chunk } } });
@@ -123,20 +130,20 @@ async function runHeadlessTurn(argv, config) {
     index = emitBlock(index, { type: "text", text: "" }, "text_delta", "text", completion.text);
   }
 
-  const stopReason = toolCall ? "tool_use" : completion.truncated ? "max_tokens" : "end_turn";
   emit({ type: "stream_event", event: { type: "message_delta", delta: { stop_reason: stopReason }, usage } });
   emit({ type: "stream_event", event: { type: "message_stop" } });
 
   const modelUsage = { [config.model]: { contextWindow: 32_768, maxOutputTokens: maxTokens } };
-  if (toolCall) {
-    // The provider terminates a tool handoff as soon as it sees the stop
-    // reason, so this mirrors the acknowledgement Claude Code emits and then
-    // waits to be closed rather than exiting on its own.
+  if (handsOff) {
+    // The provider terminates a handoff as soon as it sees the stop reason, so
+    // this mirrors the acknowledgement Claude Code emits and then waits to be
+    // closed. Finishing on its own instead races that termination: a signal
+    // that lands while the process is exiting is reported as a signal death.
     emit({
       type: "result",
       subtype: "error_during_execution",
       is_error: true,
-      stop_reason: "tool_use",
+      stop_reason: stopReason,
       terminal_reason: "aborted_streaming",
       usage,
       modelUsage,
@@ -165,17 +172,18 @@ function split(text, size = 64) {
 }
 
 /**
- * Close the way Claude Code does. A correlated tool handoff closes as 143; any
- * other termination — a cancelled turn, say — is an ordinary close. The exit
- * code therefore follows what this turn actually acknowledged, and the handler
- * is installed before the provider has anything to react to.
+ * Close the way Claude Code does. A correlated handoff, for a tool call or an
+ * output limit, closes as 143; any other termination — a cancelled turn, say —
+ * is an ordinary close. The exit code therefore follows what this turn actually
+ * acknowledged, and the handler is installed before the provider has anything
+ * to react to.
  */
 function installCloseHandler() {
-  let toolHandoff = false;
+  let handoffExpected = false;
   let proposals = { close() {} };
   const close = () => {
     proposals.close();
-    process.exit(toolHandoff ? TOOL_HANDOFF_EXIT : 0);
+    process.exit(handoffExpected ? HANDOFF_EXIT : 0);
   };
   process.on("SIGTERM", close);
   process.on("SIGINT", close);
@@ -183,12 +191,12 @@ function installCloseHandler() {
     own(current) {
       proposals = current;
     },
-    expectToolClose() {
-      toolHandoff = true;
+    expectHandoffClose() {
+      handoffExpected = true;
     },
     /** Stay alive to be closed, bounded so a provider that never closed cannot leak this process. */
     awaitClose() {
-      setTimeout(close, TOOL_HANDOFF_FALLBACK_MS);
+      setTimeout(close, HANDOFF_FALLBACK_MS);
     },
   };
 }

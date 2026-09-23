@@ -35,12 +35,14 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { claudeExecutable, buildClaudeEnvironment } from "../src/auth.ts";
-import { providerArgs } from "../src/claude-args.ts";
+import { providerArgs, thinkingDisplay } from "../src/claude-args.ts";
 import { SessionImageStore } from "../src/session-image-store.ts";
 
 // Anthropic permits four cache breakpoints per request. A fifth is rejected
 // outright, so this is a hard ceiling rather than a quality signal.
 const MAX_BREAKPOINTS = 4;
+// A shutting-down CLI that will not exit would otherwise hang the capture.
+const CHILD_EXIT_TIMEOUT_MS = 5000;
 // A CLI that neither sends a request nor exits would otherwise hang the capture.
 const CAPTURE_TIMEOUT_MS = 60_000;
 // Transcript-dominant padding, well past every model's minimum cacheable prefix,
@@ -62,7 +64,7 @@ const PNG = Buffer.from(
 );
 
 function parseOptions(argv) {
-  const options = { model: "sonnet", effort: "low", images: 0, tools: true, marker: true, claude: undefined, output: undefined };
+  const options = { model: "sonnet", effort: "low", effortExplicit: false, images: 0, tools: true, marker: true, claude: undefined, output: undefined };
   for (let index = 0; index < argv.length; index++) {
     const flag = argv[index];
     const value = () => {
@@ -71,7 +73,7 @@ function parseOptions(argv) {
       return next;
     };
     if (flag === "--model") options.model = value();
-    else if (flag === "--effort") options.effort = value();
+    else if (flag === "--effort") { options.effort = value(); options.effortExplicit = true; }
     else if (flag === "--images") options.images = Number.parseInt(value(), 10);
     else if (flag === "--claude") options.claude = value();
     else if (flag === "--output") options.output = value();
@@ -82,6 +84,7 @@ function parseOptions(argv) {
     else throw new Error(`Unknown option: ${flag}`);
   }
   if (!Number.isInteger(options.images) || options.images < 0) throw new Error("--images requires a non-negative integer");
+  if (options.model === "haiku" && options.effortExplicit) throw new Error("Haiku does not support --effort");
   return options;
 }
 
@@ -153,6 +156,22 @@ async function snapshotTree(root) {
   return files;
 }
 
+/** Resolve once the child has exited, or after a bounded wait if it will not. */
+function closed(child) {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      child.once("exit", done);
+    }, CHILD_EXIT_TIMEOUT_MS);
+    child.once("exit", done);
+  });
+}
+
 async function captureOnce(options, executable, home, project, imageStore) {
   const { server, body, listening, port } = captureServer();
   await listening;
@@ -183,13 +202,18 @@ async function captureOnce(options, executable, home, project, imageStore) {
           }
         : {}),
     };
-    const { args, prompt } = providerArgs(prepared, options.model, options.effort, { transcriptBreakpoint: options.marker });
-    const env = buildClaudeEnvironment({
-      HOME: home,
+    const { args, prompt } = providerArgs(prepared, options.model, options.effort, {
+      transcriptBreakpoint: options.marker,
+      thinkingDisplay: thinkingDisplay(),
+    });
+    // The loopback base URL and dummy token are exactly what
+    // buildClaudeEnvironment refuses to forward. This capture overrides them
+    // after that call, where the override is visible, rather than through it.
+    const env = {
+      ...buildClaudeEnvironment({ HOME: home, CLAUDE_CODE_MAX_OUTPUT_TOKENS: "64000" }),
       ANTHROPIC_BASE_URL: baseUrl,
       CLAUDE_CODE_OAUTH_TOKEN: "local-capture-dummy-oauth-token",
-      CLAUDE_CODE_MAX_OUTPUT_TOKENS: "64000",
-    });
+    };
     // An inherited proxy would send this capture off the loopback interface.
     for (const name of ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]) delete env[name];
     // A relocated configuration directory would expose the account this capture must never read.
@@ -207,6 +231,10 @@ async function captureOnce(options, executable, home, project, imageStore) {
       clearTimeout(timer);
       child.kill();
     });
+    // Claude Code writes its cache under HOME as it shuts down. Returning before it has
+    // exited lets that write land after the temporary HOME is removed, recreating it and
+    // leaving one directory behind per run.
+    await closed(child);
     // Claude Code sends its first request only after the MCP tool catalog loads.
     const bridgeReady = options.tools ? existsSync(prepared.readyPath) : undefined;
     return { body: redact(JSON.parse(captured)), prompt, directory, bridgeReady };
@@ -249,6 +277,10 @@ function report(captures, options, startup) {
 
   console.log(`served model:   ${body.model}`);
   console.log(`message roles:  ${(body.messages ?? []).map((message) => message.role).join(", ")}`);
+  // Thinking arrives with empty text unless the request asks for summarized
+  // display, and the flag carrying it is hidden from --help, so the wire body is
+  // the only proof it reached the API.
+  console.log(`thinking:       ${JSON.stringify(body.thinking ?? null)}`);
   const marked = blocks.flatMap(([label, block], position) => (block.cache_control ? [{ position, label, block }] : []));
   // The last breakpoint inside the transcript marks the prefix a later request
   // reuses. Only a change at or ahead of it invalidates that entry; the
@@ -339,7 +371,11 @@ try {
   };
 } finally {
   await imageStore.close();
-  await Promise.all([home, markerRoot, fixture?.project].filter(Boolean).map((path) => rm(path, { recursive: true, force: true })));
+  // Claude Code can still be writing under its temporary HOME as it exits, which
+  // surfaces as ENOTEMPTY here; the captures themselves are already complete.
+  await Promise.all([home, markerRoot, fixture?.project].filter(Boolean).map(
+    (path) => rm(path, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }),
+  ));
 }
 const healthy = report(captures, options, startup);
 if (options.output) {

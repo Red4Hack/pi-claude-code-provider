@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { once } from "node:events";
 import test from "node:test";
 import { ProcessTerminationError, superviseProcess, terminateProcessGroup } from "../../src/process-utils.ts";
 import { nodeFixtureArgs } from "../support/node-fixture.js";
@@ -196,3 +197,34 @@ test("supervisor termination is idempotent", async () => {
     await supervisor.wait();
     supervisor.dispose();
 });
+
+for (const inheritedPipes of [true, false]) {
+    test(`failed tree cleanup after leader exit retains unknown liveness (${inheritedPipes ? "open pipes" : "closed pipes"})`, { skip: process.platform === "win32", timeout: 5000 }, async () => {
+        const body = `const {spawn}=require("node:child_process"); const child=spawn(process.execPath,["-e","setInterval(()=>{},1000)"],{stdio:${inheritedPipes ? '"inherit"' : '"ignore"'}}); child.unref();`;
+        const child = spawn(process.execPath, ["-e", body], { detached: true, stdio: ["ignore", "pipe", "pipe"] });
+        const exited = once(child, "exit");
+        const closed = once(child, "close");
+        const supervisor = superviseProcess(child, {
+            idleTimeoutMs: 10000, totalTimeoutMs: 10000, onFailure() {},
+            terminate: async () => { throw new Error("synthetic surviving-group EPERM"); },
+        });
+        try {
+            await exited;
+            assert.equal(child.exitCode, 0);
+            assert.doesNotThrow(() => process.kill(-child.pid, 0));
+            if (!inheritedPipes) await closed;
+            const first = supervisor.terminate();
+            assert.equal(supervisor.terminate(), first);
+            await assert.rejects(first, ProcessTerminationError);
+            if (inheritedPipes) {
+                await assert.rejects(supervisor.wait(), ProcessTerminationError);
+                assert.equal(child.stdout.destroyed, true);
+            } else {
+                assert.equal((await supervisor.wait()).code, 0);
+            }
+        } finally {
+            supervisor.dispose();
+            await terminateProcessGroup(child);
+        }
+    });
+}

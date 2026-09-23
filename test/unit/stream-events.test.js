@@ -1,9 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import {
+    AssistantMessageFrameEncoder,
+    createAssistantMessageEventStream,
+    isRetryableAssistantError,
+    reduceAssistantMessageFrames,
+} from "@earendil-works/pi-ai";
 import { ClaudeEventMapper as EventMapper, argumentPreviewDue } from "../../src/stream-events.ts";
 import { createOutput } from "../../src/output.ts";
-import { PROVIDER_INIT_FIELDS, initRecord as claudeInitRecord } from "../support/claude-fixture.js";
+import { PROVIDER_INIT_FIELDS, initRecord as claudeInitRecord, streamRecoveryRecords } from "../support/claude-fixture.js";
 
 function makeMapper(stream, output, expectedTools, toolNames, onToolUse, onRateLimitNotice, onResponseAnnouncement) {
     return new EventMapper({ stream, output, expectedTools, toolNames, onToolUse, onRateLimitNotice, onResponseAnnouncement });
@@ -280,13 +285,20 @@ test("does not reinterpret a tool acknowledgement after caller abort", async () 
     assert.equal(result.stopReason, "aborted");
     assert.equal(mapper.completeToolUse(), false);
 });
-test("rejects a tool acknowledgement while arguments remain incomplete", () => {
+test("rejects a tool acknowledgement while arguments remain incomplete", async () => {
     const stream = createAssistantMessageEventStream();
     const mapper = makeMapper(stream, createOutput(model), new Set(["mcp__pi__read"]), new Map([["mcp__pi__read", "read"]]), () => { });
     mapper.accept(initRecord(["mcp__pi__read"], [{ name: "pi", status: "connected" }]));
     mapper.accept({ type: "stream_event", event: { type: "message_start", message: { id: "msg_open", model: "claude-sonnet-5", usage: {} } } });
     mapper.accept({ type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "toolu_open", name: "mcp__pi__read", input: {} } } });
-    assert.throws(() => mapper.accept(exactToolTerminationResult(), "tool_handoff"), /unclosed content blocks/);
+    // No tool-use stop was reported, so this is not the provider's own handoff
+    // termination. The error result is now reported as the error it is rather than as a
+    // block-shape complaint, and the incomplete tool call is still never published.
+    mapper.accept(exactToolTerminationResult(), "tool_handoff");
+    assert.equal(mapper.completeToolUse(), false);
+    const result = await stream.result();
+    assert.equal(result.stopReason, "error");
+    assert.match(result.errorMessage, /Claude Code request failed/);
 });
 test("emits validated rate-limit notices and retains rejected diagnostics", () => {
     // Repeats are de-duplicated per session by the extension, not here; see
@@ -605,16 +617,25 @@ function toolMapperWithOpenBlock() {
     return { stream, output, mapper };
 }
 
+const closeToolBlock = { type: "stream_event", event: { type: "content_block_stop", index: 0 } };
+const stopMessageWith = (reason) => ({ type: "stream_event", event: { type: "message_delta", delta: { stop_reason: reason }, usage: {} } });
+
 test("names the evidence when a tool input never closes its JSON", async () => {
     const { mapper } = toolMapperWithOpenBlock();
     const partial = `{"path":"notes.md","content":"${"a".repeat(300)}`;
     mapper.accept({ type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: partial } } });
+    // Held rather than thrown at the block's end: a recovery signal that follows
+    // would explain the cut as a retryable interruption instead.
+    mapper.accept(closeToolBlock);
+    assert.match(mapper.deferredFailure, /ended after \d+ bytes without closing its JSON/);
     // A tool input that stops mid-JSON is what a response truncated at its
     // output-token limit looks like, and the old bare message sent people hunting
-    // for a protocol bug instead.
+    // for a protocol bug instead. The limit stop that follows is where it surfaces.
+    mapper.accept(stopMessageWith("max_tokens"));
     assert.throws(
-        () => mapper.accept({ type: "stream_event", event: { type: "content_block_stop", index: 0 } }),
-        (error) => /invalid arguments for tool write/.test(error.message)
+        () => mapper.completeLength(),
+        (error) => error.code === "tool_arguments"
+            && /invalid arguments for tool write/.test(error.message)
             && /ended after \d+ bytes without closing its JSON/.test(error.message)
             && /output-token limit/.test(error.message)
             && !error.message.includes("aaa"),
@@ -624,13 +645,17 @@ test("names the evidence when a tool input never closes its JSON", async () => {
 test("distinguishes a corrupted tool input from a truncated one", async () => {
     const { mapper } = toolMapperWithOpenBlock();
     mapper.accept({ type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: "[1,2,3]" } } });
+    mapper.accept(closeToolBlock);
+    mapper.accept(stopMessageWith("tool_use"));
     assert.throws(
-        () => mapper.accept({ type: "stream_event", event: { type: "content_block_stop", index: 0 } }),
-        (error) => /was not a JSON object after 7 bytes/.test(error.message) && !/output-token limit/.test(error.message),
+        () => mapper.completeToolUse(),
+        (error) => error.code === "tool_arguments"
+            && /was not a JSON object after 7 bytes/.test(error.message)
+            && !/output-token limit/.test(error.message),
     );
 });
 
-test("a turn Claude continued past its output cap is not reported as truncated", async () => {
+test("a capped response stays a length stop even when Claude Code continues past it", async () => {
     const stream = createAssistantMessageEventStream();
     const output = createOutput(model);
     const mapper = makeMapper(stream, output, new Set(), new Map(), () => { });
@@ -639,17 +664,20 @@ test("a turn Claude continued past its output cap is not reported as truncated",
     mapper.accept({ type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } } });
     mapper.accept({ type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "1 2 3" } } });
     mapper.accept({ type: "stream_event", event: { type: "content_block_stop", index: 0 } });
-    // Captured from a real Claude Code run under CLAUDE_CODE_MAX_OUTPUT_TOKENS:
-    // it reports max_tokens on each capped message, then continues and finishes.
+    // Claude Code reports max_tokens on a capped message, then continues on its own
+    // and finishes the turn under another stop reason. The first max_tokens hands the
+    // response off, so that unrequested continuation is never mapped into Pi's
+    // message, and a result that still arrives cannot present the truncated text as a
+    // finished answer.
     mapper.accept({ type: "stream_event", event: { type: "message_delta", delta: { stop_reason: "max_tokens" }, usage: {} } });
     mapper.accept({ type: "stream_event", event: { type: "message_delta", delta: { stop_reason: "max_tokens" }, usage: {} } });
     mapper.accept({ type: "stream_event", event: { type: "message_stop" } });
     mapper.accept({ type: "result", is_error: false, result: "1 2 3", stop_reason: "stop_sequence" });
     mapper.completeResult();
     const result = await stream.result();
-    // Pi throws away a summary that stopped at its cap, so a completed turn
-    // reported as "length" costs a whole compaction and buys nothing.
-    assert.equal(result.stopReason, "stop");
+    assert.equal(result.stopReason, "length");
+    // The text produced before the cap is kept, not discarded with the turn.
+    assert.deepEqual(result.content.filter((block) => block.type === "text").map((block) => block.text), ["1 2 3"]);
 });
 
 test("a turn that really ended at its cap is still reported as truncated", async () => {
@@ -715,4 +743,203 @@ test("explains a cache-breakpoint limit rejection and names the escape hatch", a
     init(unrelated);
     unrelated.accept({ type: "result", is_error: true, api_error_status: 429, result: "subscription limit reached" });
     assert.equal(unrelated.cacheBreakpointLimit, false);
+});
+
+// --- Claude Code mid-response recovery (captured records) -------------------------
+
+/**
+ * Replay one captured scenario the way the provider does: map records until a handoff
+ * latches or a record is rejected, then publish the matching terminal event. Mirrors
+ * provider.ts phase 4 closely enough to show what a real request would return.
+ */
+async function replayCapture(scenario) {
+    const records = streamRecoveryRecords(scenario);
+    const tools = records.find((record) => record.type === "system" && record.subtype === "init").tools;
+    const stream = createAssistantMessageEventStream();
+    const output = createOutput(model);
+    const events = [];
+    // `partial` is a shared live accumulator, so encoding each event as it arrives and
+    // encoding the whole stream afterwards are genuinely different inputs to Pi's
+    // encoder. Both orders must produce frames its reducer accepts.
+    const liveEncoder = new AssistantMessageFrameEncoder();
+    const liveFrames = [];
+    const consume = (async () => {
+        for await (const event of stream) {
+            const frame = liveEncoder.encode(event);
+            if (frame)
+                liveFrames.push(frame);
+            events.push(event);
+        }
+    })();
+    let handoff;
+    const mapper = new EventMapper({
+        stream,
+        output,
+        expectedTools: new Set(tools),
+        toolNames: new Map(tools.map((tool) => [tool, tool.replace("mcp__pi__", "")])),
+        onToolUse: () => { handoff ??= "tool"; },
+        onLengthStop: () => { handoff ??= "length"; },
+    });
+    let rejected;
+    for (const record of records) {
+        // The provider terminates Claude at a handoff, so later records never arrive.
+        if (handoff)
+            break;
+        try {
+            mapper.accept(record);
+        }
+        catch (error) {
+            rejected = error;
+            mapper.fail(error.message);
+            break;
+        }
+    }
+    if (!rejected) {
+        if (handoff === "tool")
+            mapper.completeToolUse();
+        else if (handoff === "length")
+            mapper.completeLength();
+        else if (mapper.hasSuccessfulResult)
+            mapper.completeResult();
+        else if (!mapper.isTerminal)
+            mapper.fail(mapper.deferredFailure ?? "Claude Code exited before a terminal event");
+    }
+    const message = await stream.result();
+    await consume;
+    return { message, output, events, liveFrames, rejected, mapper };
+}
+
+// Every recovery Claude Code performs after a response starts streaming. The first
+// signal differs per scenario; all of them must end the same way.
+const INTERRUPTED = [
+    ["drop", "api_retry after a dropped connection"],
+    ["live-cut-late", "api_retry on a real interrupted API stream"],
+    ["drop-tool", "a synthetic assistant error record"],
+    ["drop-text-stop", "a synthetic user continuation turn"],
+    ["sse-error", "a non-streaming replacement message"],
+    ["drop-partial-tool", "a drop inside streamed tool arguments"],
+];
+for (const [scenario, signal] of INTERRUPTED) {
+    test(`fails retryably when Claude Code recovers mid-response: ${signal}`, async () => {
+        const { message, events } = await replayCapture(scenario);
+        assert.equal(message.stopReason, "error");
+        assert.equal(message.errorMessage === undefined, false);
+        // Pi restarts the turn itself; a message it cannot classify loses the turn.
+        assert.equal(isRetryableAssistantError(message), true, message.errorMessage);
+        assert.equal(events.filter((event) => event.type === "done" || event.type === "error").length, 1);
+        // Nothing already streamed may be rewritten: no content index starts twice.
+        const started = events.filter((event) => /^(text|thinking|toolcall)_start$/.test(event.type)).map((event) => event.contentIndex);
+        assert.deepEqual(started, [...new Set(started)]);
+        assert.equal(events.filter((event) => event.type === "start").length, 1);
+    });
+}
+test("keeps ordinary turns working across the same captures", async () => {
+    // A retry before the response starts is not a mid-response recovery.
+    const before = await replayCapture("http529");
+    assert.equal(before.message.stopReason, "stop");
+    // A connection drop after the response completed changes nothing.
+    const after = await replayCapture("post-stop");
+    assert.equal(after.message.stopReason, "stop");
+    // permission_denied and the tool_result user record precede every tool handoff.
+    const handoff = await replayCapture("tool-ok");
+    assert.equal(handoff.message.stopReason, "toolUse");
+    assert.equal(handoff.output.content.some((block) => block.type === "toolCall"), true);
+});
+test("returns a length stop when a response reaches the output limit", async () => {
+    const { message, events, output } = await replayCapture("max-tokens");
+    assert.equal(message.stopReason, "length");
+    assert.equal(events.at(-1)?.type, "done");
+    assert.equal(events.filter((event) => event.type === "start").length, 1);
+    // The text produced before the limit is kept, not discarded with the turn.
+    assert.equal(output.content.some((block) => block.type === "text" && block.text.length > 0), true);
+});
+test("accepts the output-limit handoff acknowledgement and fails closed on near misses", async () => {
+    const lengthTermination = (overrides = {}) => exactToolTerminationResult({ stop_reason: "max_tokens", ...overrides });
+    const accepted = readyToolMapper("max_tokens");
+    accepted.mapper.accept(lengthTermination(), "tool_handoff");
+    assert.equal(accepted.mapper.isTerminal, false);
+    assert.equal(accepted.mapper.completeLength(), true);
+    assert.equal((await accepted.stream.result()).stopReason, "length");
+    const nearMisses = [
+        { name: "wrong cause", cause: "none", record: lengthTermination() },
+        { name: "wrong result stop", cause: "tool_handoff", record: lengthTermination({ stop_reason: "end_turn" }) },
+        { name: "wrong terminal reason", cause: "tool_handoff", record: lengthTermination({ terminal_reason: "provider_error" }) },
+        { name: "non-null API status", cause: "tool_handoff", record: lengthTermination({ api_error_status: 500 }) },
+    ];
+    for (const entry of nearMisses) {
+        const { stream, mapper } = readyToolMapper("max_tokens");
+        mapper.accept(entry.record, entry.cause);
+        assert.equal((await stream.result()).stopReason, "error", entry.name);
+    }
+});
+test("replays every captured scenario through Pi's own frame encoder and reducer", async () => {
+    // Pi's assistant events are append-only. Rewriting published content to reuse a
+    // recovered stream, as the rejected external fix did, makes these throw.
+    for (const [scenario] of [...INTERRUPTED, ["http529"], ["post-stop"], ["tool-ok"], ["max-tokens"]]) {
+        const { events, liveFrames } = await replayCapture(scenario);
+        assert.equal(liveFrames.length > 0, true, `${scenario} produced no frames`);
+        assert.doesNotThrow(() => reduceAssistantMessageFrames(liveFrames), `${scenario} (live)`);
+        const queuedEncoder = new AssistantMessageFrameEncoder();
+        const queuedFrames = [];
+        assert.doesNotThrow(() => {
+            for (const event of events) {
+                const frame = queuedEncoder.encode(event);
+                if (frame)
+                    queuedFrames.push(frame);
+            }
+        }, `${scenario} (queued encode)`);
+        assert.doesNotThrow(() => reduceAssistantMessageFrames(queuedFrames), `${scenario} (queued)`);
+    }
+});
+test("a failure before the response starts still reduces through Pi's frames", async () => {
+    // A setup failure -- a rejected initialization, an aborted request -- publishes
+    // error and end with no preceding start. Every replay above begins with a
+    // validated init, so this is the one shape they do not cover, and the
+    // provider's own pre-mapper failure path emits it too.
+    const stream = createAssistantMessageEventStream();
+    const output = createOutput(model);
+    const encoder = new AssistantMessageFrameEncoder();
+    const frames = [];
+    const consume = (async () => {
+        for await (const event of stream) {
+            const frame = encoder.encode(event);
+            if (frame)
+                frames.push(frame);
+        }
+    })();
+    const mapper = makeMapper(stream, output, new Set(), new Map(), () => { });
+    mapper.fail("Claude Code initialized with an unexpected tool set");
+    await consume;
+    // Pi's encoder currently frames nothing for a bare error, and reducing an
+    // empty set is the guarantee that matters either way: neither half throws.
+    assert.doesNotThrow(() => reduceAssistantMessageFrames(frames));
+    // The failure reaches the consumer through the stream's own result, which is
+    // the path the provider's pre-mapper failures rely on.
+    const result = await stream.result();
+    assert.equal(result.stopReason, "error");
+    assert.match(result.errorMessage, /unexpected tool set/);
+});
+
+test("classifies api_retry categories that repeating the turn cannot clear", async () => {
+    const stream = createAssistantMessageEventStream();
+    const mapper = makeMapper(stream, createOutput(model), new Set(), new Map(), () => { });
+    init(mapper);
+    mapper.accept({ type: "stream_event", event: { type: "message_start", message: { id: "msg_1", model: "claude-sonnet-5", usage: {} } } });
+    assert.throws(() => mapper.accept({ type: "system", subtype: "api_retry", error: "billing_error", error_status: 400 }), (error) => {
+        assert.equal(error.code, "stream_interrupted");
+        assert.match(error.message, /failed mid-response \(billing_error, HTTP 400\)/);
+        // "billing" is on Pi's non-retryable list, so the turn stops here.
+        assert.equal(isRetryableAssistantError({ stopReason: "error", errorMessage: error.message }), false);
+        return true;
+    });
+});
+test("ignores an api_retry that arrives before the response or after a tool stop", async () => {
+    const preStream = makeMapper(createAssistantMessageEventStream(), createOutput(model), new Set(), new Map(), () => { });
+    init(preStream);
+    preStream.accept({ type: "system", subtype: "api_retry", error: "overloaded", error_status: 529 });
+    const { mapper } = readyToolMapper();
+    // Claude Code's own next request can fail while the provider is terminating; that
+    // must not invalidate a complete proposal.
+    mapper.accept({ type: "system", subtype: "api_retry", error: "unknown", error_status: null });
+    assert.equal(mapper.completeToolUse(), true);
 });

@@ -60,9 +60,9 @@ export function superviseProcess(child: ChildProcess, options: ProcessSupervisor
 
   const terminate = (): Promise<void> => {
     terminationPromise ??= (options.terminate ?? terminateProcessGroup)(child).catch((cause: unknown) => {
-      // Cleanup can reject after close (for example, an injected post-exit
-      // diagnostic). Only a child not known to have closed leaves liveness unknown.
-      if (child.exitCode !== null || child.signalCode !== null) throw cause;
+      // A leader can exit while descendants still own its process group or
+      // inherited pipes. Only successful tree termination establishes cleanup;
+      // an exit code cannot make a rejected terminator safe.
       const failure = cause instanceof ProcessTerminationError ? cause : new ProcessTerminationError(cause);
       if (!settled) {
         settled = true;

@@ -4,6 +4,15 @@ export const PI_PEERS = Object.freeze([
   "typebox",
 ]);
 
+/**
+ * The package a specifier imports from, so a peer's documented subpath export is
+ * allowed while the manifest keeps listing peers by exact name.
+ */
+export function peerPackageName(specifier) {
+  const parts = specifier.split("/");
+  return specifier.startsWith("@") ? parts.slice(0, 2).join("/") : parts[0];
+}
+
 export function dependencyPolicyErrors(manifest) {
   const errors = [];
   const allowed = new Set(PI_PEERS);

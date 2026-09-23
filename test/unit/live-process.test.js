@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { PassThrough } from "node:stream";
 import test from "node:test";
-import { assistantReply, closeLiveRpcProcess, consumeJsonl, superviseLiveProcess } from "../../scripts/lib/live-process.js";
+import { assistantReply, closeLiveRpcProcess, consumeJsonl, describeThinking, superviseLiveProcess, thinkingTextSeen } from "../../scripts/lib/live-process.js";
 
 test("a live assistant reply reports a provider error by name rather than as empty text", () => {
   const end = (message) => ({ type: "message_end", message });
@@ -13,6 +13,35 @@ test("a live assistant reply reports a provider error by name rather than as emp
     { message: "fable:medium: usage credits are disabled" },
   );
   assert.throws(() => assistantReply([end({ role: "user" })], "cache turn 1"), { message: "cache turn 1 returned no assistant message" });
+});
+
+test("a live assistant reply fails when thinking arrived without its text", () => {
+  // The defect this catches is silent: Claude Code returns a thinking block with
+  // a signature and no text when the summarized-display request is not honoured,
+  // and the turn still succeeds, so only an explicit check notices.
+  const end = (content) => [{ type: "message_end", message: { role: "assistant", stopReason: "stop", content } }];
+  const text = { type: "text", text: "OK" };
+  const empty = { type: "thinking", thinking: "", thinkingSignature: "sig" };
+  assert.throws(() => assistantReply(end([empty, text]), "sonnet:medium"), /1 thinking block\(s\) arrived with no text/);
+  assert.throws(() => assistantReply(end([empty, { ...empty, thinking: "  " }, text]), "opus:high"), /2 thinking block\(s\)/);
+
+  // Redacted thinking is empty by construction: its payload is the signature.
+  const redacted = { type: "thinking", thinking: "", thinkingSignature: "opaque", redacted: true };
+  assert.equal(assistantReply(end([redacted, text]), "haiku").content[0], redacted);
+  assert.equal(assistantReply(end([{ type: "thinking", thinking: "reasoned" }, text]), "sonnet:low").content[1], text);
+
+  // Adaptive thinking may skip a turn, so absence passes and is reported instead.
+  assert.equal(assistantReply(end([text]), "sonnet:low").content[0], text);
+  assert.equal(thinkingTextSeen({ content: [{ type: "thinking", thinking: "reasoned" }, text] }), true);
+  assert.equal(thinkingTextSeen({ content: [redacted, text] }), false);
+  assert.equal(thinkingTextSeen({ content: [text] }), false);
+
+  // Reasoning tokens separate "did not think" from "thought without the text".
+  const thought = { type: "thinking", thinking: "reasoned" };
+  assert.equal(describeThinking({ content: [text], usage: { reasoning: 0 } }), "thinking text absent, 0 reasoning tokens");
+  assert.equal(describeThinking({ content: [text], usage: { reasoning: 412 } }), "thinking text absent, 412 reasoning tokens");
+  assert.equal(describeThinking({ content: [thought, text], usage: { reasoning: 412 } }), "thinking text seen, 412 reasoning tokens");
+  assert.equal(describeThinking({ content: [text], usage: {} }), "thinking text absent, unreported reasoning tokens");
 });
 
 test("live-process supervision clears normal exits and enforces deadlines", async () => {

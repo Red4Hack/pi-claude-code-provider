@@ -25,6 +25,7 @@ try {
           baseUrl: root,
           paths: {
             "@earendil-works/pi-ai": [packageEntry(packages.piAi, "types")],
+            "@earendil-works/pi-ai/compat": [packageEntry(packages.piAi, "types", "./compat")],
             "@earendil-works/pi-coding-agent": [packageEntry(packages.codingAgent, "types")],
             typebox: [packageEntry(packages.typebox, "types")],
           },

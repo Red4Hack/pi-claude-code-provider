@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
-import { importedSpecifiers, repositoryFiles } from "../../scripts/lib/source-policy.js";
+import { importedSpecifiers, repositoryFiles, unreferencedImportBindings } from "../../scripts/lib/source-policy.js";
 
 test("finds static, side-effect, dynamic, and re-exported imports", () => {
   const source = [
@@ -39,6 +39,21 @@ test("TypeScript parsing ignores lexical decoys and malformed import-like text",
     ['export { value } from ; import(unknown);', []],
   ];
   for (const [source, expected] of fixtures) assert.deepEqual(importedSpecifiers(source), expected, source);
+});
+
+test("reports import bindings a file never mentions again", () => {
+  assert.deepEqual(unreferencedImportBindings('import { used, dead } from "m";\nused();\n'), ["dead"]);
+  assert.deepEqual(unreferencedImportBindings('import def, { a as b } from "m";\ndef(b);\n'), []);
+  assert.deepEqual(unreferencedImportBindings('import * as ns from "m";\nns.value;\n'), []);
+  assert.deepEqual(unreferencedImportBindings('import * as ns from "m";\nexport {};\n'), ["ns"]);
+  // A type-only import used only in a type position is a use.
+  assert.deepEqual(unreferencedImportBindings('import type { T } from "m";\nconst v: T = null;\n'), []);
+  // A re-export introduces no binding, so it is never reported.
+  assert.deepEqual(unreferencedImportBindings('export { x } from "m";\nexport * from "n";\n'), []);
+  // An import re-exported by name is used.
+  assert.deepEqual(unreferencedImportBindings('import { x } from "m";\nexport { x };\n'), []);
+  // Side-effect imports bind nothing.
+  assert.deepEqual(unreferencedImportBindings('import "m";\n'), []);
 });
 
 test("lists tracked and pending source while excluding ignored files", async () => {

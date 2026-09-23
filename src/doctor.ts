@@ -1,16 +1,23 @@
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { buildClaudeEnvironment } from "./auth.ts";
+import { providerModelsForSubscription } from "./catalog.ts";
 import { bridgeArgv, bridgeLaunch, formatBridgeArgv } from "./claude-args.ts";
 import { MODEL_ALIASES, type ModelAliasVersions } from "./claude-models.ts";
 import type { VersionStatus } from "./compatibility.ts";
 import { NEUTRAL_BUN_CONFIG, hostRuntimeDescription, needsBunConfig } from "./host-runtime.ts";
-import { superviseProcess } from "./process-utils.ts";
+import { superviseProcess, terminateProcessGroup, type ProcessResult, type ProcessSupervisor } from "./process-utils.ts";
 import { headText } from "./text.ts";
-import type { RuntimeCleanupResult } from "./runtime-directories.ts";
+import { createRuntimeDirectory, recordRuntimeChild, removeRuntimeDirectory, type RuntimeCleanupResult } from "./runtime-directories.ts";
 import type { ClaudeInstallation, RequestMetrics } from "./types.ts";
+
+// Haiku 4.5 caches nothing below this, so a smaller request that reuses nothing
+// says nothing about caching; see DEVELOPING.md#prompt-caching.
+const MIN_CACHEABLE_PROMPT_TOKENS = 4_096;
+// Below this a request has no earlier turn whose prefix it could have reused.
+const MIN_REUSING_MESSAGE_COUNT = 3;
+const LOW_CACHE_HIT_PERCENT = 50;
 
 export interface BridgeProbeResult {
   ok: boolean;
@@ -23,8 +30,12 @@ export interface BridgeProbeResult {
  * Version and path checks cannot detect a bridge that the hosting runtime refuses
  * to execute, which is exactly how the compiled standalone Pi build fails.
  */
-export async function probeBridge(timeoutMs = 10_000): Promise<BridgeProbeResult> {
-  const directory = await mkdtemp(join(tmpdir(), "pi-claude-code-provider-bridge-probe-"));
+export async function probeBridge(
+  timeoutMs = 10_000,
+  dependencies: { spawnChild?: typeof spawn; supervise?: typeof superviseProcess; temporaryRoot?: string } = {},
+): Promise<BridgeProbeResult> {
+  const directory = await createRuntimeDirectory("bridge_probe", { temporaryRoot: dependencies.temporaryRoot });
+  let livenessUnknown = false;
   try {
     const catalogPath = join(directory, "catalog.json");
     const readyPath = join(directory, "ready");
@@ -36,7 +47,7 @@ export async function probeBridge(timeoutMs = 10_000): Promise<BridgeProbeResult
     const launch = bridgeLaunch(bunConfigPath);
     const argv = bridgeArgv(bunConfigPath);
     await writeFile(catalogPath, JSON.stringify([{ name: "probe", description: "doctor probe", inputSchema: { type: "object" } }]), { mode: 0o600 });
-    const child = spawn(launch.command, launch.args, {
+    const child = (dependencies.spawnChild ?? spawn)(launch.command, launch.args, {
       cwd: directory,
       // Mirror what Claude Code actually hands the bridge: its own filtered
       // environment plus the server env from --mcp-config. A probe with a richer
@@ -61,22 +72,45 @@ export async function probeBridge(timeoutMs = 10_000): Promise<BridgeProbeResult
     child.stderr?.on("data", (chunk: Buffer) => {
       stderr = headText(stderr, chunk, 4 * 1024);
     });
-    const supervisor = superviseProcess(child, {
-      idleTimeoutMs: timeoutMs,
-      totalTimeoutMs: timeoutMs,
-      onFailure(error) {
-        failure ??= error.message;
-      },
-    });
+    let supervisor: ProcessSupervisor | undefined;
+    let result: ProcessResult | undefined;
+    let waitError: unknown;
+    let terminationError: unknown;
     try {
+      supervisor = (dependencies.supervise ?? superviseProcess)(child, {
+        idleTimeoutMs: timeoutMs,
+        totalTimeoutMs: timeoutMs,
+        onFailure(error) {
+          failure ??= error.message;
+        },
+      });
+      await recordRuntimeChild(directory, child.pid as number);
       child.stdin?.end(
         `${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} })}\n` +
         `${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} })}\n`,
       );
-      await supervisor.wait();
+      result = await supervisor.wait();
+    } catch (error) {
+      waitError = error;
     } finally {
-      supervisor.dispose();
-      await supervisor.terminate().catch(() => undefined);
+      supervisor?.dispose();
+      try {
+        await (supervisor ? supervisor.terminate() : terminateProcessGroup(child));
+      } catch (error) {
+        terminationError = error;
+        // The marker carries the child PID for stale recovery. Removing the
+        // directory now could discard state a surviving descendant still uses.
+        livenessUnknown = true;
+      }
+    }
+    if (terminationError) return {
+      ok: false, argv,
+      detail: `process cleanup failed; liveness unknown: ${String(terminationError).slice(0, 256)}`,
+    };
+    if (waitError || failure || result?.error || result?.code !== 0 || result.signal !== null) {
+      const exit = result ? `exit code ${String(result.code)}, signal ${String(result.signal)}` : "no exit result";
+      const cause = waitError ?? failure ?? result?.error;
+      return { ok: false, argv, detail: `bridge process failed (${exit})${cause ? `: ${String(cause).slice(0, 256)}` : ""}` };
     }
     const listed = stdout.split("\n").filter(Boolean).map((line) => {
       try {
@@ -97,7 +131,7 @@ export async function probeBridge(timeoutMs = 10_000): Promise<BridgeProbeResult
     }
     return { ok: true, argv, detail: "handshake completed: 1 tool listed, ready marker written" };
   } finally {
-    await rm(directory, { recursive: true, force: true });
+    if (!livenessUnknown) await removeRuntimeDirectory(directory);
   }
 }
 
@@ -145,6 +179,19 @@ export function formatDoctorSummary(input: DoctorSummaryInput): string {
   lines.push(metrics
     ? `Last request: ${metrics.requestedModel}/${metrics.effort}, ${metrics.messageCount} messages, ${metrics.estimatedInputTokens} estimated transport tokens, ${reportedUsage}, ${metrics.durationMs ?? 0}ms, ${metrics.stopReason ?? "unknown"}${metrics.errorCategory ? ` (${metrics.errorCategory})` : ""}${metrics.cleanupComplete ? "" : ", cleanup incomplete"}`
     : "Last request: no request metrics recorded yet");
+  if (metrics) {
+    const sources: Record<string, string> = {
+      registered: "registered Pi session",
+      prompt: "Pi prompt declaration",
+      single: "sole-session compatibility borrow",
+      oneshot: "tool-free newest-session borrow",
+    };
+    lines.push(`Working directory source: ${sources[metrics.sessionResolution ?? ""] ?? "unresolved"}`);
+    const contextWindow = servedContextWindowNote(input, metrics);
+    if (contextWindow) lines.push(contextWindow);
+    const promptCache = promptCacheNote(metrics);
+    if (promptCache) lines.push(promptCache);
+  }
   if (input.metricsLogError) lines.push(`Metrics log error: ${input.metricsLogError}`);
   const cleanup = input.runtimeCleanup;
   if (cleanup.removed > 0 || cleanup.failures > 0 || cleanup.reaped > 0) {
@@ -156,6 +203,40 @@ export function formatDoctorSummary(input: DoctorSummaryInput): string {
     lines.push(`Stale runtime cleanup: ${cleanup.removed} removed${reaped}, ${cleanup.failures} ${cleanup.failures === 1 ? "failure" : "failures"}`);
   }
   return lines.join("\n");
+}
+
+/**
+ * Claude Code's own reported context window, when it has stopped matching the one
+ * this package advertises. Only a mismatch is reported, because a match is the
+ * ordinary case and says nothing. It is worth stating because the budget checks in
+ * src/provider.ts bound every request against the *configured* value: a served
+ * window smaller than that makes them too permissive, and the request then fails at
+ * the API, mid-stream, after quota has been spent.
+ */
+function servedContextWindowNote(input: DoctorSummaryInput, metrics: RequestMetrics): string | undefined {
+  const served = metrics.servedContextWindow;
+  if (typeof served !== "number" || !Number.isFinite(served) || served <= 0) return undefined;
+  const configured = providerModelsForSubscription(input.installation.subscriptionType)
+    .find((model) => model.id === metrics.requestedModel)?.contextWindow;
+  if (configured === undefined || configured === served) return undefined;
+  return `Context window: ${metrics.requestedModel} served ${served}, configured ${configured}; ` +
+    "request budget checks use the configured value";
+}
+
+/**
+ * Prompt-cache reuse that collapsed where it should have held. Losing reuse is
+ * otherwise silent -- no error, just slower and more expensive turns -- so the
+ * doctor states it rather than leaving a paid gate as the only detector. Reported
+ * here only, deliberately never as a session notification.
+ */
+function promptCacheNote(metrics: RequestMetrics): string | undefined {
+  const reused = metrics.cacheHitPercent;
+  if (reused === undefined || reused >= LOW_CACHE_HIT_PERCENT) return undefined;
+  if (metrics.messageCount < MIN_REUSING_MESSAGE_COUNT) return undefined;
+  if (metrics.estimatedInputTokens < MIN_CACHEABLE_PROMPT_TOKENS) return undefined;
+  return `Prompt cache: last request reused ${reused}% over ${metrics.messageCount} messages. ` +
+    "One low reading is not evidence, and Pi's own summary requests never reuse; " +
+    "repeat it before concluding caching is broken";
 }
 
 /**

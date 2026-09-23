@@ -1,6 +1,6 @@
 export const VERIFIED_VERSIONS = Object.freeze({
-  pi: "0.86.0",
-  claudeCode: "2.1.270",
+  pi: "0.86.1",
+  claudeCode: "2.1.278",
 });
 
 // The oldest Pi and Claude Code this provider claims to support. Deliberately
@@ -10,7 +10,7 @@ export const VERIFIED_VERSIONS = Object.freeze({
 // would turn every baseline bump into a silent, unreviewed support drop. Assert
 // nothing about their relative order.
 export const MINIMUM_VERSIONS = Object.freeze({
-  pi: "0.86.0",
+  pi: "0.86.1",
   claudeCode: "2.1.270",
 });
 

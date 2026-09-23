@@ -2,8 +2,12 @@ node_modules/
 package-lock.json
 !tooling/package-lock.json
 /caching/
+/fastmode/
+/stream-recovery/
+/bridges/
 /IMPROVE.md
 /REVIEW.md
+/AGENTS.md
 .env
 .env.*
 !.env.example

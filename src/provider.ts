@@ -10,14 +10,8 @@ import type {
   SimpleStreamOptions,
   TranscriptContext,
 } from "@earendil-works/pi-ai";
-import {
-  collapseSystemMessages,
-  createAssistantMessageEventStream,
-  getCurrentSystemPrompt,
-  getCurrentTools,
-  withoutInitialSystemMessage,
-} from "@earendil-works/pi-ai";
-import { bridgeArgv, formatBridgeArgv, providerArgs, transcriptBreakpointEnabled } from "./claude-args.ts";
+import * as piAi from "@earendil-works/pi-ai";
+import { bridgeArgv, formatBridgeArgv, providerArgs, thinkingDisplay, transcriptBreakpointEnabled } from "./claude-args.ts";
 import { claimClaudeLaunch, settleFailure, spawnClaudeProcess, type ClaudeProcess } from "./claude-process.ts";
 import { prepareRequest } from "./context-serializer.ts";
 import { appendCleanupFailure, ClaudeCodeError, errorCode, errorText } from "./errors.ts";
@@ -27,8 +21,8 @@ import { createOutput } from "./output.ts";
 import { claimPaidTestLaunch } from "./paid-launch-budget.ts";
 import { ProcessTerminationError, superviseProcess } from "./process-utils.ts";
 import { removeRuntimeDirectory } from "./runtime-directories.ts";
-import { SessionImageStore, type ImageStoreLease } from "./session-image-store.ts";
-import type { RateLimitNoticeSink } from "./claude-protocol.ts";
+import type { ImageStoreLease } from "./session-image-store.ts";
+import type { ResolvedSession, SessionRequest } from "./session-registry.ts";
 import { ClaudeEventMapper, type ClaudeTerminationCause } from "./stream-events.ts";
 import type { ClaudeInstallation, LogicalProviderPayload, MutableOutput, RequestMetrics } from "./types.ts";
 
@@ -70,17 +64,40 @@ type CleanupDirectory = (directory: string) => Promise<void>;
 /** Internal dependency seam for deterministic abort-timing tests. */
 type ClaimLaunch = () => Promise<void>;
 
+/**
+ * Recover Pi's logical request from the transcript it hands a provider. The
+ * prompt and tool declarations live in system messages; `normalizeContext()`
+ * folds the public `Context` shorthand into them before any provider is reached,
+ * so those top-level fields never arrive here. Pi's own helpers replay sections
+ * and tool deltas in order, and Claude Code gets the resulting prompt and active
+ * catalog while ordinary message history stays in its existing format.
+ *
+ * An empty recovery collapses to `undefined` rather than `""` or `[]`: a
+ * transcript draws no distinction between "declared nothing" and "declared
+ * empty", and `undefined` is the shape a `before_provider_request` hook already
+ * reads as absent.
+ */
+function recoverProviderContext(context: TranscriptContext): Context {
+  const systemPrompt = piAi.getCurrentSystemPrompt(context.messages);
+  const tools = piAi.getCurrentTools(context.messages);
+  return {
+    systemPrompt: systemPrompt === "" ? undefined : systemPrompt,
+    tools: tools.length === 0 ? undefined : tools,
+    messages: context.messages.filter((message) => (message as { role: string }).role !== "system"),
+  };
+}
+
 export interface ClaudeStreamDependencies {
   cleanupDirectory?: CleanupDirectory;
-  onRateLimitNotice?: RateLimitNoticeSink;
   claimLaunch?: ClaimLaunch;
   supervise?: typeof superviseProcess;
   /**
-   * Pi's session working directory. Claude runs there so the working directory
-   * Claude Code reports to the model is the one Pi's tools resolve against.
+   * Resolve the request's cwd and borrow private state from a live session.
+   * Registered IDs and Pi's prompt declaration can identify the cwd. A sole
+   * live session may be borrowed for tool-bearing requests only by explicit
+   * compatibility opt-in; that does not establish the caller's actual cwd.
    */
-  workingDirectory?: () => string | undefined;
-  imageStore?: SessionImageStore;
+  resolveSession?: (request: SessionRequest) => ResolvedSession | { error: string } | undefined;
 }
 
 export function createClaudeStream(
@@ -88,25 +105,48 @@ export function createClaudeStream(
   dependencies: ClaudeStreamDependencies = {},
 ) {
   const cleanupDirectory = dependencies.cleanupDirectory ?? removeRuntimeDirectory;
-  const onRateLimitNotice = dependencies.onRateLimitNotice;
   const claimLaunch = dependencies.claimLaunch ?? claimPaidTestLaunch;
   const supervise = dependencies.supervise ?? superviseProcess;
-  const imageStore = dependencies.imageStore;
   return (model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions): AssistantMessageEventStream => {
-    const stream = createAssistantMessageEventStream();
-    // Read once, when Pi starts the request: a session switch during asynchronous
-    // preparation must not move this request to another directory.
-    const sessionCwd = dependencies.workingDirectory?.();
+    const stream = piAi.createAssistantMessageEventStream();
+    const requestContext = recoverProviderContext(context);
+    // Resolved once, when Pi starts the request: a session starting or ending
+    // during asynchronous preparation must not move this request to another
+    // directory. The pre-hook prompt is used deliberately, because the session a
+    // request belongs to is not a payload hook's to change.
+    const session = dependencies.resolveSession?.({
+      sessionId: options?.sessionId,
+      systemPrompt: requestContext.systemPrompt,
+      hasTools: (requestContext.tools?.length ?? 0) > 0,
+    });
+    const resolved = session && "error" in session ? undefined : session;
+    const imageStore = resolved?.imageStore;
+    const onRateLimitNotice = resolved?.onRateLimitNotice;
+    // Leased with the session, not after preparation: a request that borrowed a
+    // store from another live session would otherwise fail across the awaits in
+    // between if that session shut down, even carrying no images at all. close()
+    // waits on outstanding leases, so the directory survives for whoever holds
+    // one. A request that goes on to fail briefly holds a lease it never used,
+    // which is correct: the store must stay open for anything still able to
+    // write to it. The failure is carried rather than thrown, because this
+    // prologue must return a stream, not raise.
+    let imageLease: ImageStoreLease | undefined;
+    let leaseFailure: unknown;
+    try {
+      imageLease = imageStore?.acquire();
+    } catch (error) {
+      leaseFailure = error;
+    }
     const output = createOutput(model);
 
     void (async () => {
       const startedAt = Date.now();
-      const effort = options?.reasoning ?? "medium";
+      const effort = model.id === "haiku" ? "default" : options?.reasoning ?? "medium";
       let prepared: Awaited<ReturnType<typeof prepareRequest>> | undefined;
-      let imageLease: ImageStoreLease | undefined;
       let claude: ClaudeProcess | undefined;
       let cwd: string | undefined;
       let toolUse = false;
+      let lengthStop = false;
       let terminationCause: ClaudeTerminationCause = "none";
       let mapper: ClaudeEventMapper | undefined;
       let exitCode: number | null | undefined;
@@ -115,7 +155,7 @@ export function createClaudeStream(
       let processLivenessUnknown = false;
       let finalized = false;
       const metrics: RequestMetrics = {
-        schemaVersion: 4,
+        schemaVersion: 5,
         timestamp: new Date(startedAt).toISOString(),
         platform: process.platform,
         architecture: process.arch,
@@ -123,11 +163,9 @@ export function createClaudeStream(
         claudeVersion: installation.version,
         requestedModel: model.id,
         effort,
-        // Pi carries the system prompt and the tool declarations inside the
-        // transcript, so both counts are resolved from it in phase 1, below,
-        // rather than read off fields the context no longer has.
-        messageCount: 0,
-        toolCount: 0,
+        messageCount: requestContext.messages.length,
+        toolCount: requestContext.tools?.length ?? 0,
+        sessionResolution: resolved?.resolution,
         imageCount: 0,
         transcriptBytes: 0,
         catalogBytes: 0,
@@ -183,6 +221,18 @@ export function createClaudeStream(
         claude?.terminateInBackground();
       };
 
+      // A response that reached the output limit is complete as far as Pi is concerned.
+      // Claude Code would answer it with a synthetic continuation turn and another
+      // message, so stop it here and publish the length stop. The termination path, and
+      // therefore the expected exit codes, are the tool handoff's.
+      const stopForLength = (): void => {
+        if (lengthStop || toolUse || terminationCause === "caller_abort") return;
+        lengthStop = true;
+        terminationCause = "tool_handoff";
+        metrics.terminationExpected = true;
+        claude?.terminateInBackground();
+      };
+
       const finalizeLifecycle = async (): Promise<void> => {
         if (finalized) return;
         finalized = true;
@@ -195,7 +245,6 @@ export function createClaudeStream(
           errorCategory ??= "cleanup";
         }
         imageLease?.release(processLivenessUnknown);
-        if (processLivenessUnknown && prepared?.imageStoreDirectory) metrics.cleanupComplete = false;
         metrics.durationMs = Date.now() - startedAt;
         metrics.resolvedModel = output.responseModel;
         metrics.servedContextWindow = mapper?.contextWindow;
@@ -223,15 +272,19 @@ export function createClaudeStream(
 
       try {
         // Phase 1 — prepare Pi's logical payload and private transport state.
-        const requested = logicalPayload(context);
-        // Record the request as Pi stated it before the hook can replace it, so
-        // a failing handler still reports what it was given.
-        metrics.messageCount = requested.messages.length;
-        metrics.toolCount = requested.tools?.length ?? 0;
-        const effectiveContext = await applyPayloadHook(model, requested, options);
+        const effectiveContext = await applyPayloadHook(model, requestContext, options);
         metrics.lastPhase = "payload_applied";
-        cwd = await requireWorkingDirectory(sessionCwd);
-        imageLease = imageStore?.acquire();
+        // A markerless tool-free request may borrow the newest live session for
+        // a summary. The hook cannot turn that borrowed route into a tool-bearing
+        // request, even if the process has only one registered session.
+        if (resolved?.resolution === "oneshot" && (effectiveContext.tools?.length ?? 0) > 0) {
+          throw new ClaudeCodeError(
+            "working_directory",
+            "Pi's tool-free request gained tools after before_provider_request; its working directory was only borrowed for a tool-free summary",
+          );
+        }
+        cwd = await requireWorkingDirectory(session);
+        if (leaseFailure) throw leaseFailure;
         metrics.messageCount = effectiveContext.messages.length;
         metrics.toolCount = effectiveContext.tools?.length ?? 0;
         const systemPromptBytes = Buffer.byteLength(effectiveContext.systemPrompt ?? "");
@@ -250,7 +303,7 @@ export function createClaudeStream(
           systemPromptBytes,
           prepared.attachmentPaths.length,
         );
-        metrics.imageCount = prepared.attachmentPaths.length;
+        metrics.imageCount = prepared.imageCount;
         metrics.transcriptBytes = prepared.transcriptBytes;
         metrics.catalogBytes = prepared.catalogBytes;
         metrics.imageBytes = prepared.imageBytes;
@@ -271,7 +324,11 @@ export function createClaudeStream(
           totalTimeoutMs,
         );
         const { args, prompt } = providerArgs(prepared, model.id, effort, {
-          transcriptBreakpoint: transcriptBreakpointEnabled(),
+          // Pi asks for no cache write on its one-shot summaries, which are
+          // unique per compaction, so the 1h entry this breakpoint writes would
+          // never be read back and is charged at the doubled long-TTL rate.
+          transcriptBreakpoint: transcriptBreakpointEnabled() && options?.cacheRetention !== "none",
+          thinkingDisplay: thinkingDisplay(),
         });
         const expectedTools = new Set(prepared.toolNames.keys());
         mapper = new ClaudeEventMapper({
@@ -280,6 +337,7 @@ export function createClaudeStream(
           expectedTools,
           toolNames: prepared.toolNames,
           onToolUse: stopForToolUse,
+          onLengthStop: stopForLength,
           onRateLimitNotice,
           onResponseAnnouncement: announceResponse,
           privatePaths: [prepared.directory, ...(prepared.imageStoreDirectory ? [prepared.imageStoreDirectory] : [])],
@@ -409,7 +467,31 @@ export function createClaudeStream(
           const excerpt = running.stderrExcerpt();
           return excerpt ? `: ${excerpt}` : "";
         };
+        // Both handoffs settle identically: the provider terminated Claude on
+        // purpose, so an already-terminal mapper only cleans up, an unaccepted exit
+        // fails, and an accepted one publishes after cleanup. Only the accepted
+        // exits, the completion call and the wording differ. Aliased because a
+        // closure does not keep the narrowing this straight-line code has.
+        const settling = mapper;
+        const settleHandoff = async (label: string, exitAccepted: boolean, complete: () => boolean): Promise<void> => {
+          if (settling.isTerminal) {
+            await cleanupPrepared();
+          } else if (!exitAccepted) {
+            errorCategory = "process_exit";
+            settling.fail(
+              await failureAfterCleanup(
+                `Claude Code ${label} exited unexpectedly (code ${String(result.code)}, signal ${String(result.signal)})`,
+              ),
+            );
+          } else {
+            await cleanupPrepared();
+            if (complete()) metrics.lastPhase = "completed";
+          }
+        };
         if (toolUse) {
+          // These two precede settlement and belong to the tool handoff alone:
+          // an output limit proposes nothing that could have been executed or
+          // aimed at private state.
           if (prepared.violationPath && (await pathExists(prepared.violationPath))) {
             errorCategory = "mcp_execution";
             mapper.fail(
@@ -422,19 +504,23 @@ export function createClaudeStream(
             mapper.fail(
               await failureAfterCleanup("Claude Code proposed a Pi tool call against provider-private transport state"),
             );
-          } else if (mapper.isTerminal) {
-            await cleanupPrepared();
-          } else if (!isExpectedToolHandoffExit(result)) {
-            errorCategory = "process_exit";
-            mapper.fail(
-              await failureAfterCleanup(
-                `Claude Code tool handoff exited unexpectedly (code ${String(result.code)}, signal ${String(result.signal)})`,
-              ),
-            );
           } else {
-            await cleanupPrepared();
-            if (mapper.completeToolUse()) metrics.lastPhase = "completed";
+            await settleHandoff("tool handoff", isExpectedToolHandoffExit(result), () => settling.completeToolUse());
           }
+        } else if (lengthStop) {
+          // Claude Code can finish the continuation turn it starts after an output
+          // limit and exit cleanly before the background termination lands. The
+          // response Pi asked for is complete and already mapped by then, so
+          // publish it rather than failing a turn that succeeded. completeLength()
+          // still requires the max_tokens stop, so this widens nothing. In that
+          // race the result record's usage covers the continuation turn too, which
+          // is left as reported rather than corrected.
+          const finishedBeforeTermination = mapper.hasSuccessfulResult && result.code === 0 && result.signal === null;
+          await settleHandoff(
+            "output limit handoff",
+            isExpectedToolHandoffExit(result) || finishedBeforeTermination,
+            () => settling.completeLength(),
+          );
         } else if (mapper.hasSuccessfulResult) {
           if (result.code !== 0 || result.signal !== null) {
             errorCategory ??= "process_exit";
@@ -448,10 +534,11 @@ export function createClaudeStream(
             if (mapper.completeResult()) metrics.lastPhase = "completed";
           }
         } else if (!mapper.isTerminal) {
-          errorCategory ??= mapper.rateLimitFailure ? "rate_limit" : "process_exit";
+          errorCategory ??= mapper.deferredFailure ? "tool_arguments" : mapper.rateLimitFailure ? "rate_limit" : "process_exit";
           mapper.fail(
             await failureAfterCleanup(
-              mapper.rateLimitFailure ??
+              mapper.deferredFailure ??
+                mapper.rateLimitFailure ??
                 `Claude Code exited before a terminal event (code ${String(result.code)}, signal ${String(result.signal)})${stderrDetail()}`,
             ),
           );
@@ -523,7 +610,9 @@ export function isExpectedToolHandoffExit(
  * before anything is prepared or launched, because substituting any other
  * directory would bring that contradiction back.
  */
-async function requireWorkingDirectory(directory: string | undefined): Promise<string> {
+async function requireWorkingDirectory(session: ResolvedSession | { error: string } | undefined): Promise<string> {
+  if (session && "error" in session) throw new ClaudeCodeError("working_directory", session.error);
+  const directory = session?.cwd;
   if (!directory) {
     throw new ClaudeCodeError(
       "working_directory",
@@ -564,8 +653,8 @@ function timeoutSetting(name: string, fallback: number): number {
   const raw = process.env[name]?.trim();
   if (!raw) return fallback;
   const value = Number(raw);
-  if (!Number.isSafeInteger(value) || value <= 0) {
-    throw new ClaudeCodeError("timeout_config", `${name} must be a positive integer number of milliseconds`);
+  if (!Number.isSafeInteger(value) || value <= 0 || value > 2_147_483_647) {
+    throw new ClaudeCodeError("timeout_config", `${name} must be a positive integer number of milliseconds no greater than 2147483647`);
   }
   return value;
 }
@@ -785,26 +874,12 @@ function containsPrivateTransportPath(value: unknown, directory: string): boolea
   return Object.values(value as Record<string, unknown>).some((item) => containsPrivateTransportPath(item, directory));
 }
 
-/**
- * Pi's transcript carries the system prompt and the tool declarations in its
- * system messages, and can change either mid-conversation. Claude Code takes
- * the prompt outside the message list, through `--system-prompt-file`, and its
- * transport has no way to express a later change, so every system message is
- * replayed into one effective prompt and tool set before the request is built.
- * That is exactly what Pi asks a transport without mid-conversation system
- * messages to do, and it keeps this provider's logical payload — the shape
- * `before_provider_request` sees and replaces — unchanged.
- */
-function logicalPayload(context: TranscriptContext): LogicalProviderPayload {
-  const collapsed = collapseSystemMessages(context);
-  return {
-    systemPrompt: getCurrentSystemPrompt(collapsed.messages),
-    messages: withoutInitialSystemMessage(collapsed.messages),
-    tools: getCurrentTools(collapsed.messages),
+async function applyPayloadHook(model: Model<Api>, context: Context, options?: SimpleStreamOptions): Promise<Context> {
+  const logical: LogicalProviderPayload = {
+    systemPrompt: context.systemPrompt,
+    messages: context.messages,
+    tools: context.tools,
   };
-}
-
-async function applyPayloadHook(model: Model<Api>, logical: LogicalProviderPayload, options?: SimpleStreamOptions): Promise<Context> {
   // Pi supplies this callback even when no extension handler replaces the
   // payload. Only the top-level shape is checked here, because the system-prompt
   // budget reads it before preparation; prepareRequest owns every per-message,

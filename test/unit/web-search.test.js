@@ -147,6 +147,48 @@ process.stdout.write(JSON.stringify({type:"result",is_error:false,result:"must n
     }
 });
 
+test("web search retains private state when tree cleanup fails after leader exit", { skip: process.platform === "win32", timeout: 5000 }, async () => {
+    const root = await mkdtemp(join(tmpdir(), "search-exited-leader-"));
+    const originalTmpdir = process.env.TMPDIR;
+    process.env.TMPDIR = root;
+    const fake = await fakeSearch(`
+const descendant = require("node:child_process").spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], {stdio:"ignore"});
+descendant.unref();
+process.stdout.write(JSON.stringify(${JSON.stringify(searchInit)}) + "\\n");
+process.stdout.write(JSON.stringify({type:"result",is_error:false,result:"must not succeed"}) + "\\n");`);
+    let child;
+    let directory;
+    try {
+        await assert.rejects(searchWithClaude({ executable: fake.executable, version: "test", subscriptionType: "pro" }, { query: "query" }, {
+            supervise: (running, options) => {
+                child = running;
+                return superviseProcess(running, { ...options, terminate: async () => {
+                    assert.equal(running.exitCode, 0);
+                    assert.doesNotThrow(() => process.kill(-running.pid, 0));
+                    throw new Error("synthetic surviving-group failure");
+                } });
+            },
+        }), /synthetic surviving-group failure.*runtime state was retained/);
+        const metrics = getLastSearchMetrics();
+        assert.equal(metrics.errorCategory, "process_cleanup");
+        assert.equal(metrics.cleanupComplete, false);
+        for (const name of await readdir(root)) {
+            if (!name.startsWith("pi-claude-code-provider-search-")) continue;
+            const path = join(root, name);
+            try {
+                const marker = JSON.parse(await readFile(join(path, ".pi-claude-code-provider-runtime.json"), "utf8"));
+                if (marker.childPid === child.pid) directory = path;
+            } catch { /* Not this request's marker. */ }
+        }
+        assert.ok(directory);
+        await access(join(directory, "search-request.json"));
+    } finally {
+        if (child) await terminateProcessGroup(child);
+        if (originalTmpdir === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = originalTmpdir;
+        await rm(root, { recursive: true, force: true });
+    }
+});
+
 test("web search rejects promptly and retains marked state when process death is unknown", { skip: process.platform === "win32" }, async () => {
     const root = await mkdtemp(join(tmpdir(), "search-unknown-liveness-"));
     const originalTmpdir = process.env.TMPDIR;

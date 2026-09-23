@@ -45,7 +45,7 @@ async function withProviderStream(reply, run) {
   const server = await startLocalModelServer(reply);
   try {
     const executable = await createLocalClaudeExecutable(directory, { baseUrl: server.baseUrl, model: "local-test-model" });
-    const streamFn = createClaudeStream({ executable, version: "2.1.270", subscriptionType: "pro" }, { workingDirectory: () => tmpdir() });
+    const streamFn = createClaudeStream({ executable, version: "2.1.270", subscriptionType: "pro" }, { resolveSession: () => ({ cwd: tmpdir() }) });
     await run({ streamFn, server });
   } finally {
     await server.close();

@@ -2,7 +2,7 @@ import { constants } from "node:fs";
 import { accessSync, closeSync, openSync, readFileSync, readSync, realpathSync } from "node:fs";
 import { delimiter, dirname, join, parse } from "node:path";
 
-export function findOnPath(name) {
+function findOnPath(name) {
   const extensions = process.platform === "win32"
     ? ["", ...(process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").map((value) => value.toLowerCase())]
     : [""];
@@ -208,11 +208,12 @@ export function describePiLaunch() {
   return `${isCompiledPi(override) ? "standalone" : "npm-hosted"} Pi at ${override}`;
 }
 
-export function packageEntry(packageRoot, condition) {
+export function packageEntry(packageRoot, condition, subpath = ".") {
   const manifest = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8"));
-  const entry = manifest.exports?.["."]?.[condition] ?? (condition === "import" ? manifest.module : manifest.types);
+  const fallback = subpath === "." ? (condition === "import" ? manifest.module : manifest.types) : undefined;
+  const entry = manifest.exports?.[subpath]?.[condition] ?? fallback;
   if (typeof entry !== "string") {
-    throw new Error(`Cannot resolve the ${condition} entry for ${manifest.name} at ${packageRoot}`);
+    throw new Error(`Cannot resolve the ${condition} entry for ${manifest.name}${subpath === "." ? "" : subpath.slice(1)} at ${packageRoot}`);
   }
   return join(packageRoot, entry);
 }

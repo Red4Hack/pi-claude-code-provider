@@ -1,7 +1,7 @@
 import { StringDecoder } from "node:string_decoder";
 import { ClaudeCodeError } from "./errors.ts";
 
-export const DEFAULT_MAX_RECORD_BYTES = 8 * 1024 * 1024;
+const DEFAULT_MAX_RECORD_BYTES = 8 * 1024 * 1024;
 
 /** Strict JSONL framing: LF only, with one optional CR before LF. */
 export class JsonlParser {

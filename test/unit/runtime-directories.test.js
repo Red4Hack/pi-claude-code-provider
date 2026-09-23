@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { access, lstat, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import test from "node:test";
 import {
   cleanupStaleRuntimeDirectories,
@@ -92,7 +92,7 @@ test("leaves unowned, unmarked, diagnostic, symlinked, and out-of-budget candida
       temporaryRoot: root,
       currentUid,
       now,
-      maxCandidates: 0,
+      maxDeletionAttempts: 0,
       processAlive: () => false,
     }), { removed: 0, failures: 0, reaped: 0 });
     await Promise.all([valid, unmarked, malformed, diagnostic, outside, linked].map((directory) => access(directory)));
@@ -208,4 +208,74 @@ test("reaping is bounded per pass so Pi startup cannot stall behind it", async (
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("drains stale images beyond the deletion budget without counting retained entries", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-runtime-budget-test-"));
+  const now = Date.now();
+  try {
+    const images = [];
+    for (let i = 0; i < 4; i++) images.push(await createRuntimeDirectory("provider_image_store", { temporaryRoot: root, ownerPid: 601, now: now - 2 * HOUR }));
+    images.sort();
+    const markerPath = join(images[0], ".pi-claude-code-provider-runtime.json");
+    const marker = JSON.parse(await readFile(markerPath, "utf8"));
+    await writeFile(markerPath, JSON.stringify({ ...marker, ownerPid: 602 }));
+    const options = { temporaryRoot: root, currentUid: (await lstat(root)).uid, now, maxDeletionAttempts: 1, processAlive: (pid) => pid === 602 };
+    for (let i = 0; i < 3; i++) assert.deepEqual(await cleanupStaleRuntimeDirectories(options), { removed: 1, failures: 0, reaped: 0 });
+    assert.deepEqual(await readdir(root), [basename(images[0])]);
+    assert.deepEqual(await cleanupStaleRuntimeDirectories(options), { removed: 0, failures: 0, reaped: 0 });
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("a surviving group beyond the deletion budget protects its request and images", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-runtime-group-test-"));
+  const now = Date.now();
+  try {
+    const images = await createRuntimeDirectory("provider_image_store", { temporaryRoot: root, ownerPid: 701, now: now - 2 * HOUR });
+    const request = await createRuntimeDirectory("provider_request", { temporaryRoot: root, ownerPid: 701, now: now - 2 * HOUR });
+    await recordRuntimeChild(request, 702);
+    const options = { temporaryRoot: root, currentUid: (await lstat(root)).uid, now, maxDeletionAttempts: 1 };
+    assert.deepEqual(await cleanupStaleRuntimeDirectories({ ...options, processAlive: (pid) => pid === -702 }), { removed: 0, failures: 0, reaped: 0 });
+    await Promise.all([images, request].map((path) => access(path)));
+    for (let i = 0; i < 2; i++) assert.deepEqual(await cleanupStaleRuntimeDirectories({ ...options, processAlive: () => false }), { removed: 1, failures: 0, reaped: 0 });
+    assert.deepEqual(await readdir(root), []);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("failed deletions consume the budget and incomplete ownership inspection retains images", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-runtime-failure-test-"));
+  const now = Date.now();
+  try {
+    const images = await createRuntimeDirectory("provider_image_store", { temporaryRoot: root, ownerPid: 801, now: now - 2 * HOUR });
+    const request = await createRuntimeDirectory("provider_request", { temporaryRoot: root, ownerPid: 801, now: now - 2 * HOUR });
+    const options = { temporaryRoot: root, currentUid: (await lstat(root)).uid, now, processAlive: () => false };
+    let attempts = 0;
+    assert.deepEqual(await cleanupStaleRuntimeDirectories({ ...options, maxDeletionAttempts: 1, removeDirectory: async () => { attempts++; throw new Error("synthetic removal failure"); } }), { removed: 0, failures: 1, reaped: 0 });
+    assert.equal(attempts, 1);
+    assert.deepEqual(await cleanupStaleRuntimeDirectories({ ...options, inspectDirectory: async (path) => {
+      if (basename(path) === basename(request)) throw new Error("synthetic inspection failure");
+      return lstat(path);
+    } }), { removed: 0, failures: 1, reaped: 0 });
+    await Promise.all([images, request].map((path) => access(path)));
+    assert.deepEqual(await cleanupStaleRuntimeDirectories(options), { removed: 2, failures: 0, reaped: 0 });
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("permission-denied group probes retain state until absence is established", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "pi-runtime-probe-test-"));
+  const now = Date.now();
+  try {
+    await createRuntimeDirectory("provider_image_store", { temporaryRoot: root, ownerPid: 901, now: now - 2 * HOUR });
+    const request = await createRuntimeDirectory("provider_request", { temporaryRoot: root, ownerPid: 901, now: now - 2 * HOUR });
+    await recordRuntimeChild(request, 902);
+    const options = { temporaryRoot: root, currentUid: (await lstat(root)).uid, now };
+    let groupExists = true;
+    t.mock.method(process, "kill", (pid, signal) => {
+      assert.equal(signal, 0);
+      throw Object.assign(new Error("synthetic probe"), { code: pid === -902 && groupExists ? "EPERM" : "ESRCH" });
+    });
+    assert.deepEqual(await cleanupStaleRuntimeDirectories(options), { removed: 0, failures: 0, reaped: 0 });
+    groupExists = false;
+    assert.deepEqual(await cleanupStaleRuntimeDirectories(options), { removed: 2, failures: 0, reaped: 0 });
+  } finally { t.mock.restoreAll(); await rm(root, { recursive: true, force: true }); }
 });

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { EXPECTED_MODEL_FAMILIES, MINIMUM_VERSIONS, VERIFIED_VERSIONS, platformStatus, startupPlatformWarning, versionStatus } from "../../src/compatibility.ts";
+import { EXPECTED_MODEL_FAMILIES, VERIFIED_VERSIONS, platformStatus, startupPlatformWarning, versionStatus } from "../../src/compatibility.ts";
 
 test("verified versions report verified status without a warning", () => {
   const status = versionStatus("Pi", VERIFIED_VERSIONS.pi, VERIFIED_VERSIONS.pi);

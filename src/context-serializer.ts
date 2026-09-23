@@ -8,12 +8,12 @@ import { createRuntimeDirectory } from "./runtime-directories.ts";
 import type { ImageStoreLease } from "./session-image-store.ts";
 import type { PreparedRequest } from "./types.ts";
 
-export const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
-export const MAX_TOTAL_IMAGE_BYTES = 100 * 1024 * 1024;
-export const MAX_IMAGES = 20;
-export const MAX_TOOLS = 256;
-export const MAX_CATALOG_BYTES = 2 * 1024 * 1024;
-export const MAX_TRANSCRIPT_BYTES = 32 * 1024 * 1024;
+const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+const MAX_TOTAL_IMAGE_BYTES = 100 * 1024 * 1024;
+const MAX_IMAGES = 20;
+const MAX_TOOLS = 256;
+const MAX_CATALOG_BYTES = 2 * 1024 * 1024;
+const MAX_TRANSCRIPT_BYTES = 32 * 1024 * 1024;
 
 export interface RequestPreparationLimits {
   imageBytes: number;
@@ -24,7 +24,7 @@ export interface RequestPreparationLimits {
   transcriptBytes: number;
 }
 
-export const DEFAULT_REQUEST_PREPARATION_LIMITS: RequestPreparationLimits = Object.freeze({
+const DEFAULT_REQUEST_PREPARATION_LIMITS: RequestPreparationLimits = Object.freeze({
   imageBytes: MAX_IMAGE_BYTES,
   totalImageBytes: MAX_TOTAL_IMAGE_BYTES,
   images: MAX_IMAGES,
@@ -222,12 +222,12 @@ export async function prepareRequestWithLimits(
             const digest = createHash("sha256").update(validated.bytes).digest("hex");
             const name = `image-${digest}.${validated.extension}`;
             if (!writtenImages.has(name)) {
-              // Claude Code's quoted @-reference cannot contain a double quote.
               imageBytes += validated.bytes.length;
               if (imageBytes > limits.totalImageBytes) {
                 throw new ClaudeCodeError("image_total_size", `Aggregate image size exceeds ${limits.totalImageBytes} bytes`);
               }
               const path = imageStore ? await imageStore.put(name, validated.bytes) : join(directory, name);
+              // Claude Code's quoted @-reference cannot contain a double quote.
               if (path.includes('"')) throw new ClaudeCodeError("image_path", `Images cannot be attached from a temporary directory containing a double quote: ${path}; choose a temporary directory without one (TMPDIR, or TEMP on Windows)`);
               if (!imageStore) await writeFile(path, validated.bytes, { mode: 0o600, flag: "wx" });
               writtenImages.add(name);
@@ -324,6 +324,7 @@ export async function prepareRequestWithLimits(
       toolNames: names,
       transcriptBytes,
       catalogBytes,
+      imageCount,
       imageBytes,
     };
   } catch (error) {

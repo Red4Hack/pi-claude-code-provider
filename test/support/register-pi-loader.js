@@ -9,6 +9,7 @@ register(new URL("./pi-loader-hooks.js", import.meta.url), {
     modules: {
       "@earendil-works/pi-coding-agent": pathToFileURL(packageEntry(packages.codingAgent, "import")).href,
       "@earendil-works/pi-ai": pathToFileURL(packageEntry(packages.piAi, "import")).href,
+      "@earendil-works/pi-ai/compat": pathToFileURL(packageEntry(packages.piAi, "import", "./compat")).href,
       typebox: pathToFileURL(packageEntry(packages.typebox, "import")).href,
     },
   },
