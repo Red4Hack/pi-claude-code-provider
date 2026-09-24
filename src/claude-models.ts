@@ -13,8 +13,9 @@ import type { ClaudeInstallation } from "./types.ts";
  *
  * It is diagnostic only. Nothing outside the doctor may read this, and it must
  * never influence routing: the serving path stays alias-only, which is what
- * makes a wrong answer here harmless. Every failure mode degrades to
- * "unavailable" rather than reporting a version it is not sure of.
+ * makes a wrong answer here harmless. Every failure mode leaves the alias
+ * out, which the doctor reports as "undetermined", rather than reporting a
+ * version it is not sure of.
  */
 export const MODEL_ALIASES = ["sonnet", "fable", "opus", "haiku"] as const;
 export type ModelAlias = (typeof MODEL_ALIASES)[number];
@@ -86,9 +87,10 @@ async function scan(path: string, timeoutMs: number): Promise<ModelAliasVersions
   const versions: ModelAliasVersions = {};
   for (const alias of MODEL_ALIASES) {
     const values = found.get(alias);
-    // Every version tested yielded exactly one value per alias. More than one
-    // means the shape changed, and guessing would report a wrong version
-    // confidently, which is worse than reporting nothing.
+    // Several tables can name an alias: 2.1.278 embeds two Haiku values and
+    // 2.1.280 two Opus values, and the served one is not always in the same
+    // table. Guessing would report a wrong version confidently, which is worse
+    // than reporting nothing.
     if (values?.size === 1) versions[alias] = [...values][0];
   }
   return versions;

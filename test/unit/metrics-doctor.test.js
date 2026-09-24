@@ -143,9 +143,11 @@ test("doctor names the model each alias would be served, or says it cannot", () 
     assert.doesNotMatch(pro, /credits (?:are|enabled and|disabled)/);
     const max = formatDoctorSummary({ ...base, installation: { ...base.installation, subscriptionType: "max" }, modelVersions: versions });
     assert.doesNotMatch(max, /requires usage credits/);
-    // A missing alias is reported as unavailable rather than omitted silently.
-    assert.match(formatDoctorSummary({ ...base, modelVersions: { sonnet: "claude-sonnet-5" } }), /sonnet claude-sonnet-5, fable unavailable, opus unavailable, haiku unavailable/);
-    assert.match(formatDoctorSummary({ ...base, modelVersions: {} }), /sonnet unavailable/);
+    // An alias the scanner could not identify is reported as undetermined rather
+    // than omitted silently, and never as unavailable: the scan is not a runtime check.
+    assert.match(formatDoctorSummary({ ...base, modelVersions: { sonnet: "claude-sonnet-5" } }), /sonnet claude-sonnet-5, fable undetermined, opus undetermined, haiku undetermined/);
+    assert.match(formatDoctorSummary({ ...base, modelVersions: {} }), /sonnet undetermined/);
+    assert.doesNotMatch(formatDoctorSummary({ ...base, modelVersions: {} }), /unavailable/);
 });
 
 test("doctor summary handles absent, successful, and failed request diagnostics", () => {

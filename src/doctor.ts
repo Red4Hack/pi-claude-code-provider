@@ -244,7 +244,7 @@ function formatServedModels(input: DoctorSummaryInput): string {
   if (advertised.length === 0) return "";
   const entries = advertised.map((alias) => {
     const model = versions[alias];
-    if (model === undefined) return `${alias} unavailable`;
+    if (model === undefined) return `${alias} undetermined`;
     const caveat = alias === "fable" && input.installation.subscriptionType === "pro"
       ? " (Pro: requires usage credits enabled)"
       : "";
