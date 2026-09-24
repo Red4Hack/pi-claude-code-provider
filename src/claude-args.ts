@@ -8,7 +8,14 @@ import type { PreparedRequest } from "./types.ts";
 // and --safe-mode would disable the proposal MCP server.
 // Claude Code otherwise appends a changing <total_tokens> reminder that breaks
 // append-only cache reuse across this provider's fresh print-mode processes.
-const SETTINGS = JSON.stringify({ disableAllHooks: true, autoMemoryEnabled: false, totalTokensReminder: "off" });
+// Claude Code 2.1.281 ships built-in plugins that load despite empty setting
+// sources; agents-md would read the project's AGENTS.md into the prompt.
+const SETTINGS = JSON.stringify({
+  disableAllHooks: true,
+  autoMemoryEnabled: false,
+  totalTokensReminder: "off",
+  enabledPlugins: { "agents-md@builtin": false, "telemetry@builtin": false },
+});
 export const EMPTY_MCP = JSON.stringify({ mcpServers: {} });
 export const BRIDGE_PATH = fileURLToPath(new URL("../bridge/mcp-proposal-server.js", import.meta.url));
 

@@ -167,6 +167,10 @@ export class ClaudeEventMapper {
       this.validateInit(record);
       return;
     }
+    // Claude Code 2.1.281 announces its command list (system/commands_changed) ahead
+    // of init. Non-init system records carry nothing this mapper publishes, so one
+    // arriving early is skipped rather than treated as protocol drift.
+    if (!this.initialized && record.type === "system") return;
     if (!this.initialized) throw new ClaudeCodeError("protocol_order", "Claude emitted a record before initialization");
     if (!this.responseStarted) {
       throw new ClaudeCodeError("protocol_order", "Claude emitted a response record before Pi response observers completed");

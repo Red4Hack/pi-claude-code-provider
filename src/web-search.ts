@@ -267,6 +267,9 @@ class SearchProtocol {
       this.onPhase?.("initialized");
       return;
     }
+    // Claude Code 2.1.281 emits system/commands_changed ahead of init; non-init
+    // system records are ignored after init too.
+    if (!this.initialized && record.type === "system") return;
     if (!this.initialized) {
       throw new ClaudeCodeError("protocol_order", "Claude web search emitted a record before initialization");
     }

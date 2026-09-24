@@ -140,6 +140,16 @@ test("rejects unexpected initialization tools", () => {
     const mapper = makeMapper(stream, createOutput(model), new Set(), new Map(), () => { });
     assert.throws(() => mapper.accept(initRecord(["Bash"])), /unexpected tool/);
 });
+test("skips system records Claude Code emits before initialization but rejects response records", () => {
+    const stream = createAssistantMessageEventStream();
+    const mapper = makeMapper(stream, createOutput(model), new Set(), new Map(), () => { });
+    mapper.accept({ type: "system", subtype: "commands_changed", commands: [], uuid: "u", session_id: "s" });
+    assert.equal(mapper.isInitialized, false);
+    assert.throws(() => mapper.accept({ type: "stream_event", event: { type: "message_start" } }), /before initialization/);
+    assert.throws(() => mapper.accept({ type: "result", is_error: false, result: "early" }), /before initialization/);
+    mapper.accept(initRecord());
+    assert.equal(mapper.isInitialized, true);
+});
 function init(mapper) {
     mapper.accept(initRecord());
 }
