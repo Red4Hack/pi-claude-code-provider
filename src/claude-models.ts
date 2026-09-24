@@ -3,7 +3,7 @@ import type { ClaudeInstallation } from "./types.ts";
 
 /**
  * Report which concrete model each picker alias would be served, by reading the
- * alias table embedded in the Claude Code executable.
+ * CLI's `aliases` table embedded in the Claude Code executable.
  *
  * This is an undocumented internal, and a deliberate, scoped exception to this
  * project's rule of consuming only published interfaces. It is the only
@@ -21,13 +21,23 @@ export const MODEL_ALIASES = ["sonnet", "fable", "opus", "haiku"] as const;
 export type ModelAlias = (typeof MODEL_ALIASES)[number];
 export type ModelAliasVersions = Partial<Record<ModelAlias, string>>;
 
+// The executable also embeds `provider_alias_targets` tables, the model-selector
+// state of other Claude surfaces. They name different ids for the same aliases
+// (2.1.281's say claude-opus-5 where the CLI serves claude-opus-5-5), so only the
+// literal `aliases:{...}` table is read. Its name does not occur inside
+// `provider_alias_targets`, and minified code that builds an `aliases` object
+// holds expressions rather than quoted ids, so neither can match.
+//
 // Only `default:` can apply here. src/auth.ts rejects anything that is not
 // firstParty, so reading a per-provider override would report a model this
 // extension can never serve.
+const ALIAS_ENTRY = String.raw`(?:sonnet|opus|haiku|fable):\{default:"[A-Za-z0-9._-]{1,64}"(?:,per_provider:\{[^{}]{0,512}\})?\}`;
+const TABLE_PATTERN = new RegExp(String.raw`\baliases:\{(${ALIAS_ENTRY}(?:,${ALIAS_ENTRY}){0,7})\}`, "g");
 const ALIAS_PATTERN = /\b(sonnet|opus|haiku|fable):\{default:"([A-Za-z0-9._-]{1,64})"/g;
 const CHUNK_BYTES = 1024 * 1024;
-// A match cannot span more than this, so carrying it between chunks is enough.
-const OVERLAP_BYTES = 128;
+// Longer than the longest table TABLE_PATTERN can match (eight entries of at most
+// about 620 bytes), so carrying it between chunks is enough.
+const OVERLAP_BYTES = 8 * 1024;
 const SCAN_TIMEOUT_MS = 10_000;
 
 let cache: { key: string; versions: ModelAliasVersions } | undefined;
@@ -69,13 +79,15 @@ async function scan(path: string, timeoutMs: number): Promise<ModelAliasVersions
       // latin1 maps every byte to one character, so offsets stay meaningful in
       // a binary and no byte sequence can decode into a spurious match.
       const text = tail + buffer.subarray(0, bytesRead).toString("latin1");
-      for (const match of text.matchAll(ALIAS_PATTERN)) {
-        const alias = match[1];
-        const model = match[2];
-        if (alias === undefined || model === undefined) continue;
-        const values = found.get(alias) ?? new Set<string>();
-        values.add(model);
-        found.set(alias, values);
+      for (const table of text.matchAll(TABLE_PATTERN)) {
+        for (const match of (table[1] ?? "").matchAll(ALIAS_PATTERN)) {
+          const alias = match[1];
+          const model = match[2];
+          if (alias === undefined || model === undefined) continue;
+          const values = found.get(alias) ?? new Set<string>();
+          values.add(model);
+          found.set(alias, values);
+        }
       }
       tail = text.slice(-OVERLAP_BYTES);
     }
@@ -87,10 +99,9 @@ async function scan(path: string, timeoutMs: number): Promise<ModelAliasVersions
   const versions: ModelAliasVersions = {};
   for (const alias of MODEL_ALIASES) {
     const values = found.get(alias);
-    // Several tables can name an alias: 2.1.278 embeds two Haiku values and
-    // 2.1.280 two Opus values, and the served one is not always in the same
-    // table. Guessing would report a wrong version confidently, which is worse
-    // than reporting nothing.
+    // A second, different value means the table's shape has changed. Guessing
+    // would report a wrong version confidently, which is worse than reporting
+    // nothing.
     if (values?.size === 1) versions[alias] = [...values][0];
   }
   return versions;
