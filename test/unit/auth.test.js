@@ -207,3 +207,28 @@ else process.stdout.write(${JSON.stringify(CLAUDE_HEADLESS_HELP)});
         await rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
 });
+
+test("a missing Claude executable names PATH and the override instead of reading as not runnable", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-claude-code-provider-auth-missing-"));
+    const original = { path: process.env.PATH, override: process.env.PI_CLAUDE_CODE_PROVIDER_PATH };
+    process.env.PATH = directory;
+    delete process.env.PI_CLAUDE_CODE_PROVIDER_PATH;
+    try {
+        await assert.rejects(inspectClaudeInstallation(), (error) => {
+            assert.equal(error.code, "executable_missing");
+            assert.match(error.message, /claude was not found on PATH; install it or set PI_CLAUDE_CODE_PROVIDER_PATH/);
+            return true;
+        });
+        process.env.PI_CLAUDE_CODE_PROVIDER_PATH = join(directory, "absent-claude");
+        await assert.rejects(inspectClaudeInstallation(), (error) => {
+            assert.equal(error.code, "executable_missing");
+            assert.match(error.message, /Claude Code executable is not runnable: .*absent-claude$/);
+            return true;
+        });
+    }
+    finally {
+        if (original.path === undefined) delete process.env.PATH; else process.env.PATH = original.path;
+        if (original.override === undefined) delete process.env.PI_CLAUDE_CODE_PROVIDER_PATH; else process.env.PI_CLAUDE_CODE_PROVIDER_PATH = original.override;
+        await rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    }
+});

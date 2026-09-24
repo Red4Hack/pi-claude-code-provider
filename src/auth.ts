@@ -61,16 +61,7 @@ export function parseAuthStatus(stdout: string): ClaudeSubscriptionType {
 }
 
 export async function inspectClaudeInstallation(): Promise<ClaudeInstallation> {
-  const configuredExecutable = claudeExecutable();
-  let executable: string;
-  try {
-    executable = await resolveExecutable(configuredExecutable, "Claude Code", "executable_missing");
-  } catch {
-    throw new ClaudeCodeError(
-      "executable_missing",
-      `Claude Code executable is not runnable: ${configuredExecutable}`,
-    );
-  }
+  const executable = await resolveExecutable(claudeExecutable());
 
   try {
     await validateProcessTerminationCapability();
@@ -137,13 +128,13 @@ function hasCliOption(helpOutput: string, option: string): boolean {
   return new RegExp(`(?:^|[\\s,])${escaped}(?=$|[\\s,=<\\[])`, "m").test(helpOutput);
 }
 
-async function resolveExecutable(configured: string, label: string, code: string): Promise<string> {
+async function resolveExecutable(configured: string): Promise<string> {
   if (isAbsolute(configured) || configured.includes("/") || configured.includes("\\")) {
     try {
       await access(configured, process.platform === "win32" ? constants.F_OK : constants.X_OK);
       return await realpath(configured);
     } catch {
-      throw new ClaudeCodeError(code, `${label} executable is not runnable: ${configured}`);
+      throw new ClaudeCodeError("executable_missing", `Claude Code executable is not runnable: ${configured}`);
     }
   }
   const suffixes = process.platform === "win32" ? windowsExecutableSuffixes() : [""];
@@ -159,7 +150,10 @@ async function resolveExecutable(configured: string, label: string, code: string
       }
     }
   }
-  throw new ClaudeCodeError(code, `${label} is required but ${configured} was not found on PATH`);
+  throw new ClaudeCodeError(
+    "executable_missing",
+    `Claude Code is required but ${configured} was not found on PATH; install it or set PI_CLAUDE_CODE_PROVIDER_PATH to its executable`,
+  );
 }
 
 function windowsExecutableSuffixes(): string[] {

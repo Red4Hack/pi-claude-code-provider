@@ -12,6 +12,7 @@
 
 - Every request and web search no longer fails on Claude Code 2.1.281 with "Claude emitted a record before initialization". The provider now disables Claude Code's new built-in `agents-md` plugin.
 - The doctor reports a model alias it cannot identify as `undetermined` instead of `unavailable`. Opus and Haiku no longer appear unavailable while working normally.
+- When `claude` is not on PATH, the provider now says so and names `PI_CLAUDE_CODE_PROVIDER_PATH`, instead of reporting the executable as not runnable.
 - Tool and output-limit handoffs accept the provider's own POSIX termination signals after validation and cleanup, including SIGKILL escalation, instead of failing a completed response. Unexpected signal exits still fail.
 
 ## [0.4.0] - 2026-09-20
