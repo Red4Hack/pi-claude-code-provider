@@ -51,8 +51,8 @@ Two contracts are easy to break silently:
 
 | Component | Verified baseline |
 | --- | --- |
-| Pi | 0.86.1, npm distribution; standalone tar.gz bridge live-verified on Linux x64 |
-| Claude Code | 2.1.278 |
+| Pi | 0.87.1, npm distribution; standalone tar.gz bridge live-verified on Linux x64 |
+| Claude Code | 2.1.281 |
 | Node.js | 24.16.0 on WSL2, Ubuntu CI, and Apple Silicon macOS CI; 22.23.1 on Ubuntu CI and Windows CI |
 | Platform | WSL2 Ubuntu/Linux x64; native Windows x64; macOS (deterministic CI) |
 
@@ -80,7 +80,7 @@ Compare the installed CLI's help with the pinned capture when moving the verifie
 
 `npm run capture:claude-stream-recovery` regenerates them, using **no quota**. It runs the CLI against a loopback server that scripts each attempt's response, with a dummy token, a temporary `HOME`, and the provider's own `providerArgs` and `buildClaudeEnvironment`. Pass scenario names to capture a subset, `--claude` to select a build, and `--print` to inspect without writing. That dummy login resolves no subscription, so anything the CLI derives from account state carries its unauthenticated default -- most visibly `contextWindow` in each record's `modelUsage`, which reads 200000 for every alias. These files are fixtures for record *shape*; they are not evidence about the window a real account is served, and `src/catalog.ts` records where that evidence does come from. Each file is named for the version in its own init record, so a capture on a newer CLI lands beside the pinned set instead of overwriting it; read the diff, then re-pin `CAPTURED_STREAM_RECOVERY_VERSION` and delete the version the tests no longer load.
 
-`claude-<version>-stream-live-cut-late.jsonl` is the exception: it came from a real API stream interrupted by a local forwarding proxy, so it cost quota and this command cannot reproduce it. The nine scripted scenarios were re-captured on Claude Code 2.1.276 and produce the same record shapes as the pinned 2.1.274 set.
+`claude-<version>-stream-live-cut-late.jsonl` is the exception: it came from a real API stream interrupted by a local forwarding proxy, so it cost quota and this command cannot reproduce it. It keeps its own `CAPTURED_LIVE_CUT_VERSION` instead of following the scripted set; keep that file when deleting a superseded version.
 
 ## Validation
 

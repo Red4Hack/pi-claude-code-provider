@@ -9,7 +9,7 @@ This project was developed using frontier AI models under human guidance. Almost
 ## Requirements
 
 - [Pi](https://pi.dev) 0.86.1 or newer, installed from npm or a standalone build
-- Claude Code 2.1.270 or newer
+- Claude Code 2.1.281 or newer
 - Claude Code logged in to an eligible Pro, Max, Team, or Enterprise claude.ai subscription
 - Node.js 22.19 or newer only when Pi itself is installed from npm; the standalone build needs no separate Node installation
 

@@ -2,8 +2,15 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking.** Claude Code 2.1.281 is now the minimum supported version; update Claude Code (`claude update`) before or with this package. Older versions can still load, but are unsupported and flagged by the doctor.
+- Pi 0.87.1 and Claude Code 2.1.281 are now the validated baseline; the minimum supported Pi version remains 0.86.1.
+
 ### Fixed
 
+- Every request and web search no longer fails on Claude Code 2.1.281 with "Claude emitted a record before initialization". The provider now disables Claude Code's new built-in `agents-md` plugin.
+- The doctor reports a model alias it cannot identify as `undetermined` instead of `unavailable`. Opus and Haiku no longer appear unavailable while working normally.
 - Tool and output-limit handoffs accept the provider's own POSIX termination signals after validation and cleanup, including SIGKILL escalation, instead of failing a completed response. Unexpected signal exits still fail.
 
 ## [0.4.0] - 2026-09-20

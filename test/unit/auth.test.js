@@ -137,8 +137,8 @@ test("matches option aliases and value notation", () => {
 test("compares versions numerically rather than lexically", () => {
     // The failure this guards is real: "2.1.9" sorts above "2.1.241" as strings.
     assert.equal(meetsMinimumVersion("2.1.9", "2.1.241"), false);
-    assert.equal(meetsMinimumVersion("2.1.270", MINIMUM_VERSIONS.claudeCode), true);
-    assert.equal(meetsMinimumVersion("2.1.269", MINIMUM_VERSIONS.claudeCode), false);
+    assert.equal(meetsMinimumVersion("2.1.281", MINIMUM_VERSIONS.claudeCode), true);
+    assert.equal(meetsMinimumVersion("2.1.280", MINIMUM_VERSIONS.claudeCode), false);
     assert.equal(meetsMinimumVersion("2.2.0", MINIMUM_VERSIONS.claudeCode), true);
     assert.equal(meetsMinimumVersion("3.0.0", MINIMUM_VERSIONS.claudeCode), true);
     assert.equal(meetsMinimumVersion("0.86.1", MINIMUM_VERSIONS.pi), true);
