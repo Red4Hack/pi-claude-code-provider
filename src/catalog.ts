@@ -32,7 +32,8 @@ function providerModel(
 /**
  * Every alias has the same context window on every subscription tier: Claude
  * Code serves Sonnet 5, Fable 5.1, and Opus 5.5 with their native 1M window
- * on Pro as well as Max, Team, and Enterprise, without usage credits. Each
+ * on Pro as well as Max, Team, and Enterprise. The window needs no usage
+ * credits, though Fable itself does on Pro. Each
  * maxTokens is Claude Code's own default output cap for the model the alias
  * serves. The paid model matrix asserts both against what Claude Code reports
  * for a real login; see DEVELOPING.md for the baseline the gate runs against.

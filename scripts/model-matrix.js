@@ -18,7 +18,7 @@ const efforts = ["low", "medium", "high", "xhigh", "max"];
 const effortModels = ["sonnet", "opus"];
 const advertisedModels = providerModels.map((model) => model.id);
 assert.deepEqual(Object.keys(EXPECTED_MODEL_FAMILIES), advertisedModels, "compatibility targets must match advertised models");
-// Fable 5 availability and included quota vary by subscription tier. It is
+// Fable availability and included quota vary by subscription tier. It is
 // intentionally opt-in and excluded from the blocking gate; the standalone
 // case remains selectable for accounts with Fable access.
 const ungatedModels = new Set(["fable"]);

@@ -13,7 +13,9 @@ const ELIGIBLE_SUBSCRIPTIONS: ReadonlySet<string> = new Set(["pro", "max", "team
 // Every flag here appears in Claude Code's --help, so absence really does mean
 // the launch would fail. --system-prompt-file is deliberately absent: it is
 // publicly documented but hidden from the help screen, so scraping for it made
-// preflight fail where the real launch succeeds. MINIMUM_VERSIONS covers it.
+// preflight fail where the real launch succeeds. The documented minimum Claude
+// Code version covers it instead; the doctor reports that minimum, but nothing
+// enforces it.
 export const REQUIRED_HEADLESS_FLAGS = [
   "--print",
   "--setting-sources",
