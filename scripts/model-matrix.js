@@ -22,11 +22,13 @@ assert.deepEqual(Object.keys(EXPECTED_MODEL_FAMILIES), advertisedModels, "compat
 // intentionally opt-in and excluded from the blocking gate; the standalone
 // case remains selectable for accounts with Fable access.
 const ungatedModels = new Set(["fable"]);
-const mediumOnlyModels = advertisedModels.filter((model) => !effortModels.includes(model) && model !== "haiku");
+// A model without effort control runs once at "off" and sends Claude Code no effort.
+const noEffortModels = providerModels.filter((model) => !model.reasoning).map((model) => model.id);
+const mediumOnlyModels = advertisedModels.filter((model) => !effortModels.includes(model) && !noEffortModels.includes(model));
 const coreCases = [
     { model: "sonnet", effort: "medium" },
     ...effortModels.flatMap((model) => efforts.map((effort) => ({ model, effort }))).filter(({ model, effort }) => model !== "sonnet" || effort !== "medium"),
-    { model: "haiku", effort: "off" },
+    ...noEffortModels.map((model) => ({ model, effort: "off" })),
     ...mediumOnlyModels.filter((model) => !ungatedModels.has(model)).map((model) => ({ model, effort: "medium" })),
 ];
 const selectableCases = [
@@ -85,7 +87,7 @@ async function runCase(cwd, model, effort) {
     const text = message.content.filter((block) => block.type === "text").map((block) => block.text).join("").trim();
     assert.match(text, /^OK\.?$/, `${model}:${effort} response text`);
     assert.match(message.responseModel, EXPECTED_MODEL_FAMILIES[model], `${model}:${effort} resolved model`);
-    const metrics = await waitForMetrics(metricsBefore.length, model, model === "haiku" ? "default" : effort);
+    const metrics = await waitForMetrics(metricsBefore.length, model, noEffortModels.includes(model) ? "default" : effort);
     const configured = providerModels.find((entry) => entry.id === model);
     assert.equal(metrics.cleanupComplete, true, `${model}:${effort} private-state cleanup`);
     assert.equal(metrics.servedContextWindow, configured.contextWindow, `${model}:${effort} served context window`);

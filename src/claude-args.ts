@@ -99,7 +99,8 @@ export function baseClaudeArgs(): string[] {
 export function providerArgs(
   prepared: PreparedRequest,
   model: string,
-  effort: string,
+  /** Omitted for a model without effort control, which keeps Claude Code's default. */
+  effort: string | undefined,
   options: { transcriptBreakpoint?: boolean; thinkingDisplay?: "summarized" | "omitted" } = {},
 ): { args: string[]; prompt: PromptBlock[] } {
   // Quoted absolute references: Claude runs in Pi's session directory, where a
@@ -147,7 +148,7 @@ export function providerArgs(
     "",
     "--model",
     model,
-    ...(model === "haiku" ? [] : ["--effort", effort]),
+    ...(effort === undefined ? [] : ["--effort", effort]),
     ...(options.thinkingDisplay ? ["--thinking-display", options.thinkingDisplay] : []),
     "--input-format",
     "stream-json",

@@ -112,7 +112,9 @@ export function createClaudeStream(
 
     void (async () => {
       const startedAt = Date.now();
-      const effort = model.id === "haiku" ? "default" : options?.reasoning ?? "medium";
+      // A model without effort control sends none and leaves Claude Code its
+      // default thinking, which metrics record as "default".
+      const effort = model.reasoning ? options?.reasoning ?? "medium" : undefined;
       let prepared: Awaited<ReturnType<typeof prepareRequest>> | undefined;
       let claude: ClaudeProcess | undefined;
       let cwd: string | undefined;
@@ -133,7 +135,7 @@ export function createClaudeStream(
         nodeVersion: process.version,
         claudeVersion: installation.version,
         requestedModel: model.id,
-        effort,
+        effort: effort ?? "default",
         messageCount: requestContext.messages.length,
         toolCount: requestContext.tools?.length ?? 0,
         sessionResolution: resolved?.resolution,
@@ -434,86 +436,21 @@ export function createClaudeStream(
         await running.terminate();
 
         // Phase 4 — validate the exit and private state before publishing success.
-        const stderrDetail = (): string => {
-          const excerpt = running.stderrExcerpt();
-          return excerpt ? `: ${excerpt}` : "";
-        };
-        // Both handoffs settle identically: the provider terminated Claude on
-        // purpose, so an already-terminal mapper only cleans up, an unaccepted exit
-        // fails, and an accepted one publishes after cleanup. Only the accepted
-        // exits, the completion call and the wording differ. Aliased because a
-        // closure does not keep the narrowing this straight-line code has.
-        const settling = mapper;
-        const settleHandoff = async (label: string, exitAccepted: boolean, complete: () => boolean): Promise<void> => {
-          if (settling.isTerminal) {
-            await cleanupPrepared();
-          } else if (!exitAccepted) {
-            errorCategory = "process_exit";
-            settling.fail(
-              await failureAfterCleanup(
-                `Claude Code ${label} exited unexpectedly (code ${String(result.code)}, signal ${String(result.signal)})`,
-              ),
-            );
-          } else {
-            await cleanupPrepared();
-            if (complete()) metrics.lastPhase = "completed";
-          }
-        };
-        if (toolUse) {
-          // These two precede settlement and belong to the tool handoff alone:
-          // an output limit proposes nothing that could have been executed or
-          // aimed at private state.
-          if (prepared.violationPath && (await pathExists(prepared.violationPath))) {
-            errorCategory = "mcp_execution";
-            mapper.fail(
-              await failureAfterCleanup(
-                "Security invariant violated: Claude Code attempted to execute a Pi proposal tool internally",
-              ),
-            );
-          } else if (containsPrivateTransportToolArgument(output, [prepared.directory, ...(prepared.imageStoreDirectory ? [prepared.imageStoreDirectory] : [])])) {
-            errorCategory = "private_transport";
-            mapper.fail(
-              await failureAfterCleanup("Claude Code proposed a Pi tool call against provider-private transport state"),
-            );
-          } else {
-            await settleHandoff("tool handoff", isExpectedToolHandoffExit(result), () => settling.completeToolUse());
-          }
-        } else if (lengthStop) {
-          // Claude Code can finish the continuation turn it starts after an output
-          // limit and exit cleanly before the background termination lands. The
-          // response Pi asked for is complete and already mapped by then, so
-          // publish it rather than failing a turn that succeeded. completeLength()
-          // still requires the length stop, so this widens nothing. In that
-          // race the result record's usage covers the continuation turn too, which
-          // is left as reported rather than corrected.
-          const finishedBeforeTermination = mapper.hasSuccessfulResult && result.code === 0 && result.signal === null;
-          await settleHandoff(
-            "output limit handoff",
-            isExpectedToolHandoffExit(result) || finishedBeforeTermination,
-            () => settling.completeLength(),
-          );
-        } else if (mapper.hasSuccessfulResult) {
-          if (result.code !== 0 || result.signal !== null) {
-            errorCategory ??= "process_exit";
-            mapper.fail(
-              await failureAfterCleanup(
-                `Claude Code exited after a successful result (code ${String(result.code)}, signal ${String(result.signal)})${stderrDetail()}`,
-              ),
-            );
-          } else {
-            await cleanupPrepared();
-            if (mapper.completeResult()) metrics.lastPhase = "completed";
-          }
-        } else if (!mapper.isTerminal) {
-          errorCategory ??= mapper.deferredFailure ? "tool_arguments" : mapper.rateLimitFailure ? "rate_limit" : "process_exit";
-          mapper.fail(
-            await failureAfterCleanup(
-              mapper.deferredFailure ??
-                mapper.rateLimitFailure ??
-                `Claude Code exited before a terminal event (code ${String(result.code)}, signal ${String(result.signal)})${stderrDetail()}`,
-            ),
-          );
+        const outcome = await settleExit({
+          mapper,
+          output,
+          prepared,
+          result,
+          handoff: toolUse ? "tool" : lengthStop ? "length" : undefined,
+          stderrExcerpt: () => running.stderrExcerpt(),
+          cleanup: cleanupPrepared,
+          failureAfterCleanup,
+        });
+        if (outcome.errorCategory) {
+          if (outcome.errorCategory.override) errorCategory = outcome.errorCategory.value;
+          else errorCategory ??= outcome.errorCategory.value;
         }
+        if (outcome.completed) metrics.lastPhase = "completed";
       } catch (caught) {
         const error = vanishedWorkingDirectory(caught, cwd) ?? caught;
         if (error instanceof ProcessTerminationError) errorCategory = "process_cleanup";
@@ -560,6 +497,97 @@ export function createClaudeStream(
 
     return stream;
   };
+}
+
+interface ExitSettlement {
+  mapper: ClaudeEventMapper;
+  output: MutableOutput;
+  prepared: { directory: string; imageStoreDirectory?: string; violationPath?: string };
+  result: ProcessResult;
+  handoff: "tool" | "length" | undefined;
+  stderrExcerpt: () => string;
+  /** Remove private request state; success is published only after it. */
+  cleanup: () => Promise<void>;
+  /** Remove private request state and return the failure with any cleanup failure appended. */
+  failureAfterCleanup: (failure: string) => Promise<string>;
+}
+
+interface ExitOutcome {
+  /** A category that replaces an earlier one when `override`, else only fills an empty one. */
+  errorCategory?: { value: string; override: boolean };
+  completed: boolean;
+}
+
+/**
+ * Settle a Claude process that has exited and been terminated: validate its exit
+ * against what the request expected, clean private state, and publish exactly one
+ * terminal event through the mapper. Success is always published after cleanup.
+ */
+async function settleExit(settlement: ExitSettlement): Promise<ExitOutcome> {
+  const { mapper, output, prepared, result, cleanup, failureAfterCleanup } = settlement;
+  const exit = `code ${String(result.code)}, signal ${String(result.signal)}`;
+  const stderrDetail = (): string => {
+    const excerpt = settlement.stderrExcerpt();
+    return excerpt ? `: ${excerpt}` : "";
+  };
+  const fail = async (value: string, override: boolean, failure: string): Promise<ExitOutcome> => {
+    mapper.fail(await failureAfterCleanup(failure));
+    return { errorCategory: { value, override }, completed: false };
+  };
+  // Both handoffs settle identically: the provider terminated Claude on purpose,
+  // so an already-terminal mapper only cleans up, an unaccepted exit fails, and an
+  // accepted one publishes after cleanup. Only the accepted exits, the completion
+  // call and the wording differ.
+  const settleHandoff = async (label: string, exitAccepted: boolean, complete: () => boolean): Promise<ExitOutcome> => {
+    if (mapper.isTerminal) {
+      await cleanup();
+      return { completed: false };
+    }
+    if (!exitAccepted) return fail("process_exit", true, `Claude Code ${label} exited unexpectedly (${exit})`);
+    await cleanup();
+    return { completed: complete() };
+  };
+  if (settlement.handoff === "tool") {
+    // These two precede settlement and belong to the tool handoff alone: an
+    // output limit proposes nothing that could have been executed or aimed at
+    // private state.
+    if (prepared.violationPath && (await pathExists(prepared.violationPath))) {
+      return fail("mcp_execution", true, "Security invariant violated: Claude Code attempted to execute a Pi proposal tool internally");
+    }
+    if (containsPrivateTransportToolArgument(output, [prepared.directory, ...(prepared.imageStoreDirectory ? [prepared.imageStoreDirectory] : [])])) {
+      return fail("private_transport", true, "Claude Code proposed a Pi tool call against provider-private transport state");
+    }
+    return settleHandoff("tool handoff", isExpectedToolHandoffExit(result), () => mapper.completeToolUse());
+  }
+  if (settlement.handoff === "length") {
+    // Claude Code can finish the continuation turn it starts after an output
+    // limit and exit cleanly before the background termination lands. The
+    // response Pi asked for is complete and already mapped by then, so publish it
+    // rather than failing a turn that succeeded. completeLength() still requires
+    // the length stop, so this widens nothing. In that race the result record's
+    // usage covers the continuation turn too, which is left as reported rather
+    // than corrected.
+    const finishedBeforeTermination = mapper.hasSuccessfulResult && result.code === 0 && result.signal === null;
+    return settleHandoff(
+      "output limit handoff",
+      isExpectedToolHandoffExit(result) || finishedBeforeTermination,
+      () => mapper.completeLength(),
+    );
+  }
+  if (mapper.hasSuccessfulResult) {
+    if (result.code !== 0 || result.signal !== null) {
+      return fail("process_exit", false, `Claude Code exited after a successful result (${exit})${stderrDetail()}`);
+    }
+    await cleanup();
+    return { completed: mapper.completeResult() };
+  }
+  if (mapper.isTerminal) return { completed: false };
+  const category = mapper.deferredFailure ? "tool_arguments" : mapper.rateLimitFailure ? "rate_limit" : "process_exit";
+  return fail(
+    category,
+    false,
+    mapper.deferredFailure ?? mapper.rateLimitFailure ?? `Claude Code exited before a terminal event (${exit})${stderrDetail()}`,
+  );
 }
 
 export function isExpectedToolHandoffExit(
