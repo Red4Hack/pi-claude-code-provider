@@ -6,6 +6,7 @@
 
 - **Breaking.** Claude Code 2.1.281 is now the minimum supported version; update Claude Code (`claude update`) before or with this package. Older versions can still load, but are unsupported and flagged by the doctor.
 - Pi 0.87.1 and Claude Code 2.1.281 are now the validated baseline; the minimum supported Pi version remains 0.86.1.
+- Opus now uses its 1M context window on Pro, as on other plans, and its output limit rises to 128K, matching Claude Opus 5.5 in Claude Code.
 
 ### Fixed
 

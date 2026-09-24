@@ -195,6 +195,9 @@ test("doctor reports a served context window only once it stops matching the con
     assert.match(drifted, /^Context window: sonnet served 200000, configured 1000000; request budget checks use the configured value$/m);
     // A larger served window is still a mismatch worth stating; only equality is silent.
     assert.match(formatDoctorSummary({ ...base, metrics: { ...metrics, requestedModel: "haiku", servedContextWindow: 1000000 } }), /haiku served 1000000, configured 200000/);
+    // Opus is served with its 1M window on Pro, which the fixture's account uses.
+    assert.equal(base.installation.subscriptionType, "pro");
+    assert.doesNotMatch(formatDoctorSummary({ ...base, metrics: { ...metrics, requestedModel: "opus", servedContextWindow: 1000000 } }), /Context window:/);
     // Nothing to compare against is not a finding.
     assert.doesNotMatch(formatDoctorSummary({ ...base, metrics: { ...metrics, servedContextWindow: undefined } }), /Context window:/);
     assert.doesNotMatch(formatDoctorSummary({ ...base, metrics: { ...metrics, requestedModel: "unknown-alias" } }), /Context window:/);

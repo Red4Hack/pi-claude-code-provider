@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { buildClaudeEnvironment } from "./auth.ts";
-import { providerModelsForSubscription } from "./catalog.ts";
+import { providerModels } from "./catalog.ts";
 import { bridgeArgv, bridgeLaunch, formatBridgeArgv } from "./claude-args.ts";
 import { MODEL_ALIASES, type ModelAliasVersions } from "./claude-models.ts";
 import type { VersionStatus } from "./compatibility.ts";
@@ -209,7 +209,7 @@ export function formatDoctorSummary(input: DoctorSummaryInput): string {
 function servedContextWindowNote(input: DoctorSummaryInput, metrics: RequestMetrics): string | undefined {
   const served = metrics.servedContextWindow;
   if (typeof served !== "number" || !Number.isFinite(served) || served <= 0) return undefined;
-  const configured = providerModelsForSubscription(input.installation.subscriptionType)
+  const configured = providerModels()
     .find((model) => model.id === metrics.requestedModel)?.contextWindow;
   if (configured === undefined || configured === served) return undefined;
   return `Context window: ${metrics.requestedModel} served ${served}, configured ${configured}; ` +

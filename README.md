@@ -43,7 +43,7 @@ To select one directly:
 
 From the command line, use `pi --model pi-claude-code-provider/sonnet`.
 
-Sonnet, Fable, and Opus support Pi thinking levels from `low` through `max`. Haiku uses Claude Code's default thinking, even when Pi shows thinking as off. Opus has a 200K context window on Pro and 1M on Max, Team, and Enterprise; this provider keeps Pro at 200K even if Claude Code reports a 1M-capable variant.
+Sonnet, Fable, and Opus support Pi thinking levels from `low` through `max`. Haiku uses Claude Code's default thinking, even when Pi shows thinking as off. Sonnet, Fable, and Opus have a 1M context window on every plan, including Pro; Haiku has 200K.
 
 Fable availability and billing vary by subscription tier; see Anthropic's [Fable plan policy](https://support.claude.com/en/articles/15424964-claude-fable-5-on-your-plan).
 
