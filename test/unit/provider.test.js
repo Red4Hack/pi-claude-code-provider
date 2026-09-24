@@ -1326,6 +1326,21 @@ test("provider retains a caught failure category when private cleanup also fails
         if (privateDirectory) await rm(privateDirectory, { recursive: true, force: true });
     }
 });
+test("provider explains a Claude Code build removed after preflight", { skip: process.platform === "win32" }, async () => {
+    // A native install's updater deletes old builds, and preflight pinned the real path.
+    const fake = await fakeClaude(`process.exit(0);`);
+    await rm(fake.executable);
+    try {
+        const result = await createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, context, { reasoning: "medium" }).result();
+        assert.equal(result.stopReason, "error");
+        assert.match(result.errorMessage ?? "", /Claude Code at .+ no longer exists, probably removed by a Claude Code update; run \/reload/);
+        const metrics = await waitForRequestMetrics((entry) => entry.errorCategory === "executable_missing");
+        assert.equal(metrics.cleanupComplete, true);
+    }
+    finally {
+        await rm(fake.dir, { recursive: true, force: true });
+    }
+});
 test("provider cleans private transport state after an early process failure", async () => {
     const markerDirectory = await mkdtemp(join(tmpdir(), "provider-cleanup-marker-"));
     const marker = join(markerDirectory, "cwd");

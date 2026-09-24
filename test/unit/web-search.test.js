@@ -128,6 +128,20 @@ process.stdout.write(JSON.stringify({type:"result",is_error:false,result:"source
     }
 });
 
+test("web search explains a Claude Code build removed after preflight", { skip: process.platform === "win32" }, async () => {
+    const fake = await fakeSearch(`process.exit(0);`);
+    await rm(fake.executable);
+    try {
+        const installation = { executable: fake.executable, version: "test", subscriptionType: "pro" };
+        await assert.rejects(searchWithClaude(installation, { query: "query" }), /Claude Code at .+ no longer exists, probably removed by a Claude Code update; run \/reload/);
+        const metrics = getLastSearchMetrics();
+        assert.equal(metrics.errorCategory, "executable_missing");
+        assert.equal(metrics.cleanupComplete, true);
+    }
+    finally {
+        await rm(fake.directory, { recursive: true, force: true });
+    }
+});
 test("web search preserves process-group cleanup rejection and removes private state", async () => {
     const successful = await fakeSearch(`
 process.stdout.write(JSON.stringify(${JSON.stringify(searchInit)}) + "\\n");

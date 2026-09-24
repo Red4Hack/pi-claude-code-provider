@@ -343,7 +343,7 @@ export function createClaudeStream(
             const vanished = vanishedWorkingDirectory(error, cwd);
             if (error instanceof ProcessTerminationError) errorCategory = "process_cleanup";
             else if (vanished) errorCategory = "working_directory";
-            else errorCategory ??= "process";
+            else errorCategory ??= error instanceof ClaudeCodeError ? error.code : "process";
             mapper?.fail((vanished ?? error).message, options?.signal?.aborted === true);
           },
           onAbort() {

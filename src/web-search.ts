@@ -171,7 +171,7 @@ export async function searchWithClaude(
     await stdoutDone;
     if (signal?.aborted) throw new Error("Web search was cancelled");
     if (processFailure) {
-      metrics.errorCategory = "process";
+      metrics.errorCategory = processFailure instanceof ClaudeCodeError ? processFailure.code : "process";
       throw processFailure;
     }
     if (oversized) throw new Error("Claude web search exceeded the maximum captured response size");
