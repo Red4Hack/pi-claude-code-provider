@@ -164,7 +164,7 @@ Preserve these when changing serialization or Claude arguments:
 When updating Claude Code compatibility:
 
 1. Compare the required CLI flags, initialization fields, stream records, and exact tool inventory.
-2. Recapture the help surface with `npm run capture:claude-surface` and re-pin `CAPTURED_CLAUDE_VERSION`.
+2. If the installed CLI's help differs from the pinned capture, recapture it with `npm run capture:claude-surface` and re-pin `CAPTURED_CLAUDE_VERSION`.
 3. Run `npm run capture:claude-breakpoints` for `sonnet` and `haiku`, and continue only on HEALTHY verdicts.
 4. Cover readiness, invalid or oversized JSONL, timeouts, aborts, error exits, and descendant cleanup deterministically.
 5. Move `src/compatibility.ts`, CI, and the baseline table together, under the rule in [Compatibility baseline](#compatibility-baseline).

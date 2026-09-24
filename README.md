@@ -102,6 +102,7 @@ Tool-bearing side requests need a registered Pi session or a working-directory d
 ### Troubleshooting
 
 - **Provider missing or unavailable:** run `/pi-claude-code-provider-doctor`, correct the problem it reports, then run `/reload`.
+- **Requests fail right after Claude Code updated:** run the doctor. If it reports your Claude Code version as unverified, install the tested version it names with `claude install <version>`. To avoid a repeat, set `"autoUpdatesChannel": "stable"` in Claude Code's settings, which waits about a week and skips releases with major regressions, or set `DISABLE_AUTOUPDATER` to `"1"` in their `env`. See [Claude Code's setup guide](https://code.claude.com/docs/en/setup).
 - **Authentication or subscription failure:** run `claude auth status` and sign in with an eligible subscription. For rate-limit or billing errors, check your subscription limits and usage-credit settings. Logins through `CLAUDE_CODE_OAUTH_TOKEN` are unsupported.
 - **Tools fail or requests report `mcp_startup`:** run the doctor to check the tool bridge handshake.
 - **A request keeps failing:** run `/pi-claude-code-provider-doctor report` and inspect the report before sharing it. Include the exact error and steps to reproduce when [opening an issue](https://github.com/chem/pi-claude-code-provider/issues).
