@@ -17,7 +17,7 @@
 - When `claude` is not on PATH, the provider now says so and names `PI_CLAUDE_CODE_PROVIDER_PATH`, instead of reporting the executable as not runnable.
 - A Pi session that outlives the Claude Code build it started with, after the updater removes that build, now reports "Claude Code at <path> no longer exists … run /reload" instead of a bare spawn ENOENT.
 - Isolation and protocol-order failures now name what Claude Code loaded or emitted, such as `plugins: agents-md` or `system/commands_changed`, so a Claude Code release that adds one is diagnosable from the error alone.
-- Tool and output-limit handoffs accept the provider's own POSIX termination signals after validation and cleanup, including SIGKILL escalation, instead of failing a completed response. Unexpected signal exits still fail.
+- Tool and output-limit handoffs accept the provider's own POSIX termination signals after validation and cleanup, including SIGKILL escalation, instead of failing a completed response. Unexpected signal exits still fail ([#10](https://github.com/chem/pi-claude-code-provider/pull/10)).
 
 ## [0.4.0] - 2026-09-20
 
