@@ -278,11 +278,11 @@ test("web search preserves a protocol failure when process cleanup also fails", 
 
 test("web search fails closed on missing, duplicate, and unexpected initialization", async () => {
     const cases = [
-        { body: `process.stdout.write(JSON.stringify({type:"result",is_error:false,result:"no init"})+"\\n");`, pattern: /before initialization/ },
+        { body: `process.stdout.write(JSON.stringify({type:"result",is_error:false,result:"no init"})+"\\n");`, pattern: /emitted a result record before initialization/ },
         { body: `const init=${JSON.stringify(searchInit)}; process.stdout.write(JSON.stringify(init)+"\\n"+JSON.stringify(init)+"\\n");`, pattern: /duplicate initialization/ },
         { body: `process.stdout.write(JSON.stringify(${JSON.stringify({ ...searchInit, tools: ["Bash"] })})+"\\n");`, pattern: /unexpected tool set/ },
         { body: `process.stdout.write(JSON.stringify(${JSON.stringify({ ...searchInit, mcp_servers: [{ name: "rogue", status: "connected" }] })})+"\\n");`, pattern: /unexpected MCP server/ },
-        { body: `process.stdout.write(JSON.stringify(${JSON.stringify({ ...searchInit, plugins: ["rogue"] })})+"\\n");`, pattern: /unexpected customizations/ },
+        { body: `process.stdout.write(JSON.stringify(${JSON.stringify({ ...searchInit, plugins: ["rogue"] })})+"\\n");`, pattern: /unexpected customizations \(plugins: rogue\)/ },
         { body: `process.stdout.write(JSON.stringify(${JSON.stringify({ ...searchInit, apiKeySource: "ANTHROPIC_API_KEY" })})+"\\n");`, pattern: /subscription-backed/ },
     ];
     for (const entry of cases) {

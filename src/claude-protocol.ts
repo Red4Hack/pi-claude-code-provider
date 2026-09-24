@@ -114,7 +114,10 @@ export function validateClaudeInitialization(value: unknown, expectation: Claude
     throw new ClaudeCodeError("protocol_init", "Claude initialization omitted customization inventories");
   }
   if (record.slash_commands.length > 0 || record.skills.length > 0 || record.plugins.length > 0) {
-    throw new ClaudeCodeError("isolation_customizations", "Claude Code loaded unexpected customizations");
+    const loaded = (["plugins", "skills", "slash_commands"] as const)
+      .filter((field) => (record[field] as unknown[]).length > 0)
+      .map((field) => `${field}: ${inventoryNames(record[field] as unknown[])}`);
+    throw new ClaudeCodeError("isolation_customizations", `Claude Code loaded unexpected customizations (${loaded.join("; ")})`);
   }
   if (record.apiKeySource !== "none") {
     throw new ClaudeCodeError("isolation_auth", "Claude Code did not confirm subscription-backed authentication");
@@ -131,7 +134,9 @@ export function validateClaudeInitialization(value: unknown, expectation: Claude
   if (!Array.isArray(record.mcp_servers)) throw new ClaudeCodeError("protocol_init", "Claude initialization omitted MCP inventory");
   const servers = record.mcp_servers as Array<{ name?: unknown; status?: unknown }>;
   if (expectation.mcpServer === "none") {
-    if (servers.length > 0) throw new ClaudeCodeError("isolation_mcp", "Claude Code loaded an unexpected MCP server");
+    if (servers.length > 0) {
+      throw new ClaudeCodeError("isolation_mcp", `Claude Code loaded an unexpected MCP server (${inventoryNames(servers)})`);
+    }
   } else if (servers.length !== 1 || servers[0]?.name !== "pi" || servers[0]?.status !== "connected") {
     throw new ClaudeCodeError("isolation_mcp", "The Pi proposal MCP server did not initialize correctly");
   }
@@ -188,6 +193,27 @@ function validUtilization(value: unknown): number | undefined {
 
 function alertStatus(value: unknown): RateLimitNotice["status"] | undefined {
   return value === "allowed_warning" || value === "rejected" ? value : undefined;
+}
+
+/** A record's `type/subtype`, bounded, to name the record a protocol failure rejected. */
+export function recordKind(record: { type?: unknown; subtype?: unknown }): string {
+  const part = (value: unknown) => (typeof value === "string" ? value.replace(/[^\w.-]/g, "").slice(0, 48) : "");
+  const type = part(record.type) || "untyped";
+  const subtype = part(record.subtype);
+  return subtype ? `${type}/${subtype}` : type;
+}
+
+/**
+ * Up to five names from an initialization inventory, whose entries are strings or
+ * objects carrying a `name`. Bounded, and never a path: entries can carry one.
+ */
+function inventoryNames(entries: readonly unknown[]): string {
+  const names = entries.slice(0, 5).map((entry) => {
+    const name = typeof entry === "string" ? entry : (entry as { name?: unknown } | null)?.name;
+    if (typeof name !== "string" || name.length === 0) return "unnamed";
+    return /[\\/]/.test(name) ? "<path>" : name.replace(/[\u0000-\u001f\u007f]/g, "").slice(0, 64);
+  });
+  return `${names.join(", ")}${entries.length > 5 ? `, and ${entries.length - 5} more` : ""}`;
 }
 
 function formatNames(names: ReadonlySet<string>): string {

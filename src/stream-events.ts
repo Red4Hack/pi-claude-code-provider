@@ -6,6 +6,7 @@ import {
   isCacheBreakpointLimit,
   parseRateLimitNotice,
   rateLimitRejectionMessage,
+  recordKind,
   requireRecord,
   terminalResultErrorDetail,
   validateClaudeInitialization,
@@ -162,7 +163,9 @@ export class ClaudeEventMapper {
       this.validateInit(record);
       return;
     }
-    if (!this.initialized) throw new ClaudeCodeError("protocol_order", "Claude emitted a record before initialization");
+    if (!this.initialized) {
+      throw new ClaudeCodeError("protocol_order", `Claude emitted a ${recordKind(record)} record before initialization`);
+    }
     if (!this.responseStarted) {
       throw new ClaudeCodeError("protocol_order", "Claude emitted a response record before Pi response observers completed");
     }

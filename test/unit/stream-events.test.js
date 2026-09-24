@@ -179,6 +179,9 @@ test("rejects duplicate initialization, unknown records, and invalid event order
     const ordering = makeMapper(createAssistantMessageEventStream(), createOutput(model), new Set(), new Map(), () => { });
     init(ordering);
     assert.throws(() => ordering.accept({ type: "stream_event", event: { type: "content_block_stop", index: 0 } }), /before message_start/);
+    // Claude Code 2.1.281 first broke this way; the message must say which record it was.
+    const early = makeMapper(createAssistantMessageEventStream(), createOutput(model), new Set(), new Map(), () => { });
+    assert.throws(() => early.accept({ type: "system", subtype: "commands_changed" }), /Claude emitted a system\/commands_changed record before initialization/);
 });
 test("maps result-only fallback text, served limits, and cache details", async () => {
     const stream = createAssistantMessageEventStream();
