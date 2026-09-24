@@ -7,7 +7,7 @@
 - **Breaking.** Claude Code 2.1.281 is now the minimum supported version; update Claude Code (`claude update`) before or with this package. Older versions can still load, but are unsupported and flagged by the doctor.
 - Pi 0.87.1 and Claude Code 2.1.281 are now the validated baseline; the minimum supported Pi version remains 0.86.1.
 - Opus now uses its 1M context window on Pro, as on other plans, and its output limit rises to 128K, matching Claude Opus 5.5 in Claude Code.
-- Long sessions can use their whole context window. The provider no longer refuses a request early by reserving the model's full output limit; Pi's own compaction runs at its usual threshold, and a context too large for the window comes back as "Prompt is too long", which Pi compacts and retries. A response cut off at the window now ends as a `length` stop Pi also recovers from, instead of a normal stop.
+- Long sessions can use their whole context window. The provider no longer refuses a request early by reserving the model's full output limit; Pi's own compaction runs at its usual threshold, and a context too large for the window comes back as "Prompt is too long", which Pi compacts and retries. A response cut off at the window now ends as a `length` stop Pi also recovers from, instead of an interruption error that Pi retried with the same oversized context.
 - Claude Code no longer compacts the replayed conversation on its own (`DISABLE_COMPACT=1`); Pi owns compaction.
 
 ### Fixed

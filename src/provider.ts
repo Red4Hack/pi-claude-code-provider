@@ -684,10 +684,10 @@ function effectiveMaxOutputTokens(model: Model<Api>, requested: number | undefin
 }
 
 /**
- * A served context window is required rather than assumed. Skipping validation
- * when none is reported would leave the request with no bound at all, and
- * inventing a fallback ceiling would add a second unexplained limit that still
- * could not show the request fits a window nobody stated.
+ * A served context window is required rather than assumed. Skipping the
+ * system-prompt check when none is reported would leave that prompt unbounded,
+ * and inventing a fallback ceiling would add an unexplained limit that still
+ * could not show the prompt fits a window nobody stated.
  *
  * Only positivity and finiteness are required, because the value is compared
  * and never propagated; a fractional override is harmless. Pi rejects a

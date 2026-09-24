@@ -27,7 +27,7 @@ const TRANSCRIPT_CACHE_CONTROL = { type: "ephemeral", ttl: "1h" } as const;
 
 /**
  * Escape hatch for a Claude Code release that leaves no room for this breakpoint:
- * every Claude 5 alias already carries the API's maximum of four.
+ * with it, every Claude 5 alias carries the API's maximum of four.
  */
 export const TRANSCRIPT_BREAKPOINT_ENV = "PI_CLAUDE_CODE_PROVIDER_TRANSCRIPT_BREAKPOINT";
 

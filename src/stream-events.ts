@@ -47,7 +47,7 @@ export interface ClaudeEventMapperOptions {
   expectedTools: Set<string>;
   toolNames: Map<string, string>;
   onToolUse: () => void;
-  /** Omitted only by tests: without it a max_tokens stop falls back to failing on Claude Code's continuation. */
+  /** Omitted only by tests: without it a length stop falls back to failing on Claude Code's continuation. */
   onLengthStop?: () => void;
   onRateLimitNotice?: RateLimitNoticeSink;
   onResponseAnnouncement?: ResponseAnnouncementSink;
@@ -243,7 +243,7 @@ export class ClaudeEventMapper {
     // Before the response starts, a retry is an ordinary pre-stream retry that costs
     // nothing to let through. After a tool-use stop the provider is already terminating
     // Claude for handoff, and records about Claude's own next request must not
-    // invalidate a complete proposal. A max_tokens stop is followed by Claude Code's own
+    // invalidate a complete proposal. A length stop is followed by Claude Code's own
     // continuation, which the length handoff owns.
     if (!this.messageStarted || this.stopReason === "tool_use" || isLengthStop(this.stopReason)) return;
     const raw = record as Record<string, unknown>;
@@ -622,9 +622,9 @@ function isLengthStop(reason: string | undefined): boolean {
 }
 
 function stopReason(value: unknown): string {
-  // Claude exposes this as a string rather than a closed enum. Pi only gives
-  // special meaning to max_tokens and tool_use, so preserve future values as
-  // ordinary stops instead of rejecting an otherwise valid response.
+  // Claude exposes this as a string rather than a closed enum. Only tool_use and
+  // the length stops (isLengthStop) carry special meaning here, so preserve future
+  // values as ordinary stops instead of rejecting an otherwise valid response.
   if (typeof value !== "string" || value.length === 0) {
     throw new ClaudeCodeError("protocol_stop", `Invalid Claude stop reason: ${String(value)}`);
   }
