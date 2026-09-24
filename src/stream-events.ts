@@ -242,7 +242,7 @@ export class ClaudeEventMapper {
     // Claude for handoff, and records about Claude's own next request must not
     // invalidate a complete proposal. A max_tokens stop is followed by Claude Code's own
     // continuation, which the length handoff owns.
-    if (!this.messageStarted || this.stopReason === "tool_use" || this.stopReason === "max_tokens") return;
+    if (!this.messageStarted || this.stopReason === "tool_use" || isLengthStop(this.stopReason)) return;
     const raw = record as Record<string, unknown>;
     let cause: string | undefined;
     if (record.type === "system" && record.subtype === "api_retry") {
@@ -302,7 +302,7 @@ export class ClaudeEventMapper {
       if (this.blocks.size > 0) throw new ClaudeCodeError("protocol_blocks", "Claude stopped with unclosed content blocks");
       this.messageStopped = true;
       if (this.stopReason === "tool_use") this.latchHandoff(this.onToolUse);
-      else if (this.stopReason === "max_tokens") this.latchHandoff(this.onLengthStop);
+      else if (isLengthStop(this.stopReason)) this.latchHandoff(this.onLengthStop);
     } else throw new ClaudeCodeError("protocol_event", `Unsupported Claude stream event: ${String(type)}`);
   }
 
@@ -313,7 +313,7 @@ export class ClaudeEventMapper {
     }
     this.applyUsage(event.usage);
     if (this.stopReason === "tool_use") this.latchHandoff(this.onToolUse);
-    else if (this.stopReason === "max_tokens") this.latchHandoff(this.onLengthStop);
+    else if (isLengthStop(this.stopReason)) this.latchHandoff(this.onLengthStop);
   }
 
   /** Stop mapping this response's stream and ask the provider to terminate Claude. */
@@ -468,7 +468,7 @@ export class ClaudeEventMapper {
     // absent flag or subtype string, which could hide protocol drift.
     if (this.stopReason === "tool_use") throw new ClaudeCodeError("protocol_result", "Claude returned success after a tool-use stop");
     if (this.output.content.length === 0 && record.result) this.pushFallbackText(record.result);
-    this.successfulResult = this.stopReason === "max_tokens" ? "length" : "stop";
+    this.successfulResult = isLengthStop(this.stopReason) ? "length" : "stop";
     this.output.stopReason = this.successfulResult;
   }
 
@@ -497,16 +497,16 @@ export class ClaudeEventMapper {
   }
 
   /**
-   * Publish a response that reached the output limit, after the provider has terminated
-   * Claude. Claude Code answers a max_tokens stop with a synthetic "Output token limit
-   * hit" turn and another message, so the provider stops it at the stop reason and
-   * returns Pi the ordinary `length` stop the response earned.
+   * Publish a response that reached the output limit or the context window, after the
+   * provider has terminated Claude. Claude Code answers either stop with a synthetic
+   * "Output token limit hit" turn and another message, so the provider stops it at the
+   * stop reason and returns Pi the ordinary `length` stop the response earned.
    */
   completeLength(): boolean {
     if (this.terminal) return false;
     this.throwDeferredFailure();
     if (this.blocks.size > 0) throw new ClaudeCodeError("protocol_blocks", "Output limit stop completed with unclosed content blocks");
-    if (this.stopReason !== "max_tokens") throw new ClaudeCodeError("protocol_stop", "Claude did not report an output limit stop");
+    if (!isLengthStop(this.stopReason)) throw new ClaudeCodeError("protocol_stop", "Claude did not report an output limit stop");
     this.terminal = true;
     this.output.stopReason = "length";
     this.stream.push({ type: "done", reason: "length", message: this.output });
@@ -520,7 +520,7 @@ export class ClaudeEventMapper {
     if (record.subtype !== "error_during_execution" || record.is_error !== true) return false;
     if (record.api_error_status !== undefined || record.result !== undefined) return false;
     if (record.terminal_reason !== "aborted_streaming") return false;
-    if (this.stopReason === "max_tokens") return record.stop_reason === "max_tokens";
+    if (isLengthStop(this.stopReason)) return record.stop_reason === this.stopReason;
     return this.stopReason === "tool_use" &&
       record.stop_reason === "tool_use" &&
       this.output.content.some((block) => block.type === "toolCall");
@@ -606,6 +606,17 @@ export class ClaudeEventMapper {
 // other documented category (billing_error, authentication_failed, invalid_request, ...)
 // describes a condition that repeating the turn cannot clear.
 const RETRYABLE_INTERRUPTIONS = new Set(["overloaded", "server_error", "unknown"]);
+
+/**
+ * Whether a stop ends the response at a limit Pi reports as `length`. The API
+ * accepts input plus max_tokens beyond the window and stops generation at the
+ * window with `model_context_window_exceeded`. Claude Code answers that stop
+ * exactly as it answers `max_tokens`, with a synthetic continuation turn, so it
+ * takes the same handoff; Pi then compacts and retries a short length stop.
+ */
+function isLengthStop(reason: string | undefined): boolean {
+  return reason === "max_tokens" || reason === "model_context_window_exceeded";
+}
 
 function stopReason(value: unknown): string {
   // Claude exposes this as a string rather than a closed enum. Pi only gives

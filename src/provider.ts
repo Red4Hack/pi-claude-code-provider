@@ -192,7 +192,8 @@ export function createClaudeStream(
         claude?.terminateInBackground();
       };
 
-      // A response that reached the output limit is complete as far as Pi is concerned.
+      // A response that reached the output limit or the context window is complete as
+      // far as Pi is concerned.
       // Claude Code would answer it with a synthetic continuation turn and another
       // message, so stop it here and publish the length stop. The termination path, and
       // therefore the expected exit codes, are the tool handoff's.
@@ -265,22 +266,25 @@ export function createClaudeStream(
         // file exists, because nothing later in the request can make room for it.
         const systemPromptTokens = estimateTransportTokens(0, 0, systemPromptBytes, 0);
         metrics.estimatedInputTokens = systemPromptTokens;
-        validateSystemPromptBudget(model, systemPromptTokens, maxOutputTokens);
+        validateSystemPromptBudget(model, systemPromptTokens);
         prepared = await prepareRequest(effectiveContext, imageLease);
         metrics.cleanupComplete = false;
         metrics.lastPhase = "prepared";
-        const estimatedInputTokens = estimateTransportTokens(
+        metrics.imageCount = prepared.imageCount;
+        metrics.transcriptBytes = prepared.transcriptBytes;
+        metrics.catalogBytes = prepared.catalogBytes;
+        metrics.imageBytes = prepared.imageBytes;
+        // Recorded, not enforced. A context too large for the window is refused by
+        // Claude Code or the API as "Prompt is too long" without billing anything,
+        // and Pi reads that as an overflow and compacts. A gate here would have to
+        // reserve room this transport cannot measure, and would refuse requests Pi's
+        // own compaction threshold still considers in range.
+        metrics.estimatedInputTokens = estimateTransportTokens(
           prepared.transcriptBytes,
           prepared.catalogBytes,
           systemPromptBytes,
           prepared.attachmentPaths.length,
         );
-        metrics.imageCount = prepared.imageCount;
-        metrics.transcriptBytes = prepared.transcriptBytes;
-        metrics.catalogBytes = prepared.catalogBytes;
-        metrics.imageBytes = prepared.imageBytes;
-        metrics.estimatedInputTokens = estimatedInputTokens;
-        validateContextBudget(model, estimatedInputTokens, maxOutputTokens);
 
         // Configuration must fail before a paid budget slot is claimed or a
         // Claude process is spawned.
@@ -479,7 +483,7 @@ export function createClaudeStream(
           // limit and exit cleanly before the background termination lands. The
           // response Pi asked for is complete and already mapped by then, so
           // publish it rather than failing a turn that succeeded. completeLength()
-          // still requires the max_tokens stop, so this widens nothing. In that
+          // still requires the length stop, so this widens nothing. In that
           // race the result record's usage covers the continuation turn too, which
           // is left as reported rather than corrected.
           const finishedBeforeTermination = mapper.hasSuccessfulResult && result.code === 0 && result.signal === null;
@@ -632,16 +636,15 @@ function timeoutSetting(name: string, fallback: number): number {
 }
 
 /**
- * Deliberately conservative pre-launch estimate: roughly 3 bytes per token
- * plus 10% margin and a flat per-image reserve. Overestimating rejects a
- * request early with `context_budget` instead of ever overrunning the served
- * window mid-stream. Metrics record this estimate beside Claude's reported
- * prompt counters (input + cacheRead + cacheWrite); calibrate against that
- * logged data across representative transcripts before changing the ratio.
+ * Estimated input tokens for a request's transport, at 2.5 bytes per token plus
+ * a flat per-image reserve. The JSON transcript is denser than plain text: on
+ * Claude Code 2.1.281 with Sonnet 5, code tool results measured 2.47 bytes per
+ * token and English prose 2.86. Metrics record this beside Claude's reported
+ * prompt counters (input + cacheRead + cacheWrite), and the system-prompt check
+ * below uses it; recalibrate against those counters before changing the ratio.
  */
 function estimateTransportTokens(transcriptBytes: number, catalogBytes: number, systemBytes: number, images: number): number {
-  const textTokens = Math.ceil((transcriptBytes + catalogBytes + systemBytes) / 3);
-  return Math.ceil(textTokens * 1.1) + images * 2_000;
+  return Math.ceil((transcriptBytes + catalogBytes + systemBytes) / 2.5) + images * 2_000;
 }
 
 function effectiveMaxOutputTokens(model: Model<Api>, requested: number | undefined): number {
@@ -682,24 +685,14 @@ function requireContextWindow(model: Model<Api>): number {
  * patterns, which would spend a summarization request compacting history that
  * can never make room for the system prompt.
  */
-function validateSystemPromptBudget(model: Model<Api>, systemTokens: number, maxOutput: number): void {
+function validateSystemPromptBudget(model: Model<Api>, systemTokens: number): void {
   const contextWindow = requireContextWindow(model);
-  if (systemTokens + maxOutput > contextWindow) {
+  if (systemTokens > contextWindow) {
     throw new ClaudeCodeError(
       "system_prompt_budget",
-      `Pi system prompt alone needs about ${systemTokens} tokens; with the ${maxOutput}-token output reserve ` +
-        `that exceeds the ${contextWindow}-token context of ${model.id}. Reduce loaded system instructions, ` +
-        `project context, or skill descriptions, or select a larger-context model.`,
-    );
-  }
-}
-
-function validateContextBudget(model: Model<Api>, estimatedInputTokens: number, maxOutput: number): void {
-  const contextWindow = requireContextWindow(model);
-  if (estimatedInputTokens + maxOutput > contextWindow) {
-    throw new ClaudeCodeError(
-      "context_budget",
-      `context_length_exceeded: estimated Claude Code transport input ${estimatedInputTokens} plus output reserve ${maxOutput} exceeds context ${contextWindow}`,
+      `Pi system prompt alone needs about ${systemTokens} tokens, which exceeds the ${contextWindow}-token ` +
+        `context of ${model.id}. Reduce loaded system instructions, project context, or skill descriptions, ` +
+        `or select a larger-context model.`,
     );
   }
 }

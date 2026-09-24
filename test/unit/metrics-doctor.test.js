@@ -186,13 +186,13 @@ test("doctor summary puts one labeled fact on each line", () => {
 });
 
 test("doctor reports a served context window only once it stops matching the configured one", () => {
-    // The budget checks bound a request against the configured window, so a
-    // smaller served one makes them too permissive. The fixture's sonnet on Pro
+    // Pi compacts by the configured window, so a smaller served one lets sessions
+    // grow until Claude Code refuses them. The fixture's sonnet on Pro
     // configures 1M, which the paid matrix has verified, so a match stays silent.
     const base = doctorBase();
     assert.doesNotMatch(formatDoctorSummary({ ...base, metrics }), /Context window:/);
     const drifted = formatDoctorSummary({ ...base, metrics: { ...metrics, servedContextWindow: 200000 } });
-    assert.match(drifted, /^Context window: sonnet served 200000, configured 1000000; request budget checks use the configured value$/m);
+    assert.match(drifted, /^Context window: sonnet served 200000, configured 1000000; Pi compacts by the configured value$/m);
     // A larger served window is still a mismatch worth stating; only equality is silent.
     assert.match(formatDoctorSummary({ ...base, metrics: { ...metrics, requestedModel: "haiku", servedContextWindow: 1000000 } }), /haiku served 1000000, configured 200000/);
     // Opus is served with its 1M window on Pro, which the fixture's account uses.

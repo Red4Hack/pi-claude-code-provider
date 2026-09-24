@@ -48,6 +48,8 @@ test("builds an allowlisted Claude environment", () => {
         assert.equal(env.CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS, "1");
         assert.equal(env.DISABLE_NON_ESSENTIAL_MODEL_CALLS, undefined);
         assert.equal(env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, "1");
+        // Pi owns compaction; Claude Code must never compact the replayed transcript.
+        assert.equal(env.DISABLE_COMPACT, "1");
         assert.equal(env.HOME, process.env.HOME);
     }
     finally {

@@ -574,7 +574,7 @@ test("0.86 transcript one-shot borrowing refuses tools added by the payload hook
     assert.match(result.errorMessage ?? "", /gained tools after before_provider_request/);
     assert.equal(claims, 0);
 });
-test("provider forwards and reserves Pi's effective per-request output limit", async () => {
+test("provider forwards Pi's per-request output limit without reserving it against the window", async () => {
     const directory = await mkdtemp(join(tmpdir(), "provider-max-tokens-"));
     const marker = join(directory, "max-tokens");
     const fake = await fakeClaude(`
@@ -585,7 +585,9 @@ process.stdin.on("end", () => {
   process.stdout.write(JSON.stringify({type:"result",is_error:false,result:"bounded",usage:{},modelUsage:{sonnet:{contextWindow:3000,maxOutputTokens:64000}}}) + "\\n");
 });`);
     try {
-        const boundedModel = { ...model, contextWindow: 3_000, maxTokens: 64_000 };
+        // The API accepts input plus max_tokens beyond the window and stops at the
+        // window, so this request must launch even though the two exceed it.
+        const boundedModel = { ...model, contextWindow: 1_000, maxTokens: 64_000 };
         const result = await createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(
             boundedModel,
             context,
@@ -593,7 +595,9 @@ process.stdin.on("end", () => {
         ).result();
         assert.equal(result.stopReason, "stop", result.errorMessage);
         assert.equal(await readFile(marker, "utf8"), "2048");
-        assert.equal(getLastRequestMetrics()?.servedMaxOutputTokens, 64_000);
+        const metrics = getLastRequestMetrics();
+        assert.equal(metrics?.servedMaxOutputTokens, 64_000);
+        assert.ok(metrics.estimatedInputTokens + 2_048 > boundedModel.contextWindow);
     } finally {
         await rm(directory, { recursive: true, force: true });
         await rm(fake.dir, { recursive: true, force: true });
@@ -1274,7 +1278,7 @@ test("MCP readiness has a bounded timeout even while the process remains alive",
         await rm(directory, { recursive: true, force: true });
     }
 });
-test("provider enforces idle and context-budget limits", async () => {
+test("provider enforces the idle limit", async () => {
     const idle = await fakeClaude(`process.stdin.resume(); process.stdout.write(JSON.stringify(${JSON.stringify(init)}) + "\\n"); process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"message_start",message:{id:"idle",model:"claude-sonnet-5",usage:{}}}}) + "\\n"); setInterval(() => {}, 1000);`);
     const originalIdle = process.env.PI_CLAUDE_CODE_PROVIDER_IDLE_TIMEOUT_MS;
     const originalTotal = process.env.PI_CLAUDE_CODE_PROVIDER_TOTAL_TIMEOUT_MS;
@@ -1289,22 +1293,12 @@ test("provider enforces idle and context-budget limits", async () => {
         if (originalTotal === undefined) delete process.env.PI_CLAUDE_CODE_PROVIDER_TOTAL_TIMEOUT_MS; else process.env.PI_CLAUDE_CODE_PROVIDER_TOTAL_TIMEOUT_MS = originalTotal;
         await rm(idle.dir, { recursive: true, force: true });
     }
-    for (let attempt = 0; attempt < 20 && getLastRequestMetrics()?.errorCategory !== "process"; attempt++) {
-        await new Promise((resolve) => setTimeout(resolve, 5));
-    }
-    const installation = { executable: "/does/not/run", version: "test", subscriptionType: "pro" };
-    const tinyModel = { ...model, contextWindow: 100, maxTokens: 90 };
-    const budgetResult = await createClaudeStream(installation)(tinyModel, context, { reasoning: "medium" }).result();
-    for (let attempt = 0; attempt < 20 && getLastRequestMetrics()?.errorCategory !== "context_budget"; attempt++) {
-        await new Promise((resolve) => setTimeout(resolve, 5));
-    }
-    assert.match(budgetResult.errorMessage ?? "", /context_length_exceeded/);
-    assert.equal(getLastRequestMetrics()?.errorCategory, "context_budget");
-    assert.ok((getLastRequestMetrics()?.estimatedInputTokens ?? 0) > 0);
 });
 test("provider retains a caught failure category when private cleanup also fails", async () => {
     const installation = { executable: "/does/not/run", version: "test", subscriptionType: "pro" };
-    const tinyModel = { ...model, contextWindow: 100, maxTokens: 90 };
+    const originalTotal = process.env.PI_CLAUDE_CODE_PROVIDER_TOTAL_TIMEOUT_MS;
+    // Timeout settings are read after preparation, so this fails with private state to clean.
+    process.env.PI_CLAUDE_CODE_PROVIDER_TOTAL_TIMEOUT_MS = "not-a-number";
     let privateDirectory;
     let cleanupAttempts = 0;
     const failCleanup = async (directory) => {
@@ -1313,9 +1307,9 @@ test("provider retains a caught failure category when private cleanup also fails
         throw new Error("synthetic cleanup failure");
     };
     try {
-        const result = await createClaudeStream(installation, { cleanupDirectory: failCleanup })(tinyModel, context, { reasoning: "medium" }).result();
+        const result = await createClaudeStream(installation, { cleanupDirectory: failCleanup })(model, context, { reasoning: "medium" }).result();
         assert.equal(result.stopReason, "error");
-        assert.match(result.errorMessage ?? "", /context_length_exceeded/);
+        assert.match(result.errorMessage ?? "", /PI_CLAUDE_CODE_PROVIDER_TOTAL_TIMEOUT_MS must be a positive integer/);
         assert.match(result.errorMessage ?? "", /private request cleanup failed: synthetic cleanup failure/);
         for (
             let attempt = 0;
@@ -1324,10 +1318,11 @@ test("provider retains a caught failure category when private cleanup also fails
         ) {
             await new Promise((resolve) => setTimeout(resolve, 5));
         }
-        assert.equal(getLastRequestMetrics()?.errorCategory, "context_budget");
+        assert.equal(getLastRequestMetrics()?.errorCategory, "timeout_config");
         assert.equal(getLastRequestMetrics()?.cleanupComplete, false);
     }
     finally {
+        if (originalTotal === undefined) delete process.env.PI_CLAUDE_CODE_PROVIDER_TOTAL_TIMEOUT_MS; else process.env.PI_CLAUDE_CODE_PROVIDER_TOTAL_TIMEOUT_MS = originalTotal;
         if (privateDirectory) await rm(privateDirectory, { recursive: true, force: true });
     }
 });
@@ -1494,10 +1489,10 @@ test("provider fails before streaming when Pi's async response handler rejects",
     }
 });
 
-// A 200K-window model reserving 32K output admits at most 168,000 estimated
-// input tokens, which the byte estimator reaches at exactly 458,181 bytes.
+// A 200K-window model admits a system prompt of at most 200,000 estimated
+// tokens, which the byte estimator reaches at exactly 500,000 bytes.
 const BUDGET_MODEL = { ...model, contextWindow: 200_000, maxTokens: 32_000 };
-const LARGEST_ADMITTED_SYSTEM_PROMPT_BYTES = 458_181;
+const LARGEST_ADMITTED_SYSTEM_PROMPT_BYTES = 500_000;
 const DEAD_INSTALLATION = { executable: "/does/not/run", version: "test", subscriptionType: "pro" };
 function markedSystemPrompt(bytes) {
     const head = "ALPHA-MARKER-4417\n";
@@ -1557,14 +1552,15 @@ test("provider rejects a system prompt the served model cannot hold", async () =
     assert.ok(metrics.estimatedInputTokens > 0);
     assert.equal(metrics.cleanupComplete, true);
 });
-test("the system-prompt precheck admits the boundary and the full budget still decides", async () => {
+test("the system-prompt precheck admits the boundary and nothing else gates the request", async () => {
     const systemPrompt = "y".repeat(LARGEST_ADMITTED_SYSTEM_PROMPT_BYTES);
     const result = await createClaudeStream(DEAD_INSTALLATION)(BUDGET_MODEL, providerContext({ tools: [], systemPrompt }), { reasoning: "medium" }).result();
-    const metrics = await waitForRequestMetrics((entry) => entry.errorCategory === "context_budget");
-    // The precheck is necessary, not sufficient: preparation ran, and the
-    // transcript's own bytes then carried the request over the window.
-    assert.equal(metrics.lastPhase, "prepared");
-    assert.match(result.errorMessage ?? "", /context_length_exceeded/);
+    const metrics = await waitForRequestMetrics((entry) => entry.transcriptBytes > 0);
+    // The whole request now estimates past the window, and still launches:
+    // Claude Code or the API refuses an oversized one as "Prompt is too long".
+    assert.ok(metrics.estimatedInputTokens + BUDGET_MODEL.maxTokens > BUDGET_MODEL.contextWindow);
+    assert.notEqual(metrics.errorCategory, "system_prompt_budget");
+    assert.doesNotMatch(result.errorMessage ?? "", /context_length_exceeded/);
 });
 test("the system-prompt budget measures bytes rather than characters", async () => {
     const systemPrompt = "。".repeat(200_000);
@@ -1574,16 +1570,13 @@ test("the system-prompt budget measures bytes rather than characters", async () 
     await waitForRequestMetrics((entry) => entry.errorCategory === "system_prompt_budget");
     assert.match(result.errorMessage ?? "", /system prompt alone needs about \d+ tokens/);
 });
-test("budget failures classify correctly for Pi's overflow recovery", async () => {
+test("an oversized system prompt is not reported as an overflow Pi would compact", async () => {
     const oversized = await createClaudeStream(DEAD_INSTALLATION)(BUDGET_MODEL, providerContext({ tools: [], systemPrompt: "y".repeat(LARGEST_ADMITTED_SYSTEM_PROMPT_BYTES + 3) }), { reasoning: "medium" }).result();
     await waitForRequestMetrics((entry) => entry.errorCategory === "system_prompt_budget");
-    const overBudget = await createClaudeStream(DEAD_INSTALLATION)({ ...model, contextWindow: 100, maxTokens: 90 }, context, { reasoning: "medium" }).result();
-    await waitForRequestMetrics((entry) => entry.errorCategory === "context_budget");
     const asMessage = (result) => ({ stopReason: "error", errorMessage: result.errorMessage ?? "", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } });
-    // Compaction cannot shrink a system prompt, so the system-only failure must
-    // not look like a recoverable overflow; the transcript one must.
+    // Compaction cannot shrink a system prompt. A transcript too large for the
+    // window is Claude Code's "Prompt is too long", covered by the captured replay.
     assert.equal(isContextOverflow(asMessage(oversized), BUDGET_MODEL.contextWindow), false);
-    assert.equal(isContextOverflow(asMessage(overBudget), 100), true);
 });
 test("provider requires a usable model context window", async () => {
     for (const contextWindow of [undefined, 0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {

@@ -43,8 +43,7 @@ function providerModel(
  * subscription and reports its unauthenticated default.
  *
  * The doctor reports a served window that stops matching the configured one,
- * because the budget checks in src/provider.ts bound a request against the
- * configured value.
+ * because Pi places its compaction threshold by the configured value.
  */
 export function providerModels(): ProviderModelConfig[] {
   return [

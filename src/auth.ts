@@ -237,5 +237,8 @@ export function buildClaudeEnvironment(extra: NodeJS.ProcessEnv = {}): NodeJS.Pr
   // can execute a configured Git clean filter before any Pi tool call.
   env.CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS = "1";
   env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
+  // Pi owns compaction. Given a transcript near its limit, Claude Code otherwise
+  // starts compacting it on its own before refusing it as too long.
+  env.DISABLE_COMPACT = "1";
   return { ...env, ...extra };
 }

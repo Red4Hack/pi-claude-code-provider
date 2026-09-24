@@ -201,10 +201,10 @@ export function formatDoctorSummary(input: DoctorSummaryInput): string {
 /**
  * Claude Code's own reported context window, when it has stopped matching the one
  * this package advertises. Only a mismatch is reported, because a match is the
- * ordinary case and says nothing. It is worth stating because the budget checks in
- * src/provider.ts bound every request against the *configured* value: a served
- * window smaller than that makes them too permissive, and the request then fails at
- * the API, mid-stream, after quota has been spent.
+ * ordinary case and says nothing. It is worth stating because Pi places its
+ * compaction threshold by the *configured* value: a served window smaller than
+ * that lets sessions grow until Claude Code refuses them as too long, and one
+ * larger compacts sessions that still had room.
  */
 function servedContextWindowNote(input: DoctorSummaryInput, metrics: RequestMetrics): string | undefined {
   const served = metrics.servedContextWindow;
@@ -213,7 +213,7 @@ function servedContextWindowNote(input: DoctorSummaryInput, metrics: RequestMetr
     .find((model) => model.id === metrics.requestedModel)?.contextWindow;
   if (configured === undefined || configured === served) return undefined;
   return `Context window: ${metrics.requestedModel} served ${served}, configured ${configured}; ` +
-    "request budget checks use the configured value";
+    "Pi compacts by the configured value";
 }
 
 /**
