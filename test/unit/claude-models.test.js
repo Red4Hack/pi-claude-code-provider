@@ -13,9 +13,14 @@ import { CAPTURED_CLAUDE_VERSION } from "../support/claude-fixture.js";
 // that would reintroduce exactly the version coupling this project removed when
 // EXPECTED_MODEL_FAMILIES replaced dated ids. Change them only to cover a new
 // table *shape*.
-const ALIAS_TABLE = 'sonnet:{default:"claude-sonnet-5",per_provider:{gateway:"claude-sonnet-4-6"}},'
+const ALIAS_TABLE = 'aliases:{sonnet:{default:"claude-sonnet-5",per_provider:{gateway:"claude-sonnet-4-6"}},'
     + 'opus:{default:"claude-opus-5"},haiku:{default:"claude-haiku-4-5"},'
-    + 'fable:{default:"claude-fable-5-1",per_provider:{gateway:"claude-fable-5"}}';
+    + 'fable:{default:"claude-fable-5-1",per_provider:{gateway:"claude-fable-5"}}}';
+// Another surface's selector state, in the shape Claude Code embeds beside the
+// CLI table. Its ids differ on purpose: none of them may be reported.
+const OTHER_SURFACE_TABLE = 'provider_alias_targets:{fable:{default:"claude-fable-4"},'
+    + 'haiku:{default:"claude-haiku-4-5-20251001"},opus:{default:"claude-opus-4",per_provider:{gateway:"claude-opus-4-7"}},'
+    + 'sonnet:{default:"claude-sonnet-4"}}';
 
 function installation(executable) {
     return { executable, version: CAPTURED_CLAUDE_VERSION, subscriptionType: "pro" };
@@ -53,6 +58,28 @@ test("reads one model per alias and ignores per-provider overrides", async () =>
     }
 });
 
+test("reads only the CLI alias table, not other surfaces' alias targets", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-claude-code-provider-models-surfaces-"));
+    try {
+        const versions = await scan(directory, Buffer.from(
+            `${OTHER_SURFACE_TABLE} ,${ALIAS_TABLE}, ${OTHER_SURFACE_TABLE} ${OTHER_SURFACE_TABLE}`,
+            "latin1",
+        ));
+        assert.deepEqual(versions, {
+            sonnet: "claude-sonnet-5",
+            fable: "claude-fable-5-1",
+            opus: "claude-opus-5",
+            haiku: "claude-haiku-4-5",
+        });
+        // Without the CLI table, the other surfaces report nothing.
+        assert.deepEqual(await scan(directory, Buffer.from(OTHER_SURFACE_TABLE, "latin1")), {});
+        // Minified code that builds an aliases object is not a table either.
+        assert.deepEqual(await scan(directory, Buffer.from("aliases:{opus:Br(n.aliasTargets.opus,G.opus)}", "latin1")), {});
+    } finally {
+        await rm(directory, { recursive: true, force: true });
+    }
+});
+
 test("finds a table that straddles a read-chunk boundary", async () => {
     const directory = await mkdtemp(join(tmpdir(), "pi-claude-code-provider-models-chunk-"));
     try {
@@ -75,13 +102,13 @@ test("finds a table that straddles a read-chunk boundary", async () => {
     }
 });
 
-test("treats a second distinct value for an alias as unavailable", async () => {
+test("treats a second distinct value for an alias as undetermined", async () => {
     const directory = await mkdtemp(join(tmpdir(), "pi-claude-code-provider-models-ambiguous-"));
     try {
         // Two different values mean the table's shape changed. Reporting a
         // confident wrong version is worse than reporting nothing.
         const versions = await scan(directory, Buffer.from(
-            `${ALIAS_TABLE} sonnet:{default:"claude-sonnet-6"} opus:{default:"claude-opus-5"}`,
+            `${ALIAS_TABLE} aliases:{sonnet:{default:"claude-sonnet-6"},opus:{default:"claude-opus-5"}}`,
             "latin1",
         ));
         assert.equal(versions.sonnet, undefined);
@@ -93,13 +120,15 @@ test("treats a second distinct value for an alias as unavailable", async () => {
     }
 });
 
-test("degrades to unavailable rather than failing", async () => {
+test("degrades to undetermined rather than failing", async () => {
     const directory = await mkdtemp(join(tmpdir(), "pi-claude-code-provider-models-soft-"));
     try {
         assert.deepEqual(await scan(directory, Buffer.from("no alias table here", "latin1")), {});
         assert.deepEqual(await scan(directory, Buffer.alloc(0)), {});
         // A truncated table matches nothing rather than half-matching.
-        assert.deepEqual(await scan(directory, Buffer.from('sonnet:{default:"claude-', "latin1")), {});
+        assert.deepEqual(await scan(directory, Buffer.from('aliases:{sonnet:{default:"claude-', "latin1")), {});
+        // An unterminated table is not a table.
+        assert.deepEqual(await scan(directory, Buffer.from(ALIAS_TABLE.slice(0, -1), "latin1")), {});
         clearModelAliasCache();
         assert.deepEqual(await readClaudeModelAliases(installation(join(directory, "absent"))), {});
         clearModelAliasCache();

@@ -11,10 +11,11 @@ Options:
                                         access to
   --agent <agent>                       Agent for the current session. Overrides
                                         the 'agent' setting.
-  --agents <json>                       JSON object defining custom agents (e.g.
-                                        '{"reviewer": {"description": "Reviews
-                                        code", "prompt": "You are a code
-                                        reviewer"}}')
+  --agents <json-or-file>               JSON object defining custom agents, or
+                                        with --print the path to a file that
+                                        holds one (e.g. '{"reviewer":
+                                        {"description": "Reviews code",
+                                        "prompt": "You are a code reviewer"}}')
   --allow-dangerously-skip-permissions  Enable bypassing all permission checks
                                         as an option, without it being enabled
                                         by default. Recommended only for
@@ -37,10 +38,13 @@ Options:
                                         session in the background under the same
                                         ID, or starts a copy and says so when
                                         the session is already running
-  --bare                                Minimal mode: skip hooks, LSP, plugin
-                                        sync, attribution, auto-memory,
-                                        background prefetches, keychain reads,
-                                        and CLAUDE.md auto-discovery. Sets
+  --bare                                Minimal mode: skip hooks (those defined
+                                        in settings and by installed plugins;
+                                        features built into Claude Code are
+                                        unaffected), LSP, plugin sync,
+                                        attribution, auto-memory, background
+                                        prefetches, keychain reads, and
+                                        CLAUDE.md auto-discovery. Sets
                                         CLAUDE_CODE_SIMPLE=1. Anthropic auth is
                                         strictly ANTHROPIC_API_KEY or
                                         apiKeyHelper via --settings (OAuth and
@@ -204,15 +208,15 @@ Options:
                                         open interactive picker with optional
                                         search term
   --safe-mode                           Start with all customizations
-                                        (CLAUDE.md, skills, plugins, hooks, MCP
-                                        servers, custom commands and agents,
-                                        output styles, workflows, custom themes,
-                                        keybindings, and more) disabled — useful
-                                        for troubleshooting a broken
+                                        (CLAUDE.md, skills, installed plugins,
+                                        hooks, MCP servers, custom commands and
+                                        agents, output styles, workflows, custom
+                                        themes, keybindings, and more) disabled
+                                        — useful for troubleshooting a broken
                                         configuration. Admin-managed (policy)
                                         settings still apply. Auth, model
-                                        selection, built-in tools, and
-                                        permissions work normally. Sets
+                                        selection, built-in tools and plugins,
+                                        and permissions work normally. Sets
                                         CLAUDE_CODE_SAFE_MODE=1.
   --session-id <uuid>                   Use a specific session ID for the
                                         conversation (must be a valid UUID)

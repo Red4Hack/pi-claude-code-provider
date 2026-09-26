@@ -143,9 +143,11 @@ test("doctor names the model each alias would be served, or says it cannot", () 
     assert.doesNotMatch(pro, /credits (?:are|enabled and|disabled)/);
     const max = formatDoctorSummary({ ...base, installation: { ...base.installation, subscriptionType: "max" }, modelVersions: versions });
     assert.doesNotMatch(max, /requires usage credits/);
-    // A missing alias is reported as unavailable rather than omitted silently.
-    assert.match(formatDoctorSummary({ ...base, modelVersions: { sonnet: "claude-sonnet-5" } }), /sonnet claude-sonnet-5, fable unavailable, opus unavailable, haiku unavailable/);
-    assert.match(formatDoctorSummary({ ...base, modelVersions: {} }), /sonnet unavailable/);
+    // An alias the scanner could not identify is reported as undetermined rather
+    // than omitted silently, and never as unavailable: the scan is not a runtime check.
+    assert.match(formatDoctorSummary({ ...base, modelVersions: { sonnet: "claude-sonnet-5" } }), /sonnet claude-sonnet-5, fable undetermined, opus undetermined, haiku undetermined/);
+    assert.match(formatDoctorSummary({ ...base, modelVersions: {} }), /sonnet undetermined/);
+    assert.doesNotMatch(formatDoctorSummary({ ...base, modelVersions: {} }), /unavailable/);
 });
 
 test("doctor summary handles absent, successful, and failed request diagnostics", () => {
@@ -187,15 +189,18 @@ test("doctor summary puts one labeled fact on each line", () => {
 });
 
 test("doctor reports a served context window only once it stops matching the configured one", () => {
-    // The budget checks bound a request against the configured window, so a
-    // smaller served one makes them too permissive. The fixture's sonnet on Pro
+    // Pi compacts by the configured window, so a smaller served one lets sessions
+    // grow until Claude Code refuses them. The fixture's sonnet on Pro
     // configures 1M, which the paid matrix has verified, so a match stays silent.
     const base = doctorBase();
     assert.doesNotMatch(formatDoctorSummary({ ...base, metrics }), /Context window:/);
     const drifted = formatDoctorSummary({ ...base, metrics: { ...metrics, servedContextWindow: 200000 } });
-    assert.match(drifted, /^Context window: sonnet served 200000, configured 1000000; request budget checks use the configured value$/m);
+    assert.match(drifted, /^Context window: sonnet served 200000, configured 1000000; Pi compacts by the configured value$/m);
     // A larger served window is still a mismatch worth stating; only equality is silent.
     assert.match(formatDoctorSummary({ ...base, metrics: { ...metrics, requestedModel: "haiku", servedContextWindow: 1000000 } }), /haiku served 1000000, configured 200000/);
+    // Opus is served with its 1M window on Pro, which the fixture's account uses.
+    assert.equal(base.installation.subscriptionType, "pro");
+    assert.doesNotMatch(formatDoctorSummary({ ...base, metrics: { ...metrics, requestedModel: "opus", servedContextWindow: 1000000 } }), /Context window:/);
     // Nothing to compare against is not a finding.
     assert.doesNotMatch(formatDoctorSummary({ ...base, metrics: { ...metrics, servedContextWindow: undefined } }), /Context window:/);
     assert.doesNotMatch(formatDoctorSummary({ ...base, metrics: { ...metrics, requestedModel: "unknown-alias" } }), /Context window:/);

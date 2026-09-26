@@ -5,7 +5,7 @@ import { rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { Type } from "typebox";
 import { inspectClaudeInstallation } from "../src/auth.ts";
-import { providerModelsForSubscription } from "../src/catalog.ts";
+import { providerModels as catalogModels } from "../src/catalog.ts";
 import { bridgeArgv } from "../src/claude-args.ts";
 import { readClaudeModelAliases } from "../src/claude-models.ts";
 import { MINIMUM_VERSIONS, VERIFIED_VERSIONS, platformStatus, startupPlatformWarning, versionStatus } from "../src/compatibility.ts";
@@ -39,7 +39,7 @@ export default async function piClaudeCodeProvider(pi: ExtensionAPI): Promise<vo
     registerUnavailableNotice(pi, errorText(error));
     return;
   }
-  const providerModels = providerModelsForSubscription(installation.subscriptionType);
+  const providerModels = catalogModels();
   const currentPlatform = platformStatus();
   const searchOutputs = createSearchOutputOwner();
   const imageStore = new SessionImageStore();
@@ -201,7 +201,7 @@ function registerDoctorCommand(pi: ExtensionAPI, runtimeCleanup: RuntimeCleanupR
           piStatus,
           claudeStatus,
           installation: current,
-          modelIds: providerModelsForSubscription(current.subscriptionType).map((model) => model.id),
+          modelIds: catalogModels().map((model) => model.id),
           // Diagnostic only, and fail-soft: a doctor run must never fail
           // because Claude Code moved an undocumented internal table.
           modelVersions: await readClaudeModelAliases(current).catch(() => undefined),

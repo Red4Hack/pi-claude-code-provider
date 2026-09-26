@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 // Claude Code's help, captured byte-for-byte. Re-pin with
 // `npm run capture:claude-surface` and update this constant deliberately; a
 // hand-written approximation invents spellings the CLI never emitted.
-export const CAPTURED_CLAUDE_VERSION = "2.1.270";
+export const CAPTURED_CLAUDE_VERSION = "2.1.281";
 export const CAPTURED_CLAUDE_HELP_PATH = fileURLToPath(
   new URL(`./captured/claude-${CAPTURED_CLAUDE_VERSION}-help.txt`, import.meta.url),
 );
@@ -13,11 +13,17 @@ export const CLAUDE_HEADLESS_HELP = readFileSync(CAPTURED_CLAUDE_HELP_PATH, "utf
 // Claude Code stdout for the mid-response recovery scenarios, captured from this
 // version and sanitized. Regenerate with `npm run capture:claude-stream-recovery`; these
 // shapes are only worth testing against because Claude Code really emitted them.
-export const CAPTURED_STREAM_RECOVERY_VERSION = "2.1.274";
+export const CAPTURED_STREAM_RECOVERY_VERSION = "2.1.281";
+
+// live-cut-late came from a real API stream cut by a forwarding proxy, so it cost
+// quota and the capture script cannot regenerate it. It keeps the version in its
+// own init record rather than following the scripted set.
+export const CAPTURED_LIVE_CUT_VERSION = "2.1.274";
 
 export function streamRecoveryRecords(scenario) {
+  const version = scenario === "live-cut-late" ? CAPTURED_LIVE_CUT_VERSION : CAPTURED_STREAM_RECOVERY_VERSION;
   const path = fileURLToPath(
-    new URL(`./captured/claude-${CAPTURED_STREAM_RECOVERY_VERSION}-stream-${scenario}.jsonl`, import.meta.url),
+    new URL(`./captured/claude-${version}-stream-${scenario}.jsonl`, import.meta.url),
   );
   return readFileSync(path, "utf8").trim().split("\n").map((line) => JSON.parse(line));
 }

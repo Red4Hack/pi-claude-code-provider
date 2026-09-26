@@ -1,7 +1,8 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { existsSync } from "node:fs";
 import { buildClaudeEnvironment, claudeLaunch } from "./auth.ts";
 import { stderrExcerpt } from "./claude-protocol.ts";
-import { appendCleanupFailure, ClaudeCodeError, errorText } from "./errors.ts";
+import { appendCleanupFailure, ClaudeCodeError, errorCode, errorText } from "./errors.ts";
 import { ProcessTerminationError, type ProcessSupervisor, type superviseProcess } from "./process-utils.ts";
 import { recordRuntimeChild } from "./runtime-directories.ts";
 import { tailText } from "./text.ts";
@@ -85,7 +86,7 @@ export function spawnClaudeProcess(options: ClaudeProcessOptions): ClaudeProcess
   const supervisor = options.supervise(child, {
     idleTimeoutMs: options.idleTimeoutMs,
     totalTimeoutMs: options.totalTimeoutMs,
-    onFailure: options.onFailure,
+    onFailure: (error) => options.onFailure(vanishedExecutable(error, options.installation.executable) ?? error),
   });
   let terminationFailure: unknown;
   const terminate = async (): Promise<void> => {
@@ -116,7 +117,11 @@ export function spawnClaudeProcess(options: ClaudeProcessOptions): ClaudeProcess
   return {
     child,
     supervisor,
-    recordOwnership: () => recordRuntimeChild(options.directory, child.pid ?? 0),
+    // A child that failed to spawn has no PID and nothing to own; its spawn error
+    // reaches onFailure, which already names the cause.
+    recordOwnership: async () => {
+      if (child.pid !== undefined) await recordRuntimeChild(options.directory, child.pid);
+    },
     stderrExcerpt: () => stderrExcerpt(stderr, [options.directory, ...(options.privatePaths ?? [])]),
     terminate,
     terminateInBackground,
@@ -152,6 +157,19 @@ export async function settleFailure(
       livenessUnknown: terminationError instanceof ProcessTerminationError,
     };
   }
+}
+
+/**
+ * Preflight resolves Claude Code to the real path of the build it validated, and
+ * a native install's updater later deletes old builds. A session that outlives
+ * that would otherwise fail every request with a bare spawn ENOENT.
+ */
+function vanishedExecutable(error: Error, executable: string): ClaudeCodeError | undefined {
+  if (errorCode(error) !== "ENOENT" || existsSync(executable)) return undefined;
+  return new ClaudeCodeError(
+    "executable_missing",
+    `Claude Code at ${executable} no longer exists, probably removed by a Claude Code update; run /reload`,
+  );
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {

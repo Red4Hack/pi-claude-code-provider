@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { buildClaudeEnvironment } from "./auth.ts";
-import { providerModelsForSubscription } from "./catalog.ts";
+import { providerModels } from "./catalog.ts";
 import { bridgeArgv, bridgeLaunch, formatBridgeArgv } from "./claude-args.ts";
 import { MODEL_ALIASES, type ModelAliasVersions } from "./claude-models.ts";
 import type { VersionStatus } from "./compatibility.ts";
@@ -208,19 +208,19 @@ export function formatDoctorSummary(input: DoctorSummaryInput): string {
 /**
  * Claude Code's own reported context window, when it has stopped matching the one
  * this package advertises. Only a mismatch is reported, because a match is the
- * ordinary case and says nothing. It is worth stating because the budget checks in
- * src/provider.ts bound every request against the *configured* value: a served
- * window smaller than that makes them too permissive, and the request then fails at
- * the API, mid-stream, after quota has been spent.
+ * ordinary case and says nothing. It is worth stating because Pi places its
+ * compaction threshold by the *configured* value: a served window smaller than
+ * that lets sessions grow until Claude Code refuses them as too long, and one
+ * larger compacts sessions that still had room.
  */
 function servedContextWindowNote(input: DoctorSummaryInput, metrics: RequestMetrics): string | undefined {
   const served = metrics.servedContextWindow;
   if (typeof served !== "number" || !Number.isFinite(served) || served <= 0) return undefined;
-  const configured = providerModelsForSubscription(input.installation.subscriptionType)
+  const configured = providerModels()
     .find((model) => model.id === metrics.requestedModel)?.contextWindow;
   if (configured === undefined || configured === served) return undefined;
   return `Context window: ${metrics.requestedModel} served ${served}, configured ${configured}; ` +
-    "request budget checks use the configured value";
+    "Pi compacts by the configured value";
 }
 
 /**
@@ -251,7 +251,7 @@ function formatServedModels(input: DoctorSummaryInput): string {
   if (advertised.length === 0) return "";
   const entries = advertised.map((alias) => {
     const model = versions[alias];
-    if (model === undefined) return `${alias} unavailable`;
+    if (model === undefined) return `${alias} undetermined`;
     const caveat = alias === "fable" && input.installation.subscriptionType === "pro"
       ? " (Pro: requires usage credits enabled)"
       : "";

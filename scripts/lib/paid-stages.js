@@ -31,7 +31,7 @@ export const PAID_STAGES = {
   "cache-haiku": { label: "Haiku cache", cap: 3, script: "live-test.js", args: ["--cache", "--cache-model", "haiku"] },
   "cache-images": { label: "Sonnet image cache", cap: 3, script: "live-test.js", args: ["--cache-images", "--cache-model", "sonnet:low"] },
   "cache-images-haiku": { label: "Haiku image cache", cap: 3, script: "live-test.js", args: ["--cache-images", "--cache-model", "haiku"] },
-  // Fable 5 availability and included quota vary by subscription tier, so its
+  // Fable availability and included quota vary by subscription tier, so its
   // one-launch case is opt-in and excluded from the blocking gate.
   fable: { label: "fable model", cap: 1, script: "model-matrix.js", args: ["--case", "fable:medium"] },
   opus: { label: "opus model", cap: 1, script: "model-matrix.js", args: ["--case", "opus:medium"] },

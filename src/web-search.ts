@@ -10,7 +10,7 @@ import { recordSearchMetrics } from "./metrics.ts";
 import { claimPaidTestLaunch } from "./paid-launch-budget.ts";
 import { ProcessTerminationError, superviseProcess } from "./process-utils.ts";
 import { createRuntimeDirectory, removeRuntimeDirectory } from "./runtime-directories.ts";
-import { parseRateLimitNotice, rateLimitRejectionMessage, terminalResultErrorDetail, type RateLimitNoticeSink, validateClaudeInitialization } from "./claude-protocol.ts";
+import { parseRateLimitNotice, rateLimitRejectionMessage, recordKind, terminalResultErrorDetail, type RateLimitNoticeSink, validateClaudeInitialization } from "./claude-protocol.ts";
 
 const MAX_CAPTURE_BYTES = 2 * 1024 * 1024;
 const MAX_REQUEST_BYTES = 64 * 1024;
@@ -171,7 +171,7 @@ export async function searchWithClaude(
     await stdoutDone;
     if (signal?.aborted) throw new Error("Web search was cancelled");
     if (processFailure) {
-      metrics.errorCategory = "process";
+      metrics.errorCategory = processFailure instanceof ClaudeCodeError ? processFailure.code : "process";
       throw processFailure;
     }
     if (oversized) throw new Error("Claude web search exceeded the maximum captured response size");
@@ -271,7 +271,7 @@ class SearchProtocol {
     // system records are ignored after init too.
     if (!this.initialized && record.type === "system") return;
     if (!this.initialized) {
-      throw new ClaudeCodeError("protocol_order", "Claude web search emitted a record before initialization");
+      throw new ClaudeCodeError("protocol_order", `Claude web search emitted a ${recordKind(record)} record before initialization`);
     }
     if (this.resultRecord) {
       throw new ClaudeCodeError("protocol_order", "Claude web search emitted a record after its result");

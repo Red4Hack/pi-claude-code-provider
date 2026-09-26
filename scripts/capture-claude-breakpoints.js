@@ -35,6 +35,7 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { claudeExecutable, buildClaudeEnvironment } from "../src/auth.ts";
+import { providerModels } from "../src/catalog.ts";
 import { providerArgs, thinkingDisplay } from "../src/claude-args.ts";
 import { SessionImageStore } from "../src/session-image-store.ts";
 
@@ -84,7 +85,13 @@ function parseOptions(argv) {
     else throw new Error(`Unknown option: ${flag}`);
   }
   if (!Number.isInteger(options.images) || options.images < 0) throw new Error("--images requires a non-negative integer");
-  if (options.model === "haiku" && options.effortExplicit) throw new Error("Haiku does not support --effort");
+  const configured = providerModels().find((model) => model.id === options.model);
+  if (!configured) throw new Error(`Unknown model alias: ${options.model}`);
+  // A model without effort control sends none, as the provider does.
+  if (!configured.reasoning) {
+    if (options.effortExplicit) throw new Error(`${options.model} does not support --effort`);
+    options.effort = undefined;
+  }
   return options;
 }
 

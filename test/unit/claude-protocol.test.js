@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { terminalResultErrorDetail, validateClaudeInitialization } from "../../src/claude-protocol.ts";
+import { recordKind, terminalResultErrorDetail, validateClaudeInitialization } from "../../src/claude-protocol.ts";
 
 const base = {
     type: "system",
@@ -47,4 +47,33 @@ test("reports sanitized MCP initialization errors without private paths", () => 
 test("shares terminal result diagnostics across Claude protocol consumers", () => {
     assert.equal(terminalResultErrorDetail({ result: null, errors: ["first", "second"] }), "first; second");
     assert.equal(terminalResultErrorDetail({ terminal_reason: "limit" }, "assistant detail"), "assistant detail");
+});
+
+test("names what an isolation failure found, bounded and without paths", () => {
+    const expectation = { tools: new Set(), mcpServer: "none" };
+    // Claude Code 2.1.281's built-in agents-md plugin is exactly this kind of drift.
+    assert.throws(
+        () => validateClaudeInitialization({ ...base, plugins: [{ name: "agents-md", path: "/opt/claude/plugins/agents-md" }] }, expectation),
+        (error) => {
+            assert.equal(error.code, "isolation_customizations");
+            assert.equal(error.message, "Claude Code loaded unexpected customizations (plugins: agents-md)");
+            return true;
+        },
+    );
+    const many = ["a", "b", "c", "d", "e", "f", "g"];
+    assert.throws(
+        () => validateClaudeInitialization({ ...base, skills: ["/private/skill"], slash_commands: many }, expectation),
+        /\(skills: <path>; slash_commands: a, b, c, d, e, and 2 more\)$/,
+    );
+    assert.throws(
+        () => validateClaudeInitialization({ ...base, mcp_servers: [{ name: "rogue", status: "connected" }] }, expectation),
+        /Claude Code loaded an unexpected MCP server \(rogue\)$/,
+    );
+});
+
+test("names a record by its bounded type and subtype", () => {
+    assert.equal(recordKind({ type: "system", subtype: "commands_changed" }), "system/commands_changed");
+    assert.equal(recordKind({ type: "result" }), "result");
+    assert.equal(recordKind({}), "untyped");
+    assert.equal(recordKind({ type: "sys<tem>\n", subtype: 7 }), "system");
 });

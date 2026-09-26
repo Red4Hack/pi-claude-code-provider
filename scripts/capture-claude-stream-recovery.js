@@ -95,6 +95,17 @@ const SCENARIOS = {
   "max-tokens": ({ attempt, model }) => ({
     sse: messageStart(`msg_${attempt}`, model) + textStart(0, attempt === 1 ? "truncated by limit" : "continued") + blockStop(0) + messageEnd(attempt === 1 ? "max_tokens" : "end_turn"),
   }),
+  // The API refuses an input that alone exceeds the window, before any stream bytes.
+  "prompt-too-long": () => ({
+    status: 400,
+    body: '{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 1000500 tokens > 1000000 maximum"}}',
+  }),
+  // Generation reached the context window, which the API reports as its own stop
+  // reason rather than an error when input plus max_tokens exceeds the window.
+  "context-window-exceeded": ({ attempt, model }) => ({
+    sse: messageStart(`msg_${attempt}`, model) + textStart(0, attempt === 1 ? "cut off by the window" : "continued") + blockStop(0) +
+      messageEnd(attempt === 1 ? "model_context_window_exceeded" : "end_turn"),
+  }),
   // A normal tool proposal, including the permission_denied and tool_result records
   // Claude Code emits before the stop reason in every handoff.
   "tool-ok": ({ attempt, model }) =>

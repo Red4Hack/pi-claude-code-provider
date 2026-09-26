@@ -3,6 +3,8 @@ import test from "node:test";
 import {
     AssistantMessageFrameEncoder,
     createAssistantMessageEventStream,
+    isContextOverflow,
+    isRecoverableLength,
     isRetryableAssistantError,
     reduceAssistantMessageFrames,
 } from "@earendil-works/pi-ai";
@@ -187,6 +189,10 @@ test("rejects duplicate initialization, unknown records, and invalid event order
     const ordering = makeMapper(createAssistantMessageEventStream(), createOutput(model), new Set(), new Map(), () => { });
     init(ordering);
     assert.throws(() => ordering.accept({ type: "stream_event", event: { type: "content_block_stop", index: 0 } }), /before message_start/);
+    // Early system records are skipped; any other early record names itself.
+    const early = makeMapper(createAssistantMessageEventStream(), createOutput(model), new Set(), new Map(), () => { });
+    early.accept({ type: "system", subtype: "commands_changed" });
+    assert.throws(() => early.accept({ type: "result", subtype: "success" }), /Claude emitted a result\/success record before initialization/);
 });
 test("maps result-only fallback text, served limits, and cache details", async () => {
     const stream = createAssistantMessageEventStream();
@@ -863,6 +869,24 @@ test("returns a length stop when a response reaches the output limit", async () 
     // The text produced before the limit is kept, not discarded with the turn.
     assert.equal(output.content.some((block) => block.type === "text" && block.text.length > 0), true);
 });
+test("returns a length stop Pi recovers from when generation reaches the context window", async () => {
+    // The API accepts input plus max_tokens beyond the window and stops at the window;
+    // Claude Code answers that stop with the same continuation turn as max_tokens.
+    const { message, events, output } = await replayCapture("context-window-exceeded");
+    assert.equal(message.stopReason, "length");
+    assert.equal(events.at(-1)?.type, "done");
+    assert.equal(output.content.some((block) => block.type === "text" && block.text.length > 0), true);
+    // Pi compacts and retries a length stop that fell short of the model's output limit.
+    assert.equal(isRecoverableLength(message, 64_000), true);
+});
+test("reports a prompt too long for the window as an overflow Pi compacts", async () => {
+    const { message } = await replayCapture("prompt-too-long");
+    assert.equal(message.stopReason, "error");
+    assert.match(message.errorMessage, /Prompt is too long/);
+    assert.equal(isContextOverflow(message), true, message.errorMessage);
+    // Repeating the same oversized request cannot succeed.
+    assert.equal(isRetryableAssistantError(message), false, message.errorMessage);
+});
 test("accepts the output-limit handoff acknowledgement and fails closed on near misses", async () => {
     const lengthTermination = (overrides = {}) => exactToolTerminationResult({ stop_reason: "max_tokens", ...overrides });
     const accepted = readyToolMapper("max_tokens");
@@ -870,9 +894,14 @@ test("accepts the output-limit handoff acknowledgement and fails closed on near 
     assert.equal(accepted.mapper.isTerminal, false);
     assert.equal(accepted.mapper.completeLength(), true);
     assert.equal((await accepted.stream.result()).stopReason, "length");
+    const windowStop = readyToolMapper("model_context_window_exceeded");
+    windowStop.mapper.accept(lengthTermination({ stop_reason: "model_context_window_exceeded" }), "tool_handoff");
+    assert.equal(windowStop.mapper.completeLength(), true);
+    assert.equal((await windowStop.stream.result()).stopReason, "length");
     const nearMisses = [
         { name: "wrong cause", cause: "none", record: lengthTermination() },
         { name: "wrong result stop", cause: "tool_handoff", record: lengthTermination({ stop_reason: "end_turn" }) },
+        { name: "other length stop", cause: "tool_handoff", record: lengthTermination({ stop_reason: "model_context_window_exceeded" }) },
         { name: "wrong terminal reason", cause: "tool_handoff", record: lengthTermination({ terminal_reason: "provider_error" }) },
         { name: "non-null API status", cause: "tool_handoff", record: lengthTermination({ api_error_status: 500 }) },
     ];
@@ -885,7 +914,7 @@ test("accepts the output-limit handoff acknowledgement and fails closed on near 
 test("replays every captured scenario through Pi's own frame encoder and reducer", async () => {
     // Pi's assistant events are append-only. Rewriting published content to reuse a
     // recovered stream, as the rejected external fix did, makes these throw.
-    for (const [scenario] of [...INTERRUPTED, ["http529"], ["post-stop"], ["tool-ok"], ["max-tokens"]]) {
+    for (const [scenario] of [...INTERRUPTED, ["http529"], ["post-stop"], ["tool-ok"], ["max-tokens"], ["context-window-exceeded"], ["prompt-too-long"]]) {
         const { events, liveFrames } = await replayCapture(scenario);
         assert.equal(liveFrames.length > 0, true, `${scenario} produced no frames`);
         assert.doesNotThrow(() => reduceAssistantMessageFrames(liveFrames), `${scenario} (live)`);

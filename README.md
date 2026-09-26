@@ -9,7 +9,7 @@ This project was developed using frontier AI models under human guidance. Almost
 ## Requirements
 
 - [Pi](https://pi.dev) 0.86.1 or newer, installed from npm or a standalone build
-- Claude Code 2.1.270 or newer
+- Claude Code 2.1.281 or newer
 - Claude Code logged in to an eligible Pro, Max, Team, or Enterprise claude.ai subscription
 - Node.js 22.19 or newer only when Pi itself is installed from npm; the standalone build needs no separate Node installation
 
@@ -43,7 +43,7 @@ To select one directly:
 
 From the command line, use `pi --model pi-claude-code-provider/sonnet`.
 
-Sonnet, Fable, and Opus support Pi thinking levels from `low` through `max`. Haiku uses Claude Code's default thinking, even when Pi shows thinking as off. Opus has a 200K context window on Pro and 1M on Max, Team, and Enterprise; this provider keeps Pro at 200K even if Claude Code reports a 1M-capable variant.
+Sonnet, Fable, and Opus support Pi thinking levels from `low` through `max`. Haiku uses Claude Code's default thinking, even when Pi shows thinking as off. Sonnet, Fable, and Opus have a 1M context window on every plan, including Pro; Haiku has 200K.
 
 Fable availability and billing vary by subscription tier; see Anthropic's [Fable plan policy](https://support.claude.com/en/articles/15424964-claude-fable-5-on-your-plan).
 
@@ -102,6 +102,7 @@ Tool-bearing side requests need a registered Pi session or a working-directory d
 ### Troubleshooting
 
 - **Provider missing or unavailable:** run `/pi-claude-code-provider-doctor`, correct the problem it reports, then run `/reload`.
+- **Requests fail right after Claude Code updated:** run the doctor. If it reports your Claude Code version as unverified, install the tested version it names with `claude install <version>`. To avoid a repeat, set `"autoUpdatesChannel": "stable"` in Claude Code's settings, which waits about a week and skips releases with major regressions, or set `DISABLE_AUTOUPDATER` to `"1"` in their `env`. See [Claude Code's setup guide](https://code.claude.com/docs/en/setup).
 - **Authentication or subscription failure:** run `claude auth status` and sign in with an eligible subscription. For rate-limit or billing errors, check your subscription limits and usage-credit settings. Logins through `CLAUDE_CODE_OAUTH_TOKEN` are unsupported.
 - **Tools fail or requests report `mcp_startup`:** run the doctor to check the tool bridge handshake.
 - **A subscription limit ends the turn instead of retrying:** that is deliberate. A session or weekly window cannot reopen before its reset, so each retry would spend another Claude launch for the same failure. The message names the window and its reset; Pi's retry budget still applies to transient failures.

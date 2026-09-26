@@ -48,6 +48,8 @@ test("builds an allowlisted Claude environment", () => {
         assert.equal(env.CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS, "1");
         assert.equal(env.DISABLE_NON_ESSENTIAL_MODEL_CALLS, undefined);
         assert.equal(env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, "1");
+        // Pi owns compaction; Claude Code must never compact the replayed transcript.
+        assert.equal(env.DISABLE_COMPACT, "1");
         assert.equal(env.HOME, process.env.HOME);
     }
     finally {
@@ -137,8 +139,8 @@ test("matches option aliases and value notation", () => {
 test("compares versions numerically rather than lexically", () => {
     // The failure this guards is real: "2.1.9" sorts above "2.1.241" as strings.
     assert.equal(meetsMinimumVersion("2.1.9", "2.1.241"), false);
-    assert.equal(meetsMinimumVersion("2.1.270", MINIMUM_VERSIONS.claudeCode), true);
-    assert.equal(meetsMinimumVersion("2.1.269", MINIMUM_VERSIONS.claudeCode), false);
+    assert.equal(meetsMinimumVersion("2.1.281", MINIMUM_VERSIONS.claudeCode), true);
+    assert.equal(meetsMinimumVersion("2.1.280", MINIMUM_VERSIONS.claudeCode), false);
     assert.equal(meetsMinimumVersion("2.2.0", MINIMUM_VERSIONS.claudeCode), true);
     assert.equal(meetsMinimumVersion("3.0.0", MINIMUM_VERSIONS.claudeCode), true);
     assert.equal(meetsMinimumVersion("0.86.1", MINIMUM_VERSIONS.pi), true);
@@ -204,6 +206,31 @@ else process.stdout.write(${JSON.stringify(CLAUDE_HEADLESS_HELP)});
     }
     finally {
         if (originalClaude === undefined) delete process.env.PI_CLAUDE_CODE_PROVIDER_PATH; else process.env.PI_CLAUDE_CODE_PROVIDER_PATH = originalClaude;
+        await rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    }
+});
+
+test("a missing Claude executable names PATH and the override instead of reading as not runnable", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-claude-code-provider-auth-missing-"));
+    const original = { path: process.env.PATH, override: process.env.PI_CLAUDE_CODE_PROVIDER_PATH };
+    process.env.PATH = directory;
+    delete process.env.PI_CLAUDE_CODE_PROVIDER_PATH;
+    try {
+        await assert.rejects(inspectClaudeInstallation(), (error) => {
+            assert.equal(error.code, "executable_missing");
+            assert.match(error.message, /claude was not found on PATH; install it or set PI_CLAUDE_CODE_PROVIDER_PATH/);
+            return true;
+        });
+        process.env.PI_CLAUDE_CODE_PROVIDER_PATH = join(directory, "absent-claude");
+        await assert.rejects(inspectClaudeInstallation(), (error) => {
+            assert.equal(error.code, "executable_missing");
+            assert.match(error.message, /Claude Code executable is not runnable: .*absent-claude$/);
+            return true;
+        });
+    }
+    finally {
+        if (original.path === undefined) delete process.env.PATH; else process.env.PATH = original.path;
+        if (original.override === undefined) delete process.env.PI_CLAUDE_CODE_PROVIDER_PATH; else process.env.PI_CLAUDE_CODE_PROVIDER_PATH = original.override;
         await rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
 });

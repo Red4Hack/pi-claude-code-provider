@@ -34,7 +34,7 @@ pi install /absolute/path/to/pi-claude-code-provider
 | Visible web search | `src/web-search.ts` | `web-search.test.js` |
 | Diagnostics and metrics | `src/diagnostics.ts`, `src/doctor.ts`, `src/metrics.ts`, `src/claude-models.ts` | `metrics-doctor.test.js`, `claude-models.test.js` |
 | Proposal-only MCP bridge | `bridge/mcp-proposal-server.js` | `mcp-bridge.test.js` |
-| Paid and live validation | `src/paid-launch-budget.ts`, `scripts/paid-test-runner.js`, `scripts/live-test.js`, `scripts/model-matrix.js`, `scripts/lib/paid-stages.js`, `scripts/lib/paid-confirmation.js`, `scripts/lib/live-process.js`, `scripts/lib/model-matrix-policy.js`, `scripts/lib/pi-installation.js` | `paid-stages.test.js`, `paid-confirmation.test.js`, `paid-runner-lifecycle.test.js`, `live-process.test.js`, `model-matrix-policy.test.js`, `pi-installation.test.js` |
+| Paid and live validation | `src/paid-launch-budget.ts`, `scripts/paid-test-runner.js`, `scripts/live-test.js`, `scripts/model-matrix.js`, `scripts/lib/paid-stages.js`, `scripts/lib/paid-confirmation.js`, `scripts/lib/live-process.js`, `scripts/lib/pi-installation.js` | `paid-stages.test.js`, `paid-confirmation.test.js`, `paid-runner-lifecycle.test.js`, `live-process.test.js`, `pi-installation.test.js` |
 | Repository policy and capture tooling | `scripts/check.js`, `scripts/typecheck.js`, `scripts/release-check.js`, `scripts/lib/dependency-policy.js`, `scripts/lib/documentation-policy.js`, `scripts/lib/source-policy.js`, `scripts/capture-claude-surface.js`, `scripts/capture-claude-breakpoints.js`, `scripts/capture-claude-stream-recovery.js` | `dependency-policy.test.js`, `documentation-policy.test.js`, `source-policy.test.js`, `claude-fixture.test.js`, `node-fixture.test.js` |
 
 The manifest entry `extensions/index.ts` only re-exports the implementation. Keep the entry an `index.ts`: Pi's startup extension list appends any other entry's filename to the package name.
@@ -54,8 +54,8 @@ Two contracts are easy to break silently:
 
 | Component | Verified baseline |
 | --- | --- |
-| Pi | 0.86.1, npm distribution; standalone tar.gz bridge live-verified on Linux x64 |
-| Claude Code | 2.1.278 |
+| Pi | 0.87.1, npm distribution; standalone tar.gz bridge live-verified on Linux x64 |
+| Claude Code | 2.1.281 |
 | Node.js | 24.16.0 on WSL2, Ubuntu CI, and Apple Silicon macOS CI; 22.23.1 on Ubuntu CI and Windows CI |
 | Platform | Linux x64, gated on WSL2 Ubuntu; native Windows x64; macOS (deterministic CI) |
 
@@ -79,11 +79,11 @@ Compare the installed CLI's help with the pinned capture when moving the verifie
 
 ### Captured stream-recovery records
 
-`test/support/captured/claude-<version>-stream-<scenario>.jsonl` is Claude Code's own stdout for each way it recovers from an API failure, captured from the version `CAPTURED_STREAM_RECOVERY_VERSION` in `test/support/claude-fixture.js` names. The provider's handling of these shapes is tested against them rather than against hand-written sequences, for the same reason the help surface is: a hand-written sequence encodes what we believe Claude Code emits, and the recovery paths are exactly where that belief was wrong.
+`test/support/captured/claude-<version>-stream-<scenario>.jsonl` is Claude Code's own stdout for each way it recovers from an API failure, and for the context-window refusal and stop, captured from the version `CAPTURED_STREAM_RECOVERY_VERSION` in `test/support/claude-fixture.js` names. The provider's handling of these shapes is tested against them rather than against hand-written sequences, for the same reason the help surface is: a hand-written sequence encodes what we believe Claude Code emits, and the recovery paths are exactly where that belief was wrong.
 
 `npm run capture:claude-stream-recovery` regenerates them, using **no quota**. It runs the CLI against a loopback server that scripts each attempt's response, with a dummy token, a temporary `HOME`, and the provider's own `providerArgs` and `buildClaudeEnvironment`. Pass scenario names to capture a subset, `--claude` to select a build, and `--print` to inspect without writing. That dummy login resolves no subscription, so anything the CLI derives from account state carries its unauthenticated default -- most visibly `contextWindow` in each record's `modelUsage`, which reads 200000 for every alias. These files are fixtures for record *shape*; they are not evidence about the window a real account is served, and `src/catalog.ts` records where that evidence does come from. Each file is named for the version in its own init record, so a capture on a newer CLI lands beside the pinned set instead of overwriting it; read the diff, then re-pin `CAPTURED_STREAM_RECOVERY_VERSION` and delete the version the tests no longer load.
 
-`claude-<version>-stream-live-cut-late.jsonl` is the exception: it came from a real API stream interrupted by a local forwarding proxy, so it cost quota and this command cannot reproduce it. The nine scripted scenarios were re-captured on Claude Code 2.1.276 and produce the same record shapes as the pinned 2.1.274 set.
+`claude-<version>-stream-live-cut-late.jsonl` is the exception: it came from a real API stream interrupted by a local forwarding proxy, so it cost quota and this command cannot reproduce it. It keeps its own `CAPTURED_LIVE_CUT_VERSION` instead of following the scripted set; keep that file when deleting a superseded version.
 
 ### Captured Claude Code protocol
 
@@ -152,7 +152,7 @@ Both bridge lanes are required, and `test:paid:release` runs both. A `--no-tools
 
 RPC stages that read replies through `assistantReply` fail on non-redacted thinking blocks with empty text. Print-mode stages do not use that check. Adaptive thinking can skip a turn, so the cache probe and model matrix also report whether thinking text appeared and how many reasoning tokens were used; a turn with no reasoning tokens did not exercise the check.
 
-The release suite covers text, tool, image, isolation, recovery, Unicode, history, web search, cache reuse, both bridge lanes, the gated aliases, and the supported effort matrix. Successful RPC harnesses close stdin so Pi can run session shutdown and flush metrics before exit. The model matrix asserts the family an alias serves, not a dated model id, so an upstream model refresh cannot fail the gate while an alias serving the wrong family still does. Every entry also checks context/output capabilities, cleanup, and the absence of leaked private directories. Pro's `opus` entry retains the conservative 200K context limit.
+The release suite covers text, tool, image, isolation, recovery, Unicode, history, web search, cache reuse, both bridge lanes, the gated aliases, and the supported effort matrix. Successful RPC harnesses close stdin so Pi can run session shutdown and flush metrics before exit. The model matrix asserts the family an alias serves, not a dated model id, so an upstream model refresh cannot fail the gate while an alias serving the wrong family still does. Every entry also checks that the context window and default output cap Claude Code reports for the served model equal the configured ones, cleanup, and the absence of leaked private directories.
 
 Fable is selectable but excluded from the release gate, because its availability and billing vary by tier. On Pro it requires usage credits, and with credits turned off every Fable request fails with an assistant error. Run `npm run test:paid:fable` only on an account where that spend is available and separately authorized; the blocking Sonnet and Opus cases already exercise the shared transport.
 
@@ -194,7 +194,7 @@ Preserve these when changing serialization or Claude arguments:
 When updating Claude Code compatibility:
 
 1. Compare the required CLI flags, initialization fields, stream records, and exact tool inventory.
-2. Recapture the help surface with `npm run capture:claude-surface` and re-pin `CAPTURED_CLAUDE_VERSION`.
+2. If the installed CLI's help differs from the pinned capture, recapture it with `npm run capture:claude-surface` and re-pin `CAPTURED_CLAUDE_VERSION`.
 3. Run `npm run capture:claude-breakpoints` for `sonnet` and `haiku`, and continue only on HEALTHY verdicts.
 4. Cover readiness, invalid or oversized JSONL, timeouts, aborts, error exits, and descendant cleanup deterministically.
 5. Move `src/compatibility.ts`, CI, and the baseline table together, under the rule in [Compatibility baseline](#compatibility-baseline).

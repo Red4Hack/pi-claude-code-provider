@@ -13,7 +13,9 @@ const ELIGIBLE_SUBSCRIPTIONS: ReadonlySet<string> = new Set(["pro", "max", "team
 // Every flag here appears in Claude Code's --help, so absence really does mean
 // the launch would fail. --system-prompt-file is deliberately absent: it is
 // publicly documented but hidden from the help screen, so scraping for it made
-// preflight fail where the real launch succeeds. MINIMUM_VERSIONS covers it.
+// preflight fail where the real launch succeeds. The documented minimum Claude
+// Code version covers it instead; the doctor reports that minimum, but nothing
+// enforces it.
 export const REQUIRED_HEADLESS_FLAGS = [
   "--print",
   "--setting-sources",
@@ -61,16 +63,7 @@ export function parseAuthStatus(stdout: string): ClaudeSubscriptionType {
 }
 
 export async function inspectClaudeInstallation(): Promise<ClaudeInstallation> {
-  const configuredExecutable = claudeExecutable();
-  let executable: string;
-  try {
-    executable = await resolveExecutable(configuredExecutable, "Claude Code", "executable_missing");
-  } catch {
-    throw new ClaudeCodeError(
-      "executable_missing",
-      `Claude Code executable is not runnable: ${configuredExecutable}`,
-    );
-  }
+  const executable = await resolveExecutable(claudeExecutable());
 
   try {
     await validateProcessTerminationCapability();
@@ -137,13 +130,13 @@ function hasCliOption(helpOutput: string, option: string): boolean {
   return new RegExp(`(?:^|[\\s,])${escaped}(?=$|[\\s,=<\\[])`, "m").test(helpOutput);
 }
 
-async function resolveExecutable(configured: string, label: string, code: string): Promise<string> {
+async function resolveExecutable(configured: string): Promise<string> {
   if (isAbsolute(configured) || configured.includes("/") || configured.includes("\\")) {
     try {
       await access(configured, process.platform === "win32" ? constants.F_OK : constants.X_OK);
       return await realpath(configured);
     } catch {
-      throw new ClaudeCodeError(code, `${label} executable is not runnable: ${configured}`);
+      throw new ClaudeCodeError("executable_missing", `Claude Code executable is not runnable: ${configured}`);
     }
   }
   const suffixes = process.platform === "win32" ? windowsExecutableSuffixes() : [""];
@@ -159,7 +152,10 @@ async function resolveExecutable(configured: string, label: string, code: string
       }
     }
   }
-  throw new ClaudeCodeError(code, `${label} is required but ${configured} was not found on PATH`);
+  throw new ClaudeCodeError(
+    "executable_missing",
+    `Claude Code is required but ${configured} was not found on PATH; install it or set PI_CLAUDE_CODE_PROVIDER_PATH to its executable`,
+  );
 }
 
 function windowsExecutableSuffixes(): string[] {
@@ -241,5 +237,8 @@ export function buildClaudeEnvironment(extra: NodeJS.ProcessEnv = {}): NodeJS.Pr
   // can execute a configured Git clean filter before any Pi tool call.
   env.CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS = "1";
   env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
+  // Pi owns compaction. Given a transcript near its limit, Claude Code otherwise
+  // starts compacting it on its own before refusing it as too long.
+  env.DISABLE_COMPACT = "1";
   return { ...env, ...extra };
 }

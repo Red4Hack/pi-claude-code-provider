@@ -128,6 +128,20 @@ process.stdout.write(JSON.stringify({type:"result",is_error:false,result:"source
     }
 });
 
+test("web search explains a Claude Code build removed after preflight", { skip: process.platform === "win32" }, async () => {
+    const fake = await fakeSearch(`process.exit(0);`);
+    await rm(fake.executable);
+    try {
+        const installation = { executable: fake.executable, version: "test", subscriptionType: "pro" };
+        await assert.rejects(searchWithClaude(installation, { query: "query" }), /Claude Code at .+ no longer exists, probably removed by a Claude Code update; run \/reload/);
+        const metrics = getLastSearchMetrics();
+        assert.equal(metrics.errorCategory, "executable_missing");
+        assert.equal(metrics.cleanupComplete, true);
+    }
+    finally {
+        await rm(fake.directory, { recursive: true, force: true });
+    }
+});
 test("web search preserves process-group cleanup rejection and removes private state", async () => {
     const successful = await fakeSearch(`
 process.stdout.write(JSON.stringify(${JSON.stringify(searchInit)}) + "\\n");
@@ -276,11 +290,11 @@ test("web search skips a system record that precedes initialization", async () =
 
 test("web search fails closed on missing, duplicate, and unexpected initialization", async () => {
     const cases = [
-        { body: `process.stdout.write(JSON.stringify({type:"result",is_error:false,result:"no init"})+"\\n");`, pattern: /before initialization/ },
+        { body: `process.stdout.write(JSON.stringify({type:"result",is_error:false,result:"no init"})+"\\n");`, pattern: /emitted a result record before initialization/ },
         { body: `const init=${JSON.stringify(searchInit)}; process.stdout.write(JSON.stringify(init)+"\\n"+JSON.stringify(init)+"\\n");`, pattern: /duplicate initialization/ },
         { body: `process.stdout.write(JSON.stringify(${JSON.stringify({ ...searchInit, tools: ["Bash"] })})+"\\n");`, pattern: /unexpected tool set/ },
         { body: `process.stdout.write(JSON.stringify(${JSON.stringify({ ...searchInit, mcp_servers: [{ name: "rogue", status: "connected" }] })})+"\\n");`, pattern: /unexpected MCP server/ },
-        { body: `process.stdout.write(JSON.stringify(${JSON.stringify({ ...searchInit, plugins: ["rogue"] })})+"\\n");`, pattern: /unexpected customizations/ },
+        { body: `process.stdout.write(JSON.stringify(${JSON.stringify({ ...searchInit, plugins: ["rogue"] })})+"\\n");`, pattern: /unexpected customizations \(plugins: rogue\)/ },
         { body: `process.stdout.write(JSON.stringify(${JSON.stringify({ ...searchInit, apiKeySource: "ANTHROPIC_API_KEY" })})+"\\n");`, pattern: /subscription-backed/ },
     ];
     for (const entry of cases) {

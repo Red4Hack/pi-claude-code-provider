@@ -23,6 +23,25 @@
 - The pre-launch token estimate is calibrated rather than assumed. Measured against a real session transcript by comparing this transport's serialized bytes with Claude's own reported prompt counters over the same messages, dense agent history tokenizes at 2.12 bytes per token; the previous 3-byte ratio, described as conservative, under-counted such a transcript by about a fifth, so the guard did not bound what it claimed to. The ratio is now 2.4 bytes per token with the existing 10% margin.
 - Protocol activity postpones the idle deadline through a timestamp read by one long-lived timer, instead of clearing and recreating a timer for every record.
 
+## [0.5.0] - 2026-09-24
+
+### Changed
+
+- **Breaking.** Claude Code 2.1.281 is now the minimum supported version; update Claude Code (`claude update`) before or with this package. Older versions can still load, but are unsupported and flagged by the doctor.
+- Pi 0.87.1 and Claude Code 2.1.281 are now the validated baseline; the minimum supported Pi version remains 0.86.1.
+- Opus now uses its 1M context window on Pro, as on other plans, and its output limit rises to 128K, matching Claude Opus 5.5 in Claude Code.
+- Long sessions can use their whole context window. The provider no longer refuses a request early by reserving the model's full output limit; Pi's own compaction runs at its usual threshold, and a context too large for the window comes back as "Prompt is too long", which Pi compacts and retries. A response cut off at the window now ends as a `length` stop Pi also recovers from, instead of an interruption error that Pi retried with the same oversized context.
+- Claude Code no longer compacts the replayed conversation on its own (`DISABLE_COMPACT=1`); Pi owns compaction.
+
+### Fixed
+
+- Every request and web search no longer fails on Claude Code 2.1.281 with "Claude emitted a record before initialization" or "Claude Code loaded unexpected customizations". The provider now disables Claude Code's new built-in `agents-md` plugin ([#11](https://github.com/chem/pi-claude-code-provider/issues/11), [#12](https://github.com/chem/pi-claude-code-provider/issues/12), [#13](https://github.com/chem/pi-claude-code-provider/issues/13)).
+- The doctor names the model every alias is served, including Opus and Haiku, by reading only Claude Code's own alias table. An alias it cannot identify is reported as `undetermined` instead of `unavailable`.
+- When `claude` is not on PATH, the provider now says so and names `PI_CLAUDE_CODE_PROVIDER_PATH`, instead of reporting the executable as not runnable.
+- A Pi session that outlives the Claude Code build it started with, after the updater removes that build, now reports "Claude Code at <path> no longer exists … run /reload" instead of a bare spawn ENOENT.
+- Isolation and protocol-order failures now name what Claude Code loaded or emitted, such as `plugins: agents-md` or `system/commands_changed`, so a Claude Code release that adds one is diagnosable from the error alone.
+- Tool and output-limit handoffs accept the provider's own POSIX termination signals after validation and cleanup, including SIGKILL escalation, instead of failing a completed response. Unexpected signal exits still fail ([#10](https://github.com/chem/pi-claude-code-provider/pull/10)).
+
 ## [0.4.0] - 2026-09-20
 
 ### Changed

@@ -19,7 +19,7 @@ import { JsonlParser } from "./jsonl.ts";
 import { recordRequestMetrics } from "./metrics.ts";
 import { createOutput } from "./output.ts";
 import { claimPaidTestLaunch } from "./paid-launch-budget.ts";
-import { ProcessTerminationError, superviseProcess } from "./process-utils.ts";
+import { ProcessTerminationError, superviseProcess, type ProcessResult } from "./process-utils.ts";
 import { removeRuntimeDirectory } from "./runtime-directories.ts";
 import type { ImageStoreLease } from "./session-image-store.ts";
 import type { ResolvedSession, SessionRequest } from "./session-registry.ts";
@@ -141,7 +141,9 @@ export function createClaudeStream(
 
     void (async () => {
       const startedAt = Date.now();
-      const effort = model.id === "haiku" ? "default" : options?.reasoning ?? "medium";
+      // A model without effort control sends none and leaves Claude Code its
+      // default thinking, which metrics record as "default".
+      const effort = model.reasoning ? options?.reasoning ?? "medium" : undefined;
       let prepared: Awaited<ReturnType<typeof prepareRequest>> | undefined;
       let claude: ClaudeProcess | undefined;
       let cwd: string | undefined;
@@ -162,7 +164,7 @@ export function createClaudeStream(
         nodeVersion: process.version,
         claudeVersion: installation.version,
         requestedModel: model.id,
-        effort,
+        effort: effort ?? "default",
         messageCount: requestContext.messages.length,
         toolCount: requestContext.tools?.length ?? 0,
         sessionResolution: resolved?.resolution,
@@ -221,7 +223,8 @@ export function createClaudeStream(
         claude?.terminateInBackground();
       };
 
-      // A response that reached the output limit is complete as far as Pi is concerned.
+      // A response that reached the output limit or the context window is complete as
+      // far as Pi is concerned.
       // Claude Code would answer it with a synthetic continuation turn and another
       // message, so stop it here and publish the length stop. The termination path, and
       // therefore the expected exit codes, are the tool handoff's.
@@ -293,22 +296,25 @@ export function createClaudeStream(
         // file exists, because nothing later in the request can make room for it.
         const systemPromptTokens = estimateTransportTokens(0, 0, systemPromptBytes, 0);
         metrics.estimatedInputTokens = systemPromptTokens;
-        validateSystemPromptBudget(model, systemPromptTokens, options?.maxTokens, effort);
+        validateSystemPromptBudget(model, systemPromptTokens, options?.maxTokens, effort ?? "default");
         prepared = await prepareRequest(effectiveContext, imageLease);
         metrics.cleanupComplete = false;
         metrics.lastPhase = "prepared";
+        metrics.imageCount = prepared.imageCount;
+        metrics.transcriptBytes = prepared.transcriptBytes;
+        metrics.catalogBytes = prepared.catalogBytes;
+        metrics.imageBytes = prepared.imageBytes;
+        // Claude Code gets the output room the context window still has, so a
+        // request whose prompt fits is never refused for reserving the model
+        // maximum; an overflow is still reported so Pi compacts.
         const estimatedInputTokens = estimateTransportTokens(
           prepared.transcriptBytes,
           prepared.catalogBytes,
           systemPromptBytes,
           prepared.attachmentPaths.length,
         );
-        metrics.imageCount = prepared.imageCount;
-        metrics.transcriptBytes = prepared.transcriptBytes;
-        metrics.catalogBytes = prepared.catalogBytes;
-        metrics.imageBytes = prepared.imageBytes;
         metrics.estimatedInputTokens = estimatedInputTokens;
-        const maxOutputTokens = availableOutputTokens(model, estimatedInputTokens, options?.maxTokens, effort);
+        const maxOutputTokens = availableOutputTokens(model, estimatedInputTokens, options?.maxTokens, effort ?? "default");
 
         // Configuration must fail before a paid budget slot is claimed or a
         // Claude process is spawned.
@@ -367,7 +373,7 @@ export function createClaudeStream(
             const vanished = vanishedWorkingDirectory(error, cwd);
             if (error instanceof ProcessTerminationError) errorCategory = "process_cleanup";
             else if (vanished) errorCategory = "working_directory";
-            else errorCategory ??= "process";
+            else errorCategory ??= error instanceof ClaudeCodeError ? error.code : "process";
             mapper?.fail((vanished ?? error).message, options?.signal?.aborted === true);
           },
           onAbort() {
@@ -463,86 +469,21 @@ export function createClaudeStream(
         await running.terminate();
 
         // Phase 4 — validate the exit and private state before publishing success.
-        const stderrDetail = (): string => {
-          const excerpt = running.stderrExcerpt();
-          return excerpt ? `: ${excerpt}` : "";
-        };
-        // Both handoffs settle identically: the provider terminated Claude on
-        // purpose, so an already-terminal mapper only cleans up, an unaccepted exit
-        // fails, and an accepted one publishes after cleanup. Only the accepted
-        // exits, the completion call and the wording differ. Aliased because a
-        // closure does not keep the narrowing this straight-line code has.
-        const settling = mapper;
-        const settleHandoff = async (label: string, exitAccepted: boolean, complete: () => boolean): Promise<void> => {
-          if (settling.isTerminal) {
-            await cleanupPrepared();
-          } else if (!exitAccepted) {
-            errorCategory = "process_exit";
-            settling.fail(
-              await failureAfterCleanup(
-                `Claude Code ${label} exited unexpectedly (code ${String(result.code)}, signal ${String(result.signal)})`,
-              ),
-            );
-          } else {
-            await cleanupPrepared();
-            if (complete()) metrics.lastPhase = "completed";
-          }
-        };
-        if (toolUse) {
-          // These two precede settlement and belong to the tool handoff alone:
-          // an output limit proposes nothing that could have been executed or
-          // aimed at private state.
-          if (prepared.violationPath && (await pathExists(prepared.violationPath))) {
-            errorCategory = "mcp_execution";
-            mapper.fail(
-              await failureAfterCleanup(
-                "Security invariant violated: Claude Code attempted to execute a Pi proposal tool internally",
-              ),
-            );
-          } else if (containsPrivateTransportToolArgument(output, [prepared.directory, ...(prepared.imageStoreDirectory ? [prepared.imageStoreDirectory] : [])])) {
-            errorCategory = "private_transport";
-            mapper.fail(
-              await failureAfterCleanup("Claude Code proposed a Pi tool call against provider-private transport state"),
-            );
-          } else {
-            await settleHandoff("tool handoff", isExpectedToolHandoffExit(result), () => settling.completeToolUse());
-          }
-        } else if (lengthStop) {
-          // Claude Code can finish the continuation turn it starts after an output
-          // limit and exit cleanly before the background termination lands. The
-          // response Pi asked for is complete and already mapped by then, so
-          // publish it rather than failing a turn that succeeded. completeLength()
-          // still requires the max_tokens stop, so this widens nothing. In that
-          // race the result record's usage covers the continuation turn too, which
-          // is left as reported rather than corrected.
-          const finishedBeforeTermination = mapper.hasSuccessfulResult && result.code === 0 && result.signal === null;
-          await settleHandoff(
-            "output limit handoff",
-            isExpectedToolHandoffExit(result) || finishedBeforeTermination,
-            () => settling.completeLength(),
-          );
-        } else if (mapper.hasSuccessfulResult) {
-          if (result.code !== 0 || result.signal !== null) {
-            errorCategory ??= "process_exit";
-            mapper.fail(
-              await failureAfterCleanup(
-                `Claude Code exited after a successful result (code ${String(result.code)}, signal ${String(result.signal)})${stderrDetail()}`,
-              ),
-            );
-          } else {
-            await cleanupPrepared();
-            if (mapper.completeResult()) metrics.lastPhase = "completed";
-          }
-        } else if (!mapper.isTerminal) {
-          errorCategory ??= mapper.deferredFailure ? "tool_arguments" : mapper.rateLimitFailure ? "rate_limit" : "process_exit";
-          mapper.fail(
-            await failureAfterCleanup(
-              mapper.deferredFailure ??
-                mapper.rateLimitFailure ??
-                `Claude Code exited before a terminal event (code ${String(result.code)}, signal ${String(result.signal)})${stderrDetail()}`,
-            ),
-          );
+        const outcome = await settleExit({
+          mapper,
+          output,
+          prepared,
+          result,
+          handoff: toolUse ? "tool" : lengthStop ? "length" : undefined,
+          stderrExcerpt: () => running.stderrExcerpt(),
+          cleanup: cleanupPrepared,
+          failureAfterCleanup,
+        });
+        if (outcome.errorCategory) {
+          if (outcome.errorCategory.override) errorCategory = outcome.errorCategory.value;
+          else errorCategory ??= outcome.errorCategory.value;
         }
+        if (outcome.completed) metrics.lastPhase = "completed";
       } catch (caught) {
         const error = vanishedWorkingDirectory(caught, cwd) ?? caught;
         if (error instanceof ProcessTerminationError) errorCategory = "process_cleanup";
@@ -591,14 +532,110 @@ export function createClaudeStream(
   };
 }
 
+interface ExitSettlement {
+  mapper: ClaudeEventMapper;
+  output: MutableOutput;
+  prepared: { directory: string; imageStoreDirectory?: string; violationPath?: string };
+  result: ProcessResult;
+  handoff: "tool" | "length" | undefined;
+  stderrExcerpt: () => string;
+  /** Remove private request state; success is published only after it. */
+  cleanup: () => Promise<void>;
+  /** Remove private request state and return the failure with any cleanup failure appended. */
+  failureAfterCleanup: (failure: string) => Promise<string>;
+}
+
+interface ExitOutcome {
+  /** A category that replaces an earlier one when `override`, else only fills an empty one. */
+  errorCategory?: { value: string; override: boolean };
+  completed: boolean;
+}
+
+/**
+ * Settle a Claude process that has exited and been terminated: validate its exit
+ * against what the request expected, clean private state, and publish exactly one
+ * terminal event through the mapper. Success is always published after cleanup.
+ */
+async function settleExit(settlement: ExitSettlement): Promise<ExitOutcome> {
+  const { mapper, output, prepared, result, cleanup, failureAfterCleanup } = settlement;
+  const exit = `code ${String(result.code)}, signal ${String(result.signal)}`;
+  const stderrDetail = (): string => {
+    const excerpt = settlement.stderrExcerpt();
+    return excerpt ? `: ${excerpt}` : "";
+  };
+  const fail = async (value: string, override: boolean, failure: string): Promise<ExitOutcome> => {
+    mapper.fail(await failureAfterCleanup(failure));
+    return { errorCategory: { value, override }, completed: false };
+  };
+  // Both handoffs settle identically: the provider terminated Claude on purpose,
+  // so an already-terminal mapper only cleans up, an unaccepted exit fails, and an
+  // accepted one publishes after cleanup. Only the accepted exits, the completion
+  // call and the wording differ.
+  const settleHandoff = async (label: string, exitAccepted: boolean, complete: () => boolean): Promise<ExitOutcome> => {
+    if (mapper.isTerminal) {
+      await cleanup();
+      return { completed: false };
+    }
+    if (!exitAccepted) return fail("process_exit", true, `Claude Code ${label} exited unexpectedly (${exit})`);
+    await cleanup();
+    return { completed: complete() };
+  };
+  if (settlement.handoff === "tool") {
+    // These two precede settlement and belong to the tool handoff alone: an
+    // output limit proposes nothing that could have been executed or aimed at
+    // private state.
+    if (prepared.violationPath && (await pathExists(prepared.violationPath))) {
+      return fail("mcp_execution", true, "Security invariant violated: Claude Code attempted to execute a Pi proposal tool internally");
+    }
+    if (containsPrivateTransportToolArgument(output, [prepared.directory, ...(prepared.imageStoreDirectory ? [prepared.imageStoreDirectory] : [])])) {
+      return fail("private_transport", true, "Claude Code proposed a Pi tool call against provider-private transport state");
+    }
+    return settleHandoff("tool handoff", isExpectedToolHandoffExit(result), () => mapper.completeToolUse());
+  }
+  if (settlement.handoff === "length") {
+    // Claude Code can finish the continuation turn it starts after an output
+    // limit and exit cleanly before the background termination lands. The
+    // response Pi asked for is complete and already mapped by then, so publish it
+    // rather than failing a turn that succeeded. completeLength() still requires
+    // the length stop, so this widens nothing. In that race the result record's
+    // usage covers the continuation turn too, which is left as reported rather
+    // than corrected.
+    const finishedBeforeTermination = mapper.hasSuccessfulResult && result.code === 0 && result.signal === null;
+    return settleHandoff(
+      "output limit handoff",
+      isExpectedToolHandoffExit(result) || finishedBeforeTermination,
+      () => mapper.completeLength(),
+    );
+  }
+  if (mapper.hasSuccessfulResult) {
+    if (result.code !== 0 || result.signal !== null) {
+      return fail("process_exit", false, `Claude Code exited after a successful result (${exit})${stderrDetail()}`);
+    }
+    await cleanup();
+    return { completed: mapper.completeResult() };
+  }
+  if (mapper.isTerminal) return { completed: false };
+  const category = mapper.deferredFailure ? "tool_arguments" : mapper.rateLimitFailure ? "rate_limit" : "process_exit";
+  return fail(
+    category,
+    false,
+    mapper.deferredFailure ?? mapper.rateLimitFailure ?? `Claude Code exited before a terminal event (${exit})${stderrDetail()}`,
+  );
+}
+
 export function isExpectedToolHandoffExit(
-  result: { code: number | null; signal: NodeJS.Signals | null },
+  result: ProcessResult,
   platform: NodeJS.Platform = process.platform,
 ): boolean {
-  // A correlated provider-owned handoff closes as code 143 on POSIX. Windows
-  // taskkill /F closes the owned Claude root as code 1. These codes are accepted
-  // only from the tool-handoff path after cleanup and proposal validation.
-  if (result.signal !== null) return false;
+  // POSIX cleanup can escalate to SIGKILL. Accept only signals the supervisor
+  // successfully sent; an unsolicited signal must still fail the handoff.
+  if (result.signal !== null) {
+    return platform !== "win32" &&
+      (result.signal === "SIGTERM" || result.signal === "SIGKILL") &&
+      result.terminationSignals?.includes(result.signal) === true;
+  }
+  // Claude's POSIX handler exits 143; Windows taskkill /F exits 1. This check
+  // runs only after the tool proposal and process cleanup have been validated.
   return platform === "win32" ? result.code === 1 : result.code === 143;
 }
 
@@ -698,10 +735,10 @@ function outputCeiling(model: Model<Api>, requested: number | undefined, effort:
 }
 
 /**
- * A served context window is required rather than assumed. Skipping validation
- * when none is reported would leave the request with no bound at all, and
- * inventing a fallback ceiling would add a second unexplained limit that still
- * could not show the request fits a window nobody stated.
+ * A served context window is required rather than assumed. Skipping the
+ * system-prompt check when none is reported would leave that prompt unbounded,
+ * and inventing a fallback ceiling would add an unexplained limit that still
+ * could not show the prompt fits a window nobody stated.
  *
  * Only positivity and finiteness are required, because the value is compared
  * and never propagated; a fractional override is harmless. Pi rejects a

@@ -656,7 +656,7 @@ test("0.86 transcript one-shot borrowing refuses tools added by the payload hook
     assert.match(result.errorMessage ?? "", /gained tools after before_provider_request/);
     assert.equal(claims, 0);
 });
-test("provider forwards and reserves Pi's effective per-request output limit", async () => {
+test("provider forwards Pi's per-request output limit without reserving it against the window", async () => {
     const directory = await mkdtemp(join(tmpdir(), "provider-max-tokens-"));
     const marker = join(directory, "max-tokens");
     const fake = await fakeClaude(`
@@ -1064,6 +1064,14 @@ test("accepts only the platform-specific provider-terminated handoff exit", () =
     assert.equal(isExpectedToolHandoffExit({ code: 1, signal: null }, "win32"), true);
     assert.equal(isExpectedToolHandoffExit({ code: 143, signal: null }, "win32"), false);
     assert.equal(isExpectedToolHandoffExit({ code: 1, signal: "SIGTERM" }, "win32"), false);
+    for (const signal of ["SIGTERM", "SIGKILL"]) {
+        assert.equal(isExpectedToolHandoffExit({ code: null, signal }, "linux"), false);
+        assert.equal(isExpectedToolHandoffExit({ code: null, signal, terminationSignals: [signal] }, "linux"), true);
+        assert.equal(isExpectedToolHandoffExit({ code: null, signal, terminationSignals: [signal] }, "win32"), false);
+    }
+    assert.equal(isExpectedToolHandoffExit({ code: null, signal: "SIGKILL", terminationSignals: ["SIGTERM"] }, "linux"), false);
+    assert.equal(isExpectedToolHandoffExit({ code: null, signal: "SIGTERM", terminationSignals: ["SIGTERM", "SIGKILL"] }, "linux"), true);
+    assert.equal(isExpectedToolHandoffExit({ code: null, signal: "SIGINT", terminationSignals: ["SIGINT"] }, "linux"), false);
 });
 
 test("provider accepts an exact-PID Windows tool handoff", { skip: process.platform !== "win32" }, async () => {
@@ -1222,7 +1230,7 @@ process.stdin.on("end", () => {
         await rm(fake.dir, { recursive: true, force: true });
     }
 });
-test("provider rejects a signal exit after tool-handoff termination", { skip: process.platform === "win32" }, async () => {
+test("provider accepts its own SIGKILL escalation after tool-handoff cleanup", { skip: process.platform === "win32" }, async () => {
     const fake = await fakeClaude(`
 process.on("SIGTERM", () => {});
 process.stdin.resume();
@@ -1233,10 +1241,32 @@ process.stdin.on("end", () => {
 });`);
     try {
         const result = await createClaudeStream({ executable: fake.executable, version: CAPTURED_CLAUDE_VERSION, subscriptionType: "pro" })(model, toolContext, { reasoning: "medium" }).result();
+        assert.equal(result.stopReason, "toolUse");
+        assert.equal(result.content.find((block) => block.type === "toolCall")?.name, "read");
+        const metrics = await waitForRequestMetrics((entry) => entry.stopReason === "toolUse" && entry.exitSignal === "SIGKILL");
+        assert.equal(metrics.lastPhase, "completed");
+        assert.equal(metrics.cleanupComplete, true);
+        assert.equal(metrics.errorCategory, undefined);
+    }
+    finally {
+        await rm(fake.dir, { recursive: true, force: true });
+    }
+});
+test("provider rejects SIGKILL when it only sent SIGTERM", { skip: process.platform === "win32" }, async () => {
+    const fake = await fakeClaude(`
+process.on("SIGTERM", () => process.kill(process.pid, "SIGKILL"));
+process.stdin.resume();
+process.stdin.on("end", () => {
+  process.stdout.write(JSON.stringify(${JSON.stringify(toolInit)}) + "\\n");
+  for (const record of ${JSON.stringify(toolUseEvents({ messageId: "msg_external_signal", toolUseId: "toolu_external_signal", partialJson: '{"path":"package.json"}' }))}) process.stdout.write(JSON.stringify(record) + "\\n");
+  setInterval(() => {}, 1000);
+});`);
+    try {
+        const result = await createClaudeStream({ executable: fake.executable, version: CAPTURED_CLAUDE_VERSION, subscriptionType: "pro" })(model, toolContext, { reasoning: "medium" }).result();
         assert.equal(result.stopReason, "error");
         assert.match(result.errorMessage ?? "", /tool handoff exited unexpectedly.*SIGKILL/);
         const metrics = await waitForRequestMetrics((entry) => entry.errorCategory === "process_exit" && entry.exitSignal === "SIGKILL");
-        assert.equal(metrics.lastPhase, "process_exited");
+        assert.equal(metrics.cleanupComplete, true);
     }
     finally {
         await rm(fake.dir, { recursive: true, force: true });
@@ -1338,7 +1368,7 @@ test("MCP readiness has a bounded timeout even while the process remains alive",
         await rm(directory, { recursive: true, force: true });
     }
 });
-test("provider enforces idle and context-budget limits", async () => {
+test("provider enforces the idle limit", async () => {
     const idle = await fakeClaude(`process.stdin.resume(); process.stdout.write(JSON.stringify(${JSON.stringify(init)}) + "\\n"); process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"message_start",message:{id:"idle",model:"claude-sonnet-5",usage:{}}}}) + "\\n"); setInterval(() => {}, 1000);`);
     const originalIdle = process.env.PI_CLAUDE_CODE_PROVIDER_IDLE_TIMEOUT_MS;
     const originalTotal = process.env.PI_CLAUDE_CODE_PROVIDER_TOTAL_TIMEOUT_MS;
@@ -1353,22 +1383,12 @@ test("provider enforces idle and context-budget limits", async () => {
         if (originalTotal === undefined) delete process.env.PI_CLAUDE_CODE_PROVIDER_TOTAL_TIMEOUT_MS; else process.env.PI_CLAUDE_CODE_PROVIDER_TOTAL_TIMEOUT_MS = originalTotal;
         await rm(idle.dir, { recursive: true, force: true });
     }
-    for (let attempt = 0; attempt < 20 && getLastRequestMetrics()?.errorCategory !== "process"; attempt++) {
-        await new Promise((resolve) => setTimeout(resolve, 5));
-    }
-    const installation = { executable: "/does/not/run", version: "test", subscriptionType: "pro" };
-    const tinyModel = { ...model, contextWindow: 100, maxTokens: 90 };
-    const budgetResult = await createClaudeStream(installation)(tinyModel, context, { reasoning: "medium" }).result();
-    for (let attempt = 0; attempt < 20 && getLastRequestMetrics()?.errorCategory !== "context_budget"; attempt++) {
-        await new Promise((resolve) => setTimeout(resolve, 5));
-    }
-    assert.match(budgetResult.errorMessage ?? "", /context_length_exceeded/);
-    assert.equal(getLastRequestMetrics()?.errorCategory, "context_budget");
-    assert.ok((getLastRequestMetrics()?.estimatedInputTokens ?? 0) > 0);
 });
 test("provider retains a caught failure category when private cleanup also fails", async () => {
     const installation = { executable: "/does/not/run", version: "test", subscriptionType: "pro" };
-    const tinyModel = { ...model, contextWindow: 100, maxTokens: 90 };
+    const originalTotal = process.env.PI_CLAUDE_CODE_PROVIDER_TOTAL_TIMEOUT_MS;
+    // Timeout settings are read after preparation, so this fails with private state to clean.
+    process.env.PI_CLAUDE_CODE_PROVIDER_TOTAL_TIMEOUT_MS = "not-a-number";
     let privateDirectory;
     let cleanupAttempts = 0;
     const failCleanup = async (directory) => {
@@ -1377,9 +1397,9 @@ test("provider retains a caught failure category when private cleanup also fails
         throw new Error("synthetic cleanup failure");
     };
     try {
-        const result = await createClaudeStream(installation, { cleanupDirectory: failCleanup })(tinyModel, context, { reasoning: "medium" }).result();
+        const result = await createClaudeStream(installation, { cleanupDirectory: failCleanup })(model, context, { reasoning: "medium" }).result();
         assert.equal(result.stopReason, "error");
-        assert.match(result.errorMessage ?? "", /context_length_exceeded/);
+        assert.match(result.errorMessage ?? "", /PI_CLAUDE_CODE_PROVIDER_TOTAL_TIMEOUT_MS must be a positive integer/);
         assert.match(result.errorMessage ?? "", /private request cleanup failed: synthetic cleanup failure/);
         for (
             let attempt = 0;
@@ -1388,11 +1408,27 @@ test("provider retains a caught failure category when private cleanup also fails
         ) {
             await new Promise((resolve) => setTimeout(resolve, 5));
         }
-        assert.equal(getLastRequestMetrics()?.errorCategory, "context_budget");
+        assert.equal(getLastRequestMetrics()?.errorCategory, "timeout_config");
         assert.equal(getLastRequestMetrics()?.cleanupComplete, false);
     }
     finally {
+        if (originalTotal === undefined) delete process.env.PI_CLAUDE_CODE_PROVIDER_TOTAL_TIMEOUT_MS; else process.env.PI_CLAUDE_CODE_PROVIDER_TOTAL_TIMEOUT_MS = originalTotal;
         if (privateDirectory) await rm(privateDirectory, { recursive: true, force: true });
+    }
+});
+test("provider explains a Claude Code build removed after preflight", { skip: process.platform === "win32" }, async () => {
+    // A native install's updater deletes old builds, and preflight pinned the real path.
+    const fake = await fakeClaude(`process.exit(0);`);
+    await rm(fake.executable);
+    try {
+        const result = await createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, context, { reasoning: "medium" }).result();
+        assert.equal(result.stopReason, "error");
+        assert.match(result.errorMessage ?? "", /Claude Code at .+ no longer exists, probably removed by a Claude Code update; run \/reload/);
+        const metrics = await waitForRequestMetrics((entry) => entry.errorCategory === "executable_missing");
+        assert.equal(metrics.cleanupComplete, true);
+    }
+    finally {
+        await rm(fake.dir, { recursive: true, force: true });
     }
 });
 test("provider cleans private transport state after an early process failure", async () => {

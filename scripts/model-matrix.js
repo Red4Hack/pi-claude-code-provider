@@ -4,32 +4,31 @@ import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EXPECTED_MODEL_FAMILIES } from "../src/compatibility.ts";
-import { inspectClaudeInstallation } from "../src/auth.ts";
-import { providerModelsForSubscription } from "../src/catalog.ts";
+import { providerModels as catalogModels } from "../src/catalog.ts";
 import { assistantReply, consumeJsonl, describeThinking, superviseLiveProcess } from "./lib/live-process.js";
 import { livePiLaunch } from "./lib/pi-installation.js";
-import { servedContextWindowMatches } from "./lib/model-matrix-policy.js";
 
 if (process.env.PI_CLAUDE_CODE_PROVIDER_PAID_TEST_CHILD !== "1") {
     throw new Error("The paid model matrix must be started through an npm test:paid:* script");
 }
 
 const packageRoot = process.cwd();
-const installation = await inspectClaudeInstallation();
-const providerModels = providerModelsForSubscription(installation.subscriptionType);
+const providerModels = catalogModels();
 const efforts = ["low", "medium", "high", "xhigh", "max"];
 const effortModels = ["sonnet", "opus"];
 const advertisedModels = providerModels.map((model) => model.id);
 assert.deepEqual(Object.keys(EXPECTED_MODEL_FAMILIES), advertisedModels, "compatibility targets must match advertised models");
-// Fable 5 availability and included quota vary by subscription tier. It is
+// Fable availability and included quota vary by subscription tier. It is
 // intentionally opt-in and excluded from the blocking gate; the standalone
 // case remains selectable for accounts with Fable access.
 const ungatedModels = new Set(["fable"]);
-const mediumOnlyModels = advertisedModels.filter((model) => !effortModels.includes(model) && model !== "haiku");
+// A model without effort control runs once at "off" and sends Claude Code no effort.
+const noEffortModels = providerModels.filter((model) => !model.reasoning).map((model) => model.id);
+const mediumOnlyModels = advertisedModels.filter((model) => !effortModels.includes(model) && !noEffortModels.includes(model));
 const coreCases = [
     { model: "sonnet", effort: "medium" },
     ...effortModels.flatMap((model) => efforts.map((effort) => ({ model, effort }))).filter(({ model, effort }) => model !== "sonnet" || effort !== "medium"),
-    { model: "haiku", effort: "off" },
+    ...noEffortModels.map((model) => ({ model, effort: "off" })),
     ...mediumOnlyModels.filter((model) => !ungatedModels.has(model)).map((model) => ({ model, effort: "medium" })),
 ];
 const selectableCases = [
@@ -88,21 +87,13 @@ async function runCase(cwd, model, effort) {
     const text = message.content.filter((block) => block.type === "text").map((block) => block.text).join("").trim();
     assert.match(text, /^OK\.?$/, `${model}:${effort} response text`);
     assert.match(message.responseModel, EXPECTED_MODEL_FAMILIES[model], `${model}:${effort} resolved model`);
-    const metrics = await waitForMetrics(metricsBefore.length, model, model === "haiku" ? "default" : effort);
+    const metrics = await waitForMetrics(metricsBefore.length, model, noEffortModels.includes(model) ? "default" : effort);
     const configured = providerModels.find((entry) => entry.id === model);
     assert.equal(metrics.cleanupComplete, true, `${model}:${effort} private-state cleanup`);
-    assert.equal(
-        servedContextWindowMatches(installation.subscriptionType, model, configured.contextWindow, metrics.servedContextWindow),
-        true,
-        `${model}:${effort} served context window`,
-    );
-    if (installation.subscriptionType === "pro" && model === "opus") {
-        assert.equal(configured.contextWindow, 200_000, `${model}:${effort} safe configured context window`);
-    }
-    // Weaker than it looks, and deliberately kept: the provider sets
-    // CLAUDE_CODE_MAX_OUTPUT_TOKENS to this same value, so this asserts the
-    // request carried it rather than that the model offers it. The served
-    // context window above is the independent capability assertion.
+    assert.equal(metrics.servedContextWindow, configured.contextWindow, `${model}:${effort} served context window`);
+    // Claude Code reports its own default output cap for the served model, not
+    // the CLAUDE_CODE_MAX_OUTPUT_TOKENS the provider sends, so this asserts the
+    // configured cap still equals that default after a model refresh.
     assert.equal(metrics.servedMaxOutputTokens, configured.maxTokens, `${model}:${effort} served maximum output`);
     const leaked = (await runtimeDirectories()).filter((name) => !runtimeBefore.includes(name));
     assert.deepEqual(leaked, [], `${model}:${effort} left private runtime directories`);

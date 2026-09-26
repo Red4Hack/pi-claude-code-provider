@@ -8,8 +8,9 @@ import type { PreparedRequest } from "./types.ts";
 // and --safe-mode would disable the proposal MCP server.
 // Claude Code otherwise appends a changing <total_tokens> reminder that breaks
 // append-only cache reuse across this provider's fresh print-mode processes.
-// Claude Code 2.1.281 ships built-in plugins that load despite empty setting
-// sources; agents-md would read the project's AGENTS.md into the prompt.
+// Claude Code 2.1.281 loads built-in plugins regardless of setting sources;
+// agents-md would read the project's AGENTS.md into the prompt and fail the
+// isolation check, and telemetry is disabled for the same isolation reason.
 const SETTINGS = JSON.stringify({
   disableAllHooks: true,
   autoMemoryEnabled: false,
@@ -27,7 +28,7 @@ const TRANSCRIPT_CACHE_CONTROL = { type: "ephemeral", ttl: "1h" } as const;
 
 /**
  * Escape hatch for a Claude Code release that leaves no room for this breakpoint:
- * every Claude 5 alias already carries the API's maximum of four.
+ * with it, every Claude 5 alias carries the API's maximum of four.
  */
 export const TRANSCRIPT_BREAKPOINT_ENV = "PI_CLAUDE_CODE_PROVIDER_TRANSCRIPT_BREAKPOINT";
 
@@ -99,7 +100,8 @@ export function baseClaudeArgs(): string[] {
 export function providerArgs(
   prepared: PreparedRequest,
   model: string,
-  effort: string,
+  /** Omitted for a model without effort control, which keeps Claude Code's default. */
+  effort: string | undefined,
   options: { transcriptBreakpoint?: boolean; thinkingDisplay?: "summarized" | "omitted" } = {},
 ): { args: string[]; prompt: PromptBlock[] } {
   // Quoted absolute references: Claude runs in Pi's session directory, where a
@@ -147,7 +149,7 @@ export function providerArgs(
     "",
     "--model",
     model,
-    ...(model === "haiku" ? [] : ["--effort", effort]),
+    ...(effort === undefined ? [] : ["--effort", effort]),
     ...(options.thinkingDisplay ? ["--thinking-display", options.thinkingDisplay] : []),
     "--input-format",
     "stream-json",
