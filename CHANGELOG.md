@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Local checkouts now show their directory name in Pi's `[Extensions]` list instead of `extensions`. The single root `index.ts` preserves Git and npm labels on both Pi distributions and replaces the previous entry shim.
+- Provider tests wait for each request's own lifecycle metrics and isolate temporary state, preventing late cleanup from interfering with another test's assertions.
+
+### Changed
+
+- Claude Code's built-in telemetry plugin is explicitly disabled alongside the existing traffic-disable environment setting.
+- Quota-free surface capture now reports startup plugins and pre-init records and verifies all Sonnet/Opus effort levels in the API request.
+
 ## [0.5.0] - 2026-09-24
 
 ### Changed

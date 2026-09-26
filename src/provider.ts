@@ -59,6 +59,8 @@ function recoverProviderContext(context: TranscriptContext): Context {
 }
 
 export interface ClaudeStreamDependencies {
+  /** Internal recorder seam; called once after this request's lifecycle settles. */
+  recordRequestMetrics?: typeof recordRequestMetrics;
   cleanupDirectory?: CleanupDirectory;
   claimLaunch?: ClaimLaunch;
   supervise?: typeof superviseProcess;
@@ -75,6 +77,7 @@ export function createClaudeStream(
   installation: ClaudeInstallation,
   dependencies: ClaudeStreamDependencies = {},
 ) {
+  const recordMetrics = dependencies.recordRequestMetrics ?? recordRequestMetrics;
   const cleanupDirectory = dependencies.cleanupDirectory ?? removeRuntimeDirectory;
   const claimLaunch = dependencies.claimLaunch ?? claimPaidTestLaunch;
   const supervise = dependencies.supervise ?? superviseProcess;
@@ -241,7 +244,7 @@ export function createClaudeStream(
         );
         metrics.exitCode = exitCode;
         metrics.exitSignal = exitSignal;
-        recordRequestMetrics(metrics);
+        recordMetrics(metrics);
       };
 
       try {

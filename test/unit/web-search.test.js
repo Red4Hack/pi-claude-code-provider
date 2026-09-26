@@ -4,10 +4,12 @@ import { access, chmod, mkdtemp, readFile, readdir, rm, writeFile } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { withTimeout, waitForPath } from "../support/wait.js";
 import { getLastSearchMetrics } from "../../src/metrics.ts";
 import { superviseProcess, terminateProcessGroup } from "../../src/process-utils.ts";
 import { searchWithClaude } from "../../src/web-search.ts";
-import { nodeFixtureSource } from "../support/node-fixture.js";
+import { supervisorWithCleanupFailure } from "../support/process-fixture.js";
+import { createNodeFixture, nodeFixtureSource } from "../support/node-fixture.js";
 
 const searchInit = {
     type: "system", subtype: "init", tools: ["WebFetch", "WebSearch"], mcp_servers: [], model: "claude-sonnet-5",
@@ -15,27 +17,7 @@ const searchInit = {
 };
 
 async function fakeSearch(body) {
-    const directory = await mkdtemp(join(tmpdir(), "pi-claude-code-provider-search-fake-"));
-    const executable = join(directory, process.platform === "win32" ? "fake-claude.cjs" : "fake-claude");
-    // Nested Node child stdout can disappear in restricted sandboxes; use the
-    // shared test-only preload so a missing init remains a real protocol failure.
-    await writeFile(executable, nodeFixtureSource(body), { mode: 0o700 });
-    await chmod(executable, 0o700);
-    return { directory, executable };
-}
-
-function supervisorWithCleanupFailure(child, options) {
-    const supervisor = superviseProcess(child, options);
-    let termination;
-    return {
-        ...supervisor,
-        terminate() {
-            termination ??= supervisor.terminate().then(() => {
-                throw new Error("synthetic search process-group EPERM");
-            });
-            return termination;
-        },
-    };
+    return createNodeFixture(body, { prefix: "fake-search-" });
 }
 
 test("web search uses a relative private request reference and validates its result", async () => {
@@ -149,7 +131,7 @@ process.stdout.write(JSON.stringify({type:"result",is_error:false,result:"must n
     try {
         const installation = { executable: successful.executable, version: "test", subscriptionType: "pro" };
         await assert.rejects(
-            searchWithClaude(installation, { query: "query" }, { supervise: supervisorWithCleanupFailure }),
+            searchWithClaude(installation, { query: "query" }, { supervise: supervisorWithCleanupFailure("synthetic search process-group EPERM") }),
             /synthetic search process-group EPERM/,
         );
         const metrics = getLastSearchMetrics();
@@ -220,14 +202,11 @@ test("web search rejects promptly and retains marked state when process death is
     };
     try {
         await assert.rejects(
-            Promise.race([
-                searchWithClaude(
+            withTimeout(searchWithClaude(
                     { executable: fake.executable, version: "test", subscriptionType: "pro" },
                     { query: "query", signal: controller.signal },
                     { timeoutMs: 1_000, supervise: superviseUnknown },
-                ),
-                new Promise((_, reject) => setTimeout(() => reject(new Error("web search did not settle")), 500)),
-            ]),
+                ), "process settlement"),
             (error) => {
                 assert.match(error.message, /Web search was cancelled/);
                 assert.match(error.message, /synthetic stubborn search EPERM/);
@@ -264,7 +243,7 @@ test("web search preserves a protocol failure when process cleanup also fails", 
     try {
         const installation = { executable: malformed.executable, version: "test", subscriptionType: "pro" };
         await assert.rejects(
-            searchWithClaude(installation, { query: "query" }, { supervise: supervisorWithCleanupFailure }),
+            searchWithClaude(installation, { query: "query" }, { supervise: supervisorWithCleanupFailure("synthetic search process-group EPERM") }),
             /malformed JSONL; Claude Code process tree cleanup failed: synthetic search process-group EPERM/,
         );
         const metrics = getLastSearchMetrics();
@@ -384,12 +363,10 @@ setInterval(() => {}, 1000);`);
         pending = searchWithClaude(
             { executable: hanging.executable, version: "test", subscriptionType: "pro" },
             { query: "query", signal: controller.signal },
-            { timeoutMs: 1000 },
+            { timeoutMs: 30_000 },
         );
         const pidPath = join(hanging.directory, "pid");
-        for (let attempt = 0; attempt < 100; attempt++) {
-            try { await access(pidPath); break; } catch { await new Promise((resolve) => setTimeout(resolve, 10)); }
-        }
+        await waitForPath(pidPath);
         const targetPid = Number(await readFile(pidPath, "utf8"));
         controller.abort();
         await assert.rejects(pending, /cancelled/);

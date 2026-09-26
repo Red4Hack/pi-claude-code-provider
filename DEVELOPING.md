@@ -24,7 +24,7 @@ pi install /absolute/path/to/pi-claude-code-provider
 
 | Change area | Owning modules | Focused validation |
 | --- | --- | --- |
-| Extension startup, session lifetime, and session working directory | `extensions/index.ts` (manifest entry), `extensions/pi-claude-code-provider.ts`, `src/session-registry.ts`, `src/session-image-store.ts` | `extension.test.js`, `session-registry.test.js`, `session-image-store.test.js` |
+| Extension startup, session lifetime, and session working directory | `index.ts` (manifest entry and implementation), `src/session-registry.ts`, `src/session-image-store.ts` | `extension.test.js`, `packaging.test.js`, `session-registry.test.js`, `session-image-store.test.js` |
 | Authentication, CLI, model catalog, and compatibility | `src/auth.ts`, `src/catalog.ts`, `src/claude-args.ts`, `src/compatibility.ts` | `auth.test.js`, `catalog.test.js`, `claude-args.test.js`, `compatibility.test.js` |
 | Transcript and provider lifecycle | `src/context-serializer.ts`, `src/provider.ts`, `src/stream-events.ts`, `src/claude-protocol.ts`, `src/jsonl.ts`, `src/output.ts`, `src/errors.ts`, `src/types.ts` | `context-serializer.test.js`, `provider.test.js`, `stream-events.test.js`, `claude-protocol.test.js`, `jsonl.test.js`, `errors.test.js` |
 | Runtime launch, process trees, and private state | `src/claude-process.ts`, `src/host-runtime.ts`, `src/process-utils.ts`, `src/runtime-directories.ts` | `process-utils.test.js`, `runtime-directories.test.js` |
@@ -34,7 +34,7 @@ pi install /absolute/path/to/pi-claude-code-provider
 | Paid and live validation | `src/paid-launch-budget.ts`, `scripts/paid-test-runner.js`, `scripts/live-test.js`, `scripts/model-matrix.js`, `scripts/lib/paid-stages.js`, `scripts/lib/paid-confirmation.js`, `scripts/lib/live-process.js`, `scripts/lib/pi-installation.js` | `paid-stages.test.js`, `paid-confirmation.test.js`, `paid-runner-lifecycle.test.js`, `live-process.test.js`, `pi-installation.test.js` |
 | Repository policy and capture tooling | `scripts/check.js`, `scripts/typecheck.js`, `scripts/release-check.js`, `scripts/lib/dependency-policy.js`, `scripts/lib/documentation-policy.js`, `scripts/lib/source-policy.js`, `scripts/capture-claude-surface.js`, `scripts/capture-claude-breakpoints.js`, `scripts/capture-claude-stream-recovery.js` | `dependency-policy.test.js`, `documentation-policy.test.js`, `source-policy.test.js`, `claude-fixture.test.js`, `node-fixture.test.js` |
 
-The manifest entry `extensions/index.ts` only re-exports the implementation. Keep the entry an `index.ts`: Pi's startup extension list appends any other entry's filename to the package name.
+The sole extension entry and implementation is root `index.ts`; the manifest declares `./index.ts` and the npm inventory includes it explicitly. Pi's compact startup banner uses the Git or npm source for those packages and the parent directory of an index entry for local paths. This produces `chem/pi-claude-code-provider` from Git and `pi-claude-code-provider` from npm or a checkout with that directory name, on both npm and standalone Pi. A renamed local checkout shows its directory name. A nested index adds its subdirectory to Git/npm labels, so keep this entry at the package root.
 
 Pi remains authoritative for prepared context, branches, compaction, active tools, execution, provider handoff, and cancellation. Read the matching Pi checkout's contributor and provider documentation before changing those boundaries. Pi imports remain optional `*` peer dependencies and are not bundled.
 
@@ -72,7 +72,9 @@ A platform is live-verified only after `npm run test:paid:release` passes on it.
 
 `test/support/captured/claude-<version>-help.txt` is `claude --help` captured byte-for-byte from the version `CAPTURED_CLAUDE_VERSION` in `test/support/claude-fixture.js` names. `validateClaudeCapabilities` decides whether the provider registers at all, so it is tested against help the CLI really emits rather than a hand-written list, which can spell flags the real help never shows.
 
-Compare the installed CLI's help with the pinned capture when moving the verified baseline. If it changes, run `npm run capture:claude-surface`, review the diff, and re-pin `CAPTURED_CLAUDE_VERSION`. The capture may remain on an older version when the help is identical.
+Run `npm run capture:claude-surface` before moving the Claude Code baseline. Besides help, it writes a versioned `claude-<version>-surface.json` containing sanitized initialization, every pre-init record, plugins, and requested/observed API effort for all Sonnet and Opus levels and Haiku's omitted effort. It uses the provider's arguments and environment, a loopback server that refuses inference, a dummy token, and a disposable home; it consumes no quota. Unexpected plugins, any pre-init record, invalid initialization, or an effort mismatch fail the command after its diagnostic report is saved. Pass `--print` to inspect without writing or `--claude <executable>` to select a build.
+
+Review the startup report even when help is unchanged: a new built-in plugin or changed record order can break isolation without changing CLI flags. If help changes, review its diff and re-pin `CAPTURED_CLAUDE_VERSION`; otherwise the help capture may stay on an older version. Startup reports name their own producing version independently and do not advance `VERIFIED_VERSIONS`. Wire effort verifies flag transport; adaptive thinking can legitimately produce no reasoning tokens, so the paid matrix keeps reasoning presence informational.
 
 ### Captured stream-recovery records
 
@@ -87,6 +89,10 @@ Compare the installed CLI's help with the pinned capture when moving the verifie
 ### Deterministic checks
 
 `npm run check` enforces dependency and import policy, Markdown links and versions, source boundaries, JavaScript syntax, and strict TypeScript. `npm test` runs deterministic tests. Neither command performs Claude inference or consumes subscription quota; `check` may run `claude --version` for advisory metadata.
+
+Each Node test worker receives a private temporary root through the test preload, with `TMPDIR`, `TEMP`, and `TMP` set together. Fixtures inherit it, and worker teardown checks for unreclaimed runtime directories before removing the root. Keep tests that mutate process environment sequential within a worker; separate files and separate suite runs remain isolated.
+
+Provider tests use `createTestClaudeStream` and `settledRequest`: the result and that stream's own metrics must settle before restoring environment or removing fixtures. `requestMetrics` receives a stream or its settled result, never the doctor's global last-record slot. Tests of early terminal publication can read raw events/result first, then await their lifecycle explicitly. Shared observations have a 10-second ceiling and clear their watchdogs when complete; short production deadlines remain appropriate when timeout behavior is the assertion. Use the shared Node executable, Claude preflight/readiness, and cleanup-failure fixture helpers instead of rebuilding them per suite.
 
 ### Paid tests
 
@@ -124,7 +130,7 @@ RPC stages that read replies through `assistantReply` fail on non-redacted think
 
 The release suite covers text, tool, image, isolation, recovery, Unicode, history, web search, cache reuse, both bridge lanes, the gated aliases, and the supported effort matrix. Successful RPC harnesses close stdin so Pi can run session shutdown and flush metrics before exit. The model matrix asserts the family an alias serves, not a dated model id, so an upstream model refresh cannot fail the gate while an alias serving the wrong family still does. Every entry also checks that the context window and default output cap Claude Code reports for the served model equal the configured ones, cleanup, and the absence of leaked private directories.
 
-Fable is selectable but excluded from the release gate, because its availability and billing vary by tier. On Pro it requires usage credits, and with credits turned off every Fable request fails with an assistant error. Run `npm run test:paid:fable` only on an account where that spend is available and separately authorized; the blocking Sonnet and Opus cases already exercise the shared transport.
+Fable is selectable but excluded from the release gate, because its availability and billing vary by tier. On Pro it requires usage credits, and with credits turned off every Fable request fails with an assistant error. When a release changes Fable catalog, routing, effort, or served-limit behavior, run `npm run test:paid:fable` on an account where that spend is available and separately authorized; the blocking Sonnet and Opus cases already exercise the shared transport.
 
 **Read the reported error before blaming the model.** When a turn ends in an assistant error, such as disabled usage credits, a rate limit, or a lost login, the live scripts fail with that error by name. Only a reply that arrived with the wrong text is evidence about model behavior.
 
@@ -163,7 +169,7 @@ Preserve these when changing serialization or Claude arguments:
 
 When updating Claude Code compatibility:
 
-1. Compare the required CLI flags, initialization fields, stream records, and exact tool inventory.
+1. Run `npm run capture:claude-surface` and review plugins, every pre-init record, effort wire checks, required flags, initialization fields, stream records, and exact tool inventory.
 2. If the installed CLI's help differs from the pinned capture, recapture it with `npm run capture:claude-surface` and re-pin `CAPTURED_CLAUDE_VERSION`.
 3. Run `npm run capture:claude-breakpoints` for `sonnet` and `haiku`, and continue only on HEALTHY verdicts.
 4. Cover readiness, invalid or oversized JSONL, timeouts, aborts, error exits, and descendant cleanup deterministically.

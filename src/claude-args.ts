@@ -10,11 +10,12 @@ import type { PreparedRequest } from "./types.ts";
 // append-only cache reuse across this provider's fresh print-mode processes.
 // Claude Code 2.1.281 loads its built-in agents-md plugin regardless of setting
 // sources; initialization would then report it and fail the isolation check.
+// Pin telemetry too, supplementing the environment's nonessential-traffic switch.
 const SETTINGS = JSON.stringify({
   disableAllHooks: true,
   autoMemoryEnabled: false,
   totalTokensReminder: "off",
-  enabledPlugins: { "agents-md@builtin": false },
+  enabledPlugins: { "agents-md@builtin": false, "telemetry@builtin": false },
 });
 export const EMPTY_MCP = JSON.stringify({ mcpServers: {} });
 export const BRIDGE_PATH = fileURLToPath(new URL("../bridge/mcp-proposal-server.js", import.meta.url));

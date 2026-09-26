@@ -1,18 +1,18 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { access, chmod, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, readdir, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
+import { waitFor, waitForRemoval } from "../support/wait.js";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { normalizeContext } from "@earendil-works/pi-ai";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, DefaultPackageManager, SettingsManager, formatSize } from "@earendil-works/pi-coding-agent";
-import initializePiClaudeCodeProvider from "../../extensions/index.ts";
-import implementation from "../../extensions/pi-claude-code-provider.ts";
+import initializePiClaudeCodeProvider from "../../index.ts";
 import { VERIFIED_VERSIONS, platformStatus } from "../../src/compatibility.ts";
-import { CAPTURED_CLAUDE_HELP_PATH, ELIGIBLE_CLAUDE_AUTH } from "../support/claude-fixture.js";
-import { nodeFixtureSource } from "../support/node-fixture.js";
+import { claudeFixtureBody } from "../support/claude-fixture.js";
+import { createNodeFixture } from "../support/node-fixture.js";
 import { sessionRegistry } from "../../src/session-registry.ts";
 
 // Pi folds `systemPrompt` and `tools` into transcript system messages before a
@@ -68,8 +68,6 @@ function sessionContext(cwd, ui) {
 }
 
 async function createFakeClaude(searchResult = "ok", { searchDelayMs = 0, rateLimitInfo, reportCwd = false, providerTools = [], holdProviderUntilInput = false } = {}) {
-    const directory = await mkdtemp(join(tmpdir(), "pi-claude-code-provider-extension-"));
-    const executable = join(directory, process.platform === "win32" ? "claude.cjs" : "claude");
     const rateLimitEvents = Array.isArray(rateLimitInfo) ? rateLimitInfo : rateLimitInfo ? [rateLimitInfo] : [];
     const init = { type: "system", subtype: "init", tools: ["WebFetch", "WebSearch"], mcp_servers: [], model: "claude-sonnet-5", permissionMode: "dontAsk", slash_commands: [], skills: [], plugins: [], apiKeySource: "none" };
     const providerInit = {
@@ -77,17 +75,7 @@ async function createFakeClaude(searchResult = "ok", { searchDelayMs = 0, rateLi
         tools: providerTools.map((name) => `mcp__pi__${name}`),
         mcp_servers: providerTools.length ? [{ name: "pi", status: "connected" }] : [],
     };
-    // Keep fake Claude JSONL visible in sandboxes that lose buffered Node child stdout.
-    await writeFile(executable, nodeFixtureSource(`
-if (process.argv.includes("--version")) process.stdout.write(${JSON.stringify(`${VERIFIED_VERSIONS.claudeCode}\n`)});
-else if (process.argv[2] === "auth" && process.argv[3] === "status") process.stdout.write(JSON.stringify(${JSON.stringify(ELIGIBLE_CLAUDE_AUTH)}));
-else if (process.argv.includes("--help")) process.stdout.write(require("node:fs").readFileSync(${JSON.stringify(CAPTURED_CLAUDE_HELP_PATH)}, "utf8"));
-else {
-  const mcpIndex = process.argv.indexOf("--mcp-config");
-  if (mcpIndex >= 0) {
-    const ready = JSON.parse(process.argv[mcpIndex + 1]).mcpServers?.pi?.env?.PI_CLAUDE_TOOL_READY;
-    if (ready) require("node:fs").writeFileSync(ready, "ready\\n", { flag: "wx" });
-  }
+    return createNodeFixture(claudeFixtureBody(`
   const providerMode = process.argv.includes("--system-prompt-file");
   const send = () => {
     process.stdout.write(JSON.stringify(providerMode ? ${JSON.stringify(providerInit)} : ${JSON.stringify(init)}) + "\\n");
@@ -98,10 +86,7 @@ else {
     process.stdin.resume();
     process.stdin.on("end", send);
   } else setTimeout(send, ${searchDelayMs});
-}
-`), { mode: 0o700 });
-    await chmod(executable, 0o700);
-    return { directory, executable };
+`, { preflight: true, writeReady: true, version: VERIFIED_VERSIONS.claudeCode }), { prefix: "pi-claude-code-provider-extension-" });
 }
 
 test("platform acknowledgement hides only the startup advisory and leaves doctor truthful", async (t) => {
@@ -755,9 +740,7 @@ test("session shutdown does not wait for a request Pi has not cancelled yet", as
             .then((result) => { settled = true; return result; });
         // Wait for the image to be stored, so a lease is certainly held and there is
         // a directory whose retention can be observed.
-        for (let attempt = 0; attempt < 300 && (await imageDirectories()).length === before.length; attempt += 1) {
-            await new Promise((resolve) => setTimeout(resolve, 10));
-        }
+        await waitFor(async () => (await imageDirectories()).length > before.length, "image-store acquisition");
         const opened = (await imageDirectories()).filter((name) => !before.includes(name));
         assert.equal(opened.length, 1, "the request never opened the session image store");
         retained = join(tmpdir(), opened[0]);
@@ -771,9 +754,7 @@ test("session shutdown does not wait for a request Pi has not cancelled yet", as
         // Nothing else can: session_shutdown has already run, and on Windows there
         // is no stale-state pass to fall back on. release() does not await the
         // removal, so poll for it.
-        for (let attempt = 0; attempt < 300 && (await imageDirectories()).includes(opened[0]); attempt += 1) {
-            await new Promise((resolve) => setTimeout(resolve, 10));
-        }
+        await waitForRemoval(retained);
         await assert.rejects(access(retained), "the session image directory was never reclaimed");
     }
     finally {
@@ -853,15 +834,14 @@ test("a Pi without Pi-AI's compat entrypoint still gets the provider", async () 
     }
 });
 
-test("Pi resolves the package to its index entry, which re-exports the implementation", async () => {
+test("Pi resolves the package to its sole root entry", async () => {
     // An index entry keeps Pi's startup extension label to the bare package name.
     const packageRoot = fileURLToPath(new URL("../..", import.meta.url));
     const agentDir = await mkdtemp(join(tmpdir(), "pi-claude-code-provider-agent-"));
     try {
         const packageManager = new DefaultPackageManager({ cwd: packageRoot, agentDir, settingsManager: SettingsManager.inMemory() });
         const resolved = await packageManager.resolveExtensionSources([packageRoot], { temporary: true });
-        assert.deepEqual(resolved.extensions.map((extension) => extension.path), [join(packageRoot, "extensions", "index.ts")]);
-        assert.equal(initializePiClaudeCodeProvider, implementation);
+        assert.deepEqual(resolved.extensions.map((extension) => extension.path), [join(packageRoot, "index.ts")]);
     } finally {
         await rm(agentDir, { recursive: true, force: true });
     }

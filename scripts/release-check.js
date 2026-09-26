@@ -17,8 +17,8 @@ if (manifest.author !== expected.author) throw new Error("Unexpected npm author/
 if (manifest.repository?.url !== expected.repository) throw new Error("Unexpected repository URL");
 if (manifest.publishConfig?.access !== "public") throw new Error("npm access must be explicitly public");
 if (manifest.pi?.extensions?.length !== 1) throw new Error("Exactly one Pi extension entry is required");
-// Pi labels any non-index entry as "<package>:<file>" in its startup extension list.
-if (manifest.pi.extensions[0] !== "./extensions/index.ts") throw new Error("The Pi extension entry must be ./extensions/index.ts");
+// Root index keeps Git/npm source labels and uses the checkout name locally.
+if (manifest.pi.extensions[0] !== "./index.ts") throw new Error("The Pi extension entry must be ./index.ts");
 if (manifest.os !== undefined) throw new Error("The package must not exclude a supported operating system");
 
 const repository = run("git", ["ls-files", "--cached", "--others", "--exclude-standard"])
@@ -47,8 +47,7 @@ const required = [
   "LICENSE",
   "README.md",
   "bridge/mcp-proposal-server.js",
-  "extensions/index.ts",
-  "extensions/pi-claude-code-provider.ts",
+  "index.ts",
   "package.json",
 ];
 for (const path of required) {

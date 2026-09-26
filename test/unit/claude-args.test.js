@@ -76,7 +76,7 @@ test("pins cache-stable Claude settings", () => {
         disableAllHooks: true,
         autoMemoryEnabled: false,
         totalTokensReminder: "off",
-        enabledPlugins: { "agents-md@builtin": false },
+        enabledPlugins: { "agents-md@builtin": false, "telemetry@builtin": false },
     });
 });
 

@@ -31,6 +31,8 @@ pi install git:github.com/chem/pi-claude-code-provider
 
 Add `-l` for a project-local installation. Pi loads project packages only after the project is trusted; use `pi config` to enable or disable the extension.
 
+For a local checkout, use `pi install /absolute/path/to/pi-claude-code-provider`. The startup `[Extensions]` list shows `chem/pi-claude-code-provider` for Git and `pi-claude-code-provider` for npm or a local checkout with that directory name. A renamed checkout shows its directory name. These labels apply to npm and standalone Pi alike.
+
 ## Use
 
 Open `/model` and choose `sonnet`, `fable`, `opus`, or `haiku` under `pi-claude-code-provider`.
@@ -55,7 +57,7 @@ After installation or an upstream update, run:
 /pi-claude-code-provider-doctor
 ```
 
-The doctor checks versions, model aliases, and the tool bridge without consuming subscription quota. It also reports recent prompt-cache reuse and context-window mismatches.
+The doctor checks versions, model aliases, and the tool bridge without consuming subscription quota. It also reports recent prompt-cache reuse and context-window mismatches. Its last-request metrics describe the request whose process cleanup and lifecycle finished most recently; overlapping requests can finish out of start order, and a terminal response can appear before its metrics finalize.
 
 Run `/pi-claude-code-provider-doctor report` for a content-free diagnostic report. Inspect it before sharing it.
 

@@ -2,22 +2,15 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import test from "node:test";
+import { withTimeout, waitFor } from "../support/wait.js";
 import { ProcessTerminationError, superviseProcess, terminateProcessGroup } from "../../src/process-utils.ts";
 import { nodeFixtureArgs } from "../support/node-fixture.js";
 
 async function assertProcessGone(pid) {
-    await assert.rejects(async () => {
-        for (let attempt = 0; attempt < 20; attempt++) {
-            try {
-                process.kill(pid, 0);
-                await new Promise((resolve) => setTimeout(resolve, 25));
-            }
-            catch (error) {
-                if (error?.code === "ESRCH") throw new Error("gone");
-                throw error;
-            }
-        }
-    }, /gone/);
+    await waitFor(() => {
+        try { process.kill(pid, 0); return false; }
+        catch (error) { if (error.code === "ESRCH") return true; throw error; }
+    }, "process death");
 }
 
 test("supervisor terminates a process that exceeds its total deadline", async () => {
@@ -59,10 +52,7 @@ test("supervisor rejects and quiesces when termination cannot establish process 
     });
     try {
         await assert.rejects(
-            Promise.race([
-                supervisor.wait(),
-                new Promise((_, reject) => setTimeout(() => reject(new Error("supervisor did not settle")), 500)),
-            ]),
+            withTimeout(supervisor.wait(), "process settlement"),
             (error) => error instanceof ProcessTerminationError && /liveness is unknown.*EPERM/.test(error.message),
         );
         assert.equal(failures.length, 2);
@@ -87,10 +77,7 @@ test("caller-initiated termination failure also rejects supervisor wait promptly
     try {
         await assert.rejects(supervisor.terminate(), ProcessTerminationError);
         await assert.rejects(
-            Promise.race([
-                supervisor.wait(),
-                new Promise((_, reject) => setTimeout(() => reject(new Error("supervisor did not settle")), 500)),
-            ]),
+            withTimeout(supervisor.wait(), "process settlement"),
             /liveness is unknown.*direct terminator EPERM/,
         );
         assert.equal(child.exitCode, null);

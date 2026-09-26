@@ -27,14 +27,15 @@
 //   npm run capture:claude-breakpoints -- --model opus --effort high
 //   npm run capture:claude-breakpoints -- --strip-marker
 //   npm run capture:claude-breakpoints -- --images 2 --output /tmp/body.json
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdtemp, mkdir, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
-import { claudeExecutable, buildClaudeEnvironment } from "../src/auth.ts";
+import { claudeExecutable } from "../src/auth.ts";
+import { captureEnvironment, captureTimeout, spawnCaptureChild, stopCaptureChild } from "./lib/claude-capture.js";
 import { providerModels } from "../src/catalog.ts";
 import { providerArgs, thinkingDisplay } from "../src/claude-args.ts";
 import { SessionImageStore } from "../src/session-image-store.ts";
@@ -42,8 +43,6 @@ import { SessionImageStore } from "../src/session-image-store.ts";
 // Anthropic permits four cache breakpoints per request. A fifth is rejected
 // outright, so this is a hard ceiling rather than a quality signal.
 const MAX_BREAKPOINTS = 4;
-// A shutting-down CLI that will not exit would otherwise hang the capture.
-const CHILD_EXIT_TIMEOUT_MS = 5000;
 // A CLI that neither sends a request nor exits would otherwise hang the capture.
 const CAPTURE_TIMEOUT_MS = 60_000;
 // Transcript-dominant padding, well past every model's minimum cacheable prefix,
@@ -163,22 +162,6 @@ async function snapshotTree(root) {
   return files;
 }
 
-/** Resolve once the child has exited, or after a bounded wait if it will not. */
-function closed(child) {
-  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
-  return new Promise((resolve) => {
-    const done = () => {
-      clearTimeout(timer);
-      resolve();
-    };
-    const timer = setTimeout(() => {
-      child.kill("SIGKILL");
-      child.once("exit", done);
-    }, CHILD_EXIT_TIMEOUT_MS);
-    child.once("exit", done);
-  });
-}
-
 async function captureOnce(options, executable, home, project, imageStore) {
   const { server, body, listening, port } = captureServer();
   await listening;
@@ -187,6 +170,7 @@ async function captureOnce(options, executable, home, project, imageStore) {
   // prompt and catalog, while generated images use session-stable paths.
   const directory = await mkdtemp(join(tmpdir(), "pi-claude-code-provider-request-"));
   const imageLease = imageStore.acquire();
+  let captureProcess;
   try {
     await writeFile(join(directory, "system-prompt.txt"), SYSTEM_PROMPT);
     await writeFile(join(directory, "tools.json"), JSON.stringify(CATALOG));
@@ -213,42 +197,28 @@ async function captureOnce(options, executable, home, project, imageStore) {
       transcriptBreakpoint: options.marker,
       thinkingDisplay: thinkingDisplay(),
     });
-    // The loopback base URL and dummy token are exactly what
-    // buildClaudeEnvironment refuses to forward. This capture overrides them
-    // after that call, where the override is visible, rather than through it.
-    const env = {
-      ...buildClaudeEnvironment({ HOME: home, CLAUDE_CODE_MAX_OUTPUT_TOKENS: "64000" }),
-      ANTHROPIC_BASE_URL: baseUrl,
-      CLAUDE_CODE_OAUTH_TOKEN: "local-capture-dummy-oauth-token",
-    };
-    // An inherited proxy would send this capture off the loopback interface.
-    for (const name of ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]) delete env[name];
-    // A relocated configuration directory would expose the account this capture must never read.
-    delete env.CLAUDE_CONFIG_DIR;
-    const child = spawn(executable, args, { cwd: project, env, stdio: ["pipe", "ignore", "ignore"] });
-    child.stdin.end(`${JSON.stringify({ type: "user", message: { role: "user", content: prompt } })}\n`);
-    let timer;
-    const captured = await Promise.race([
-      body,
-      new Promise((_, reject) => child.once("exit", () => setTimeout(() => reject(new Error("Claude Code sent no request to the local capture server")), 1000))),
-      new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`Claude Code sent no request within ${CAPTURE_TIMEOUT_MS}ms`)), CAPTURE_TIMEOUT_MS);
-      }),
-    ]).finally(() => {
-      clearTimeout(timer);
-      child.kill();
+    captureProcess = spawnCaptureChild(executable, args, {
+      cwd: project,
+      env: captureEnvironment(home, baseUrl, { CLAUDE_CODE_MAX_OUTPUT_TOKENS: "64000" }),
+      stdio: ["pipe", "ignore", "ignore"],
     });
-    // Claude Code writes its cache under HOME as it shuts down. Returning before it has
-    // exited lets that write land after the temporary HOME is removed, recreating it and
-    // leaving one directory behind per run.
-    await closed(child);
+    captureProcess.child.stdin.end(`${JSON.stringify({ type: "user", message: { role: "user", content: prompt } })}\n`);
+    const captured = await captureTimeout(Promise.race([
+      body,
+      captureProcess.closed.then(() => { throw new Error("Claude Code sent no request to the local capture server"); }),
+    ]), "Claude Code breakpoint capture", CAPTURE_TIMEOUT_MS);
+    await stopCaptureChild(captureProcess);
     // Claude Code sends its first request only after the MCP tool catalog loads.
     const bridgeReady = options.tools ? existsSync(prepared.readyPath) : undefined;
     return { body: redact(JSON.parse(captured)), prompt, directory, bridgeReady };
   } finally {
-    server.close();
-    imageLease.release();
-    await rm(directory, { recursive: true, force: true });
+    try { if (captureProcess) await stopCaptureChild(captureProcess, 100); }
+    finally {
+      server.closeAllConnections();
+      await new Promise((resolve) => server.close(resolve));
+      imageLease.release();
+      await rm(directory, { recursive: true, force: true });
+    }
   }
 }
 

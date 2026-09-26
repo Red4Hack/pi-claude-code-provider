@@ -4,6 +4,9 @@ import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { SETTLE_TIMEOUT_MS, waitForPath, withTimeout } from "../support/wait.js";
+import { closeLiveRpcProcess } from "../../scripts/lib/live-process.js";
+import { terminateProcessGroup } from "../../src/process-utils.ts";
 import { BRIDGE_PATH } from "../../src/claude-args.ts";
 import { JsonlParser } from "../../src/jsonl.ts";
 import { nodeFixtureArgs } from "../support/node-fixture.js";
@@ -82,7 +85,7 @@ test("bridge framing enforces its byte bound incrementally and handles stream bo
 
     const oversized = startBridge(catalog);
     oversized.child.stdin.write(Buffer.alloc(1024 * 1024 + 1, 0x78));
-    const early = await Promise.race([oversized.closed, delay(5_000)]);
+    const early = await withTimeout(oversized.closed, "oversized bridge request");
     assert.ok(early, "bridge did not reject an oversized unterminated record while stdin stayed open");
     assert.equal(early.code, 1);
     const overflowRecords = await oversized.records;
@@ -158,7 +161,7 @@ async function exerciseBridge(bridge) {
       const timer = setTimeout(() => {
         waiters.delete(id);
         reject(new Error(`${bridge.name} MCP response ${id} timed out`));
-      }, 2_000);
+      }, SETTLE_TIMEOUT_MS);
       waiters.set(id, {
         resolve(value) { clearTimeout(timer); resolve(value); },
         reject(error) { clearTimeout(timer); reject(error); },
@@ -181,30 +184,9 @@ async function exerciseBridge(bridge) {
     assert.match(String(secondCall.error.message), /never executes/);
     assert.equal(unknown.error.code, -32601);
   } finally {
-    child.stdin.end();
-    const result = await Promise.race([closed, delay(1_000)]);
-    if (!result) child.kill("SIGKILL");
-    else assert.deepEqual(result, { code: 0, signal: null });
+    const { result, graceful } = await closeLiveRpcProcess(child, { terminate: () => terminateProcessGroup(child) }, closed, SETTLE_TIMEOUT_MS);
+    assert.equal(graceful, true, "bridge required forced termination");
+    assert.deepEqual(result, { code: 0, signal: null });
     await rm(directory, { recursive: true, force: true });
   }
-}
-
-function delay(timeoutMs) {
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => resolve(undefined), timeoutMs);
-    timer.unref();
-  });
-}
-
-async function waitForPath(path) {
-  const deadline = Date.now() + 2_000;
-  while (Date.now() < deadline) {
-    try {
-      await access(path);
-      return;
-    } catch {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-  }
-  throw new Error(`Timed out waiting for ${path}`);
 }

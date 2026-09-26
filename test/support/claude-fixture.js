@@ -10,6 +10,13 @@ export const CAPTURED_CLAUDE_HELP_PATH = fileURLToPath(
 );
 export const CLAUDE_HEADLESS_HELP = readFileSync(CAPTURED_CLAUDE_HELP_PATH, "utf8");
 
+// Startup and effort transport can change while the supported help stays valid.
+// This report identifies its producing CLI without advancing the paid baseline.
+export const CAPTURED_SURFACE_VERSION = "2.1.283";
+export function startupSurface() {
+  return JSON.parse(readFileSync(new URL(`./captured/claude-${CAPTURED_SURFACE_VERSION}-surface.json`, import.meta.url), "utf8"));
+}
+
 // Claude Code stdout for the mid-response recovery scenarios, captured from this
 // version and sanitized. Regenerate with `npm run capture:claude-stream-recovery`; these
 // shapes are only worth testing against because Claude Code really emitted them.
@@ -79,3 +86,21 @@ export const ELIGIBLE_CLAUDE_AUTH = Object.freeze({
 });
 
 export const ELIGIBLE_CLAUDE_AUTH_JSON = JSON.stringify(ELIGIBLE_CLAUDE_AUTH);
+
+/** Shared CLI scaffolding; each test still supplies its own protocol body. */
+export function claudeFixtureBody(body, { preflight = false, writeReady = false, version = CAPTURED_CLAUDE_VERSION } = {}) {
+  const ready = writeReady ? `
+const mcpIndex = process.argv.indexOf("--mcp-config");
+if (mcpIndex >= 0) {
+  const config = JSON.parse(process.argv[mcpIndex + 1]);
+  const ready = config.mcpServers?.pi?.env?.PI_CLAUDE_TOOL_READY;
+  if (ready) require("node:fs").writeFileSync(ready, "ready\\n", { flag: "wx" });
+}` : "";
+  const request = `${ready}\n${body}`;
+  if (!preflight) return request;
+  return `
+if (process.argv.includes("--version")) process.stdout.write(${JSON.stringify(`${version}\n`)});
+else if (process.argv[2] === "auth" && process.argv[3] === "status") process.stdout.write(${JSON.stringify(ELIGIBLE_CLAUDE_AUTH_JSON)});
+else if (process.argv.includes("--help")) process.stdout.write(require("node:fs").readFileSync(${JSON.stringify(CAPTURED_CLAUDE_HELP_PATH)}, "utf8"));
+else { ${request}\n }`;
+}
