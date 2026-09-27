@@ -999,7 +999,7 @@ test("private-path comparison follows native spelling and cwd rules recursively"
             "D:\\Temp\\Private\\image.png",
         ] },
         // A macOS volume is case-insensitive by default, so case is folded there too.
-        { platform: "darwin", directory: "/private/var/folders/x/T/pi-claude-code-provider-request-A", cwd: "/Users/me/project", rejected: [
+        { platform: "darwin", directory: "/private/var/folders/x/T/pi-claude-code-provider-request-A", cwd: "/work/project", rejected: [
             "/private/var/folders/x/T/PI-CLAUDE-CODE-PROVIDER-REQUEST-A/prompt.txt",
             "/Private/var/folders/x/T/pi-claude-code-provider-request-A",
         ], accepted: [
