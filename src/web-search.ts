@@ -141,7 +141,6 @@ export async function searchWithClaude(
     });
     claude = running;
     metrics.lastPhase = "spawned";
-    await running.recordOwnership();
     const currentProtocol = new SearchProtocol({
       onPhase: (phase) => {
         metrics.lastPhase = phase;
@@ -180,6 +179,10 @@ export async function searchWithClaude(
         }
       }
     });
+    // Only after stdout has a consumer: when a child exits, Node resumes any
+    // unconsumed stdio stream and discards what it buffered, so awaiting the
+    // marker write first could lose a fast-exiting Claude's whole output.
+    await running.recordOwnership();
     const processResult = await running.supervisor.wait();
     metrics.exitCode = processResult.code;
     metrics.exitSignal = processResult.signal;

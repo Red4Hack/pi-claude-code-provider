@@ -375,7 +375,6 @@ export function createClaudeStream(
         });
         claude = running;
         metrics.lastPhase = "spawned";
-        await running.recordOwnership();
 
         // Phase 3 — consume and validate Claude's ordered JSONL protocol.
         const { child } = running;
@@ -425,6 +424,10 @@ export function createClaudeStream(
         child.stdout?.on("end", finishStdout);
         child.stdout?.once("close", finishStdout);
         if (!child.stdout) finishStdout();
+        // Only after stdout has a consumer: when a child exits, Node resumes any
+        // unconsumed stdio stream and discards what it buffered, so awaiting the
+        // marker write first could lose a fast-exiting Claude's whole output.
+        await running.recordOwnership();
 
         if (prepared.readyPath) {
           await waitForReadyOrExit(prepared.readyPath, readyTimeoutMs, options?.signal, running.supervisor.wait(), {
