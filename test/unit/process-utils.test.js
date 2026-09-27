@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import test from "node:test";
 import { withTimeout, waitFor } from "../support/wait.js";
-import { ProcessTerminationError, forceTerminateProcessTreeSync, superviseProcess, terminateProcessGroup } from "../../src/process-utils.ts";
+import { ProcessTerminationError, forceTerminateProcessTreeSync, superviseProcess, taskkillFailureNamesOnlyExitedProcesses, terminateProcessGroup } from "../../src/process-utils.ts";
 import { nodeFixtureArgs } from "../support/node-fixture.js";
 
 async function assertProcessGone(pid) {
@@ -383,4 +383,22 @@ test("process-group termination still fails on EPERM when a member may be alive"
         /cleanup failed during SIGKILL/,
     );
     await assert.rejects(terminateProcessGroup(zombieChild, 50, zombieGroupKiller({ sigterm: "EINVAL" }), () => ["Z"]), /cleanup failed during SIGTERM/);
+});
+
+test("a taskkill failure naming only processes that have since exited counts as complete", () => {
+    // Windows CI's own wording; the digits are what survive localization.
+    const failure = (stderr) => new Error(`Command failed: C:\\Windows\\System32\\taskkill.exe /PID 2100 /T /F\n${stderr}`);
+    const raced = failure("ERROR: The process with PID 6712 (child process of PID 2100) could not be terminated.\r\nReason: There is no running instance of the task.\r\r\n");
+    const gone = () => false;
+    assert.equal(taskkillFailureNamesOnlyExitedProcesses(raced, 2100, gone), true);
+    // A named process that still exists, even one reusing the PID, stays unknown.
+    assert.equal(taskkillFailureNamesOnlyExitedProcesses(raced, 2100, (pid) => pid === 6712), false);
+    // Nothing named but the root, or nothing at all: unknown.
+    assert.equal(taskkillFailureNamesOnlyExitedProcesses(failure("ERROR: The process with PID 2100 could not be terminated."), 2100, gone), false);
+    assert.equal(taskkillFailureNamesOnlyExitedProcesses(failure("Access is denied."), 2100, gone), false);
+    // The command line's own digits (System32, /PID) are never read as named processes.
+    assert.equal(taskkillFailureNamesOnlyExitedProcesses(new Error("Command failed: C:\\Windows\\System32\\taskkill.exe /PID 2100 /T /F"), 2100, () => { throw new Error("probed"); }), false);
+    const several = failure("ERROR: The process with PID 6712 (child process of PID 2100) could not be terminated.\r\nERROR: The process with PID 6716 (child process of PID 6712) could not be terminated.\r\n");
+    assert.equal(taskkillFailureNamesOnlyExitedProcesses(several, 2100, gone), true);
+    assert.equal(taskkillFailureNamesOnlyExitedProcesses(several, 2100, (pid) => pid === 6716), false);
 });

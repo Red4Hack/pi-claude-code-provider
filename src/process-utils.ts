@@ -376,7 +376,8 @@ async function terminateWindowsProcessTree(child: ChildProcess, pid: number, gra
 
   await waitForChildClose(child, graceMs);
   if (taskkillFailure) {
-    if (isTaskkillMissingProcess(taskkillFailure) && (child.exitCode !== null || child.signalCode !== null)) return;
+    const leaderExited = child.exitCode !== null || child.signalCode !== null;
+    if (leaderExited && (isTaskkillMissingProcess(taskkillFailure) || taskkillFailureNamesOnlyExitedProcesses(taskkillFailure, pid))) return;
     if (child.exitCode === null && child.signalCode === null) {
       // This retained ChildProcess handle still identifies only our direct child.
       // Best effort reduces leakage, but tree-cleanup failure remains an error.
@@ -445,6 +446,36 @@ async function waitForChildClose(child: ChildProcess, timeoutMs: number): Promis
       resolve();
     });
   });
+}
+
+/**
+ * `taskkill /T` walks the tree and fails on a descendant that was already
+ * exiting ("could not be terminated ... no running instance of the task"). Its
+ * wording is localized, but the PIDs it names are not: once our own child has
+ * closed, a failure whose named processes are all gone left nothing running.
+ * Nothing is signalled again, because the closed child's PID may be reused.
+ * A named process that still exists, or a message naming none, stays unknown.
+ */
+export function taskkillFailureNamesOnlyExitedProcesses(
+  error: unknown,
+  rootPid: number,
+  processExists: (pid: number) => boolean = windowsProcessExists,
+): boolean {
+  // Node puts "Command failed: <command line>" first and taskkill's own output
+  // after it; the command line carries unrelated digits, such as System32.
+  const output = errorMessage(error).split("\n").slice(1).join("\n");
+  const named = [...new Set([...output.matchAll(/\d+/g)].map((match) => Number(match[0])))]
+    .filter((pid) => validPid(pid) && pid !== rootPid);
+  return named.length > 0 && named.every((pid) => !processExists(pid));
+}
+
+function windowsProcessExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return !isMissingProcess(error);
+  }
 }
 
 function isTaskkillMissingProcess(error: unknown): boolean {
