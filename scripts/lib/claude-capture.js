@@ -56,11 +56,12 @@ export function spawnCaptureChild(executable, args, { cwd, env, stdio = ["pipe",
 export async function stopCaptureChild(process, graceMs = 5_000) {
   let timer;
   try {
-    const closed = await Promise.race([
-      process.closed.then(() => true),
-      new Promise((resolve) => { timer = setTimeout(() => resolve(false), graceMs); }),
+    await Promise.race([
+      process.closed,
+      new Promise((resolve) => { timer = setTimeout(resolve, graceMs); }),
     ]);
-    if (!closed) await terminateProcessGroup(process.child);
+    // POSIX descendants can keep the owned group alive after the leader closes.
+    await terminateProcessGroup(process.child);
     await captureTimeout(process.closed, "capture process cleanup", graceMs);
   } finally {
     clearTimeout(timer);

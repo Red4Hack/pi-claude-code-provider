@@ -1,11 +1,39 @@
 import assert from "node:assert/strict";
 import { readFile, rm } from "node:fs/promises";
 import test from "node:test";
-import { captureEnvironment, captureTimeout } from "../../scripts/lib/claude-capture.js";
+import { captureEnvironment, captureTimeout, spawnCaptureChild, stopCaptureChild } from "../../scripts/lib/claude-capture.js";
 import { SURFACE_CASES, captureSurfaceCase, surfaceErrors } from "../../scripts/lib/claude-surface.js";
-import { createNodeFixture } from "../support/node-fixture.js";
+import { createNodeFixture, nodeFixtureArgs } from "../support/node-fixture.js";
 import { CAPTURED_CLAUDE_VERSION, CAPTURED_SURFACE_VERSION, PROVIDER_INIT_FIELDS, initRecord, startupSurface } from "../support/claude-fixture.js";
 import { validateClaudeCapabilities } from "../../src/auth.ts";
+import { terminateProcessGroup } from "../../src/process-utils.ts";
+import { withTimeout } from "../support/wait.js";
+
+test("capture cleanup removes a descendant after its leader closes", { skip: process.platform === "win32" }, async () => {
+  // Independent stdio lets the leader close while its owned group stays alive.
+  const body = `
+const { spawn } = require("node:child_process");
+const descendant = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+descendant.unref();
+process.stdout.write(String(descendant.pid) + "\\n");
+`;
+  const capture = spawnCaptureChild(process.execPath, nodeFixtureArgs(["-e", body]), {
+    cwd: process.cwd(), env: process.env, stdio: ["ignore", "pipe", "ignore"],
+  });
+  let stdout = "";
+  capture.child.stdout.on("data", (chunk) => { stdout += chunk; });
+  try {
+    assert.deepEqual(await withTimeout(capture.closed, "capture leader exit"), { code: 0, signal: null });
+    const descendantPid = Number(stdout.trim());
+    assert.ok(Number.isSafeInteger(descendantPid) && descendantPid > 0);
+    assert.doesNotThrow(() => process.kill(descendantPid, 0), "descendant must outlive its leader");
+    await stopCaptureChild(capture, 100);
+    assert.throws(() => process.kill(descendantPid, 0), { code: "ESRCH" });
+  } finally {
+    // Clean the group even when the cleanup assertion fails.
+    await terminateProcessGroup(capture.child);
+  }
+});
 
 test("the captured startup surface covers the complete effort matrix and names its producing version", async () => {
   const report = startupSurface();

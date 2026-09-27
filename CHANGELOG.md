@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Capture cleanup terminates the owned POSIX process group even after its leader closes, preventing surviving descendants from outliving temporary capture files.
 - A stalled response observer no longer retains private request files or session image leases after cancellation, process failure, or the total deadline, including when Claude has already exited. The deadline still starts at Claude launch and now covers response processing.
 - Private-path checks reject equivalent paths into request and session image directories, including dot segments, relative paths, and Windows separator and case variations. The guard remains a heuristic rather than a filesystem sandbox.
 - An omitted MCP prefix on exactly `bash`, `read`, `edit`, or `write` no longer fails the turn when that lowercase Pi tool is active. Capitalized names and other bare tool names remain errors; arguments are unchanged ([#14](https://github.com/chem/pi-claude-code-provider/issues/14)).
