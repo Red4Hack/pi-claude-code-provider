@@ -271,7 +271,8 @@ test("the exit reaper keeps state whose child may live, and image stores with it
   const output = await create("web_search_output");
   const { calls, kill } = recordingKill({ [-515_151]: "EPERM" });
 
-  reapRuntimeStateAtExit({ platform: "linux", kill });
+  // A live member behind the EPERM; a zombie-only group would be reclaimed.
+  reapRuntimeStateAtExit({ platform: "linux", kill, groupMemberStates: (pgid) => (pgid === 515_151 ? ["S"] : []) });
 
   assert.deepEqual(calls.filter(([pid]) => pid === -525_252), [], "a retained child is not signalled");
   assert.equal(await exists(denied), true, "a child whose death is unknown keeps its request state");

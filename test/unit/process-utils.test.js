@@ -289,9 +289,30 @@ test("synchronous forced termination removes the owned group, descendants includ
 });
 
 test("synchronous forced termination reports unknown liveness when it cannot signal", () => {
-    const denied = () => { throw Object.assign(new Error("denied"), { code: "EPERM" }); };
-    assert.equal(forceTerminateProcessTreeSync(1234, undefined, { platform: "linux", kill: denied }), false);
+    const failing = (code) => () => { throw Object.assign(new Error(code), { code }); };
+    const denied = failing("EPERM");
+    const force = (kill, groupMemberStates) => forceTerminateProcessTreeSync(1234, undefined, { platform: "linux", kill, groupMemberStates });
+    // macOS answers EPERM for a group of unreaped zombies, the usual state at exit.
+    assert.equal(force(denied, () => ["Z"]), true);
+    assert.equal(force(denied, () => ["Z+", "Zs"]), true);
+    assert.equal(force(denied, () => []), true, "the group vanished between the signal and the listing");
+    assert.equal(force(denied, () => ["S"]), false, "a live member keeps the state");
+    assert.equal(force(denied, () => ["Z", "R+"]), false);
+    assert.equal(force(denied, () => undefined), false, "an unreadable listing is unknown");
+    assert.equal(force(failing("EINVAL"), () => ["Z"]), false);
     assert.equal(forceTerminateProcessTreeSync(0, undefined, { platform: "linux", kill: () => true }), false);
+});
+
+test("the group listing behind an EPERM sees a live member", { skip: process.platform === "win32" }, async () => {
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+    try {
+        await once(child, "spawn");
+        const denied = () => { throw Object.assign(new Error("EPERM"), { code: "EPERM" }); };
+        assert.equal(forceTerminateProcessTreeSync(child.pid, child, { kill: denied }), false);
+    } finally {
+        process.kill(-child.pid, "SIGKILL");
+        await once(child, "close");
+    }
 });
 
 test("synchronous forced termination on Windows trusts only taskkill's own outcome", () => {

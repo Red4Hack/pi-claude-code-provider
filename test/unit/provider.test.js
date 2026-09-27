@@ -4,7 +4,6 @@ import { access, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } fr
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
 import * as piAi from "@earendil-works/pi-ai";
 import { createCodingTools } from "@earendil-works/pi-coding-agent";
 import { containsPrivateTransportPath, isExpectedToolHandoffExit, waitForReadyOrExit } from "../../src/provider.ts";
@@ -1736,7 +1735,8 @@ ${textResponseBody}`);
   })(${JSON.stringify(model)}, ${JSON.stringify(context)}, { timeoutMs: 1000, onResponse: () => new Promise(() => {}) });
   await stream.result();
 })().catch((error) => { console.error(error); process.exitCode = 1; });`);
-    const child = spawn(process.execPath, ["--import", fileURLToPath(new URL("../support/register-pi-loader.js", import.meta.url)), probe.executable], {
+    // --import takes a module specifier: a URL, because Windows rejects a drive path.
+    const child = spawn(process.execPath, ["--import", new URL("../support/register-pi-loader.js", import.meta.url).href, probe.executable], {
         detached: process.platform !== "win32",
         stdio: ["ignore", "pipe", "pipe"],
         // The probe is an ordinary headless host, without test-runner watchdogs.

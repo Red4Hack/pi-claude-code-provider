@@ -231,6 +231,8 @@ export interface ForceTerminateSyncDependencies {
   kill?: ProcessKiller;
   /** Runs `taskkill /PID <pid> /T /F` and returns its exit status, or null if it did not complete. */
   taskkill?: (pid: number) => number | null;
+  /** POSIX: `ps` state codes of a process group's members, or undefined if unavailable. */
+  groupMemberStates?: (pgid: number) => string[] | undefined;
 }
 
 /**
@@ -258,7 +260,28 @@ export function forceTerminateProcessTreeSync(
     (dependencies.kill ?? process.kill)(-pid, "SIGKILL");
     return true;
   } catch (error) {
-    return isMissingProcess(error);
+    if (isMissingProcess(error)) return true;
+    // macOS refuses to signal a group whose members are all zombies, which is
+    // exactly the state at exit: the abort's SIGTERM already ended Claude and the
+    // exiting host will never reap it. A zombie can touch nothing, so only a
+    // listed live member keeps the state; an unreadable listing is unknown.
+    if (!isPermissionDenied(error)) return false;
+    const states = (dependencies.groupMemberStates ?? processGroupMemberStatesSync)(pid);
+    return states !== undefined && states.every((state) => state.startsWith("Z"));
+  }
+}
+
+/** `ps` state codes of the group's members, or undefined if they cannot be listed. */
+function processGroupMemberStatesSync(pgid: number): string[] | undefined {
+  try {
+    const listing = spawnSync("ps", ["-A", "-o", "pgid=,stat="], { encoding: "utf8", timeout: 5_000 });
+    if (listing.status !== 0 || typeof listing.stdout !== "string") return undefined;
+    return listing.stdout.split("\n").flatMap((line) => {
+      const match = /^\s*(\d+)\s+(\S+)/.exec(line);
+      return match && Number(match[1]) === pgid ? [match[2]!] : [];
+    });
+  } catch {
+    return undefined;
   }
 }
 

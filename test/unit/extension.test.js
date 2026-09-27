@@ -67,7 +67,7 @@ function sessionContext(cwd, ui) {
     return { cwd, ui, sessionManager: { getSessionId: () => sessionId } };
 }
 
-async function createFakeClaude(searchResult = "ok", { searchDelayMs = 0, rateLimitInfo, reportCwd = false, providerTools = [], holdProviderUntilInput = false } = {}) {
+async function createFakeClaude(searchResult = "ok", { searchDelayMs = 0, rateLimitInfo, reportCwd = false, providerTools = [] } = {}) {
     const rateLimitEvents = Array.isArray(rateLimitInfo) ? rateLimitInfo : rateLimitInfo ? [rateLimitInfo] : [];
     const init = { type: "system", subtype: "init", tools: ["WebFetch", "WebSearch"], mcp_servers: [], model: "claude-sonnet-5", permissionMode: "dontAsk", slash_commands: [], skills: [], plugins: [], apiKeySource: "none" };
     const providerInit = {
@@ -82,9 +82,11 @@ async function createFakeClaude(searchResult = "ok", { searchDelayMs = 0, rateLi
     for (const rateLimitInfo of ${JSON.stringify(rateLimitEvents)}) process.stdout.write(JSON.stringify({type:"rate_limit_event",rate_limit_info:rateLimitInfo}) + "\\n");
     process.stdout.write(JSON.stringify({type:"result",is_error:false,result:${reportCwd ? "providerMode ? process.cwd() : " : ""}${JSON.stringify(searchResult)}}) + "\\n");
   };
-  if (providerMode && ${holdProviderUntilInput}) {
+  // Like Claude Code, a provider request consumes its stdin before answering.
+  // Answering and exiting first raced the provider's write into an EPIPE.
+  if (providerMode) {
     process.stdin.resume();
-    process.stdin.on("end", send);
+    process.stdin.on("end", () => setTimeout(send, ${searchDelayMs}));
   } else setTimeout(send, ${searchDelayMs});
 `, { preflight: true, writeReady: true, version: VERIFIED_VERSIONS.claudeCode }), { prefix: "pi-claude-code-provider-extension-" });
 }
@@ -124,7 +126,7 @@ test("platform acknowledgement hides only the startup advisory and leaves doctor
 test("sole-directory compatibility flag is required for a markerless tool-bearing side Agent", async () => {
     const parent = await mkdtemp(join(tmpdir(), "provider-extension-parent-"));
     const child = await mkdtemp(join(tmpdir(), "provider-extension-child-"));
-    const { directory, executable } = await createFakeClaude("ok", { reportCwd: true, providerTools: ["read"], holdProviderUntilInput: true });
+    const { directory, executable } = await createFakeClaude("ok", { reportCwd: true, providerTools: ["read"] });
     const oldPath = process.env.PI_CLAUDE_CODE_PROVIDER_PATH;
     const oldBorrow = process.env.PI_CLAUDE_CODE_PROVIDER_BORROW_SOLE_DIRECTORY;
     process.env.PI_CLAUDE_CODE_PROVIDER_PATH = executable;
