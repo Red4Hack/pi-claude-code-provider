@@ -17,6 +17,7 @@
 
 ### Changed
 
+- Claude Code 2.1.283 is now the validated baseline; the minimum supported version remains 2.1.281.
 - The web-search tool's prompt guidance now tells models to use it only when no other web-search tool is available or the user asks for it, and its summary notes that it uses Claude subscription capacity.
 - Claude Code's built-in telemetry plugin is explicitly disabled alongside the existing traffic-disable environment setting.
 - Quota-free surface capture now reports startup plugins and pre-init records and verifies all Sonnet/Opus effort levels in the API request.

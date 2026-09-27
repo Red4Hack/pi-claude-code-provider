@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 // Claude Code's help, captured byte-for-byte. Re-pin with
 // `npm run capture:claude-surface` and update this constant deliberately; a
 // hand-written approximation invents spellings the CLI never emitted.
-export const CAPTURED_CLAUDE_VERSION = "2.1.281";
+export const CAPTURED_CLAUDE_VERSION = "2.1.283";
 export const CAPTURED_CLAUDE_HELP_PATH = fileURLToPath(
   new URL(`./captured/claude-${CAPTURED_CLAUDE_VERSION}-help.txt`, import.meta.url),
 );
