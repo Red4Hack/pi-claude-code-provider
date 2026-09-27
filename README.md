@@ -1,8 +1,10 @@
 # pi-claude-code-provider
 
+> **This project is mothballed after the release of v0.6.0.** Pi and Claude Code are both extremely fast-moving projects that publish breaking changes regularly, and this was a hobby project rather than a professional venture, so I have other plans for my time and my tokens. I encourage people to look for other providers, such as [pi-claude-bridge](https://github.com/elidickinson/pi-claude-bridge), which is built on the Agent SDK. Please do not report further issues or submit pull requests. If Pi and Claude Code stabilize in future months, I may revisit this project. I thank my users for their kind words and wish everyone good luck with their own efforts.
+
 A [Pi](https://pi.dev) package that creates a provider for Claude family models from a subscription-authenticated Claude Code installation by launching Anthropic's installed `claude` executable in documented non-interactive print mode. Pi remains fully in charge of the session: branching, compaction, and history behave like any other Pi provider, and every tool runs visibly in Pi — the Claude process can propose tool calls but never execute anything on its own. The goal is simple: the convenience of your Claude subscription in Pi, with the fewest possible surprises.
 
-This package never imitates private OAuth traffic, does not use the Agents SDK, and does not modify Claude's internal session files. It never reads Claude credentials or uses an Anthropic API key.
+This package never imitates private OAuth traffic, does not use the Agent SDK, and does not modify Claude's internal session files. It never reads Claude credentials or uses an Anthropic API key.
 
 This project was developed using frontier AI models under human guidance. Almost all of the docs and code were written by machines except for this introductory material. The project may be over-engineered in some respects; that's fine. If you enjoy this package, please star it on github.
 
@@ -114,7 +116,7 @@ The provider rejects detected tool arguments aimed at its private request and im
 - **Authentication or subscription failure:** run `claude auth status` and sign in with an eligible subscription. For rate-limit or billing errors, check your subscription limits and usage-credit settings. Logins through `CLAUDE_CODE_OAUTH_TOKEN` are unsupported.
 - **Tools fail or requests report `mcp_startup`:** run the doctor to check the tool bridge handshake.
 - **"The model refused to complete the request":** Fable, Opus 5.5, and Opus 5 run safety classifiers, most often triggered by cybersecurity and biology content, including context such as project files. Claude Code can re-run a flagged request on another model, but the provider turns that switch off because it cannot publish a response rewritten mid-stream, so the request ends with this error and Pi does not retry it. See Anthropic's [automatic model fallback](https://code.claude.com/docs/en/model-config#automatic-model-fallback).
-- **A request keeps failing:** run `/pi-claude-code-provider-doctor report` and inspect the report before sharing it. Include the exact error and steps to reproduce when [opening an issue](https://github.com/chem/pi-claude-code-provider/issues).
+- **A request keeps failing:** run `/pi-claude-code-provider-doctor report` and inspect the report before sharing it.
 
 ## Development and license
 

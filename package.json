@@ -2,7 +2,7 @@
   "name": "pi-claude-code-provider",
   "version": "0.5.0",
   "type": "module",
-  "description": "The convenience of your Claude subscription in Pi, with the fewest possible surprises. Uses Claude Code's CLI under the hood.",
+  "description": "The convenience of your Claude subscription in Pi, with the fewest possible surprises. Uses Claude Code's CLI under the hood. Mothballed after 0.6.0.",
   "author": "chem <sineverbisnon@gmail.com>",
   "license": "MIT",
   "keywords": ["pi-package", "pi-extension", "claude-code", "subscription"],
@@ -11,7 +11,7 @@
     "url": "git+https://github.com/chem/pi-claude-code-provider.git"
   },
   "bugs": {
-    "url": "https://github.com/chem/pi-claude-code-provider/issues"
+    "url": "https://github.com/chem/pi-claude-code-provider#readme"
   },
   "homepage": "https://github.com/chem/pi-claude-code-provider#readme",
   "files": [

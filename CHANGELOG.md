@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+> **This project is mothballed after the release of v0.6.0.** Pi and Claude Code are both extremely fast-moving projects that publish breaking changes regularly, and this was a hobby project rather than a professional venture, so I have other plans for my time and my tokens. I encourage people to look for other providers, such as [pi-claude-bridge](https://github.com/elidickinson/pi-claude-bridge), which is built on the Agent SDK. Please do not report further issues or submit pull requests. If Pi and Claude Code stabilize in future months, I may revisit this project. I thank my users for their kind words and wish everyone good luck with their own efforts.
+
 ### Added
 
 - The doctor and diagnostic report name the provider version Pi actually loaded and its install directory, so an older project-local or duplicate installation is visible.
