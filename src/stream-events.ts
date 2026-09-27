@@ -106,6 +106,25 @@ export class ClaudeEventMapper {
     this.privatePaths = options.privatePaths ?? [];
   }
 
+  /**
+   * Map Claude's tool name to the Pi tool name. Claude sometimes proposes the
+   * bare Pi name (e.g. `bash`) seen in Pi's system prompt instead of the MCP
+   * transport name (`mcp__pi__bash`); accept that only when it names exactly
+   * one active Pi tool.
+   */
+  private resolveToolName(qualifiedName: string): string | undefined {
+    const direct = this.toolNames.get(qualifiedName);
+    if (direct) return direct;
+    if (!qualifiedName) return undefined;
+    let match: string | undefined;
+    for (const piName of this.toolNames.values()) {
+      if (piName !== qualifiedName) continue;
+      if (match !== undefined) return undefined;
+      match = piName;
+    }
+    return match;
+  }
+
   get isTerminal(): boolean {
     return this.terminal;
   }
@@ -364,7 +383,7 @@ export class ClaudeEventMapper {
       this.stream.push({ type: "thinking_start", contentIndex, partial: this.output });
     } else if (source.type === "tool_use") {
       const qualifiedName = typeof source.name === "string" ? source.name : "";
-      const name = this.toolNames.get(qualifiedName);
+      const name = this.resolveToolName(qualifiedName);
       if (!name) throw new ClaudeCodeError("tool_unknown", `Claude proposed an unknown tool: ${qualifiedName}`);
       if (typeof source.id !== "string" || source.id.length === 0) throw new ClaudeCodeError("tool_id", "Claude emitted a tool without an ID");
       const initial = source.input && typeof source.input === "object" && !Array.isArray(source.input)
