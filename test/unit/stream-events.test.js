@@ -10,7 +10,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { ClaudeEventMapper as EventMapper, argumentPreviewDue } from "../../src/stream-events.ts";
 import { createOutput } from "../../src/output.ts";
-import { PROVIDER_INIT_FIELDS, initRecord as claudeInitRecord, streamRecoveryRecords } from "../support/claude-fixture.js";
+import { PROVIDER_INIT_FIELDS, initRecord as claudeInitRecord, streamRecoveryRecords, toolUseEvents } from "../support/claude-fixture.js";
 
 function makeMapper(stream, output, expectedTools, toolNames, onToolUse, onRateLimitNotice, onResponseAnnouncement) {
     return new EventMapper({ stream, output, expectedTools, toolNames, onToolUse, onRateLimitNotice, onResponseAnnouncement });
@@ -32,6 +32,93 @@ const model = {
 function initRecord(tools = [], mcpServers = []) {
     return claudeInitRecord(PROVIDER_INIT_FIELDS, { tools, mcp_servers: mcpServers });
 }
+
+function initializedToolMapper(toolNames) {
+    const stream = createAssistantMessageEventStream();
+    const output = createOutput(model);
+    const tools = [...toolNames.keys()];
+    const mapper = makeMapper(stream, output, new Set(tools), toolNames, () => {});
+    mapper.accept(initRecord(tools, tools.length ? [{ name: "pi", status: "connected" }] : []));
+    return { stream, output, mapper };
+}
+
+const defaultToolArguments = {
+    bash: { command: "printf hello", timeout: 2 },
+    read: { path: "README.md", offset: 1, limit: 3 },
+    edit: { path: "example.txt", edits: [{ oldText: "before", newText: "after" }] },
+    write: { path: "example.txt", content: "hello" },
+};
+for (const [piName, args] of Object.entries(defaultToolArguments)) {
+    for (const name of [piName, `mcp__pi__${piName}`]) {
+        test(`maps active ${name} to Pi ${piName} without changing the call`, async () => {
+            const { stream, output, mapper } = initializedToolMapper(new Map([[`mcp__pi__${piName}`, piName]]));
+            const events = [];
+            const consume = (async () => {
+                for await (const event of stream) events.push(structuredClone(event));
+            })();
+            for (const record of toolUseEvents({ messageId: "msg_name", toolUseId: "toolu_name", name, partialJson: JSON.stringify(args) })) {
+                mapper.accept(record);
+            }
+            assert.equal(mapper.completeToolUse(), true);
+            await consume;
+            const expected = { type: "toolCall", id: "toolu_name", name: piName, arguments: args };
+            assert.equal((await stream.result()).stopReason, "toolUse");
+            assert.deepEqual(output.content, [expected]);
+            assert.deepEqual(events.map((event) => event.type), ["start", "toolcall_start", "toolcall_delta", "toolcall_end", "done"]);
+            for (const event of events.filter((event) => event.type.startsWith("toolcall_"))) {
+                assert.equal(event.partial.content[event.contentIndex].name, piName);
+                assert.equal(event.partial.content[event.contentIndex].id, "toolu_name");
+            }
+            assert.deepEqual(events.find((event) => event.type === "toolcall_end").toolCall, expected);
+        });
+    }
+}
+
+test("bare default-name recovery does not convert Claude Code arguments", async () => {
+    const { mapper, stream } = initializedToolMapper(new Map([["mcp__pi__edit", "edit"]]));
+    const args = { file_path: "example.txt", old_string: "before", new_string: "after", replace_all: true };
+    for (const record of toolUseEvents({ messageId: "msg_args", toolUseId: "toolu_args", name: "edit" })) {
+        if (record.event.type === "content_block_start") record.event.content_block.input = args;
+        mapper.accept(record);
+    }
+    mapper.completeToolUse();
+    assert.deepEqual((await stream.result()).content[0].arguments, args);
+});
+
+test("bare recovery excludes case variants, arbitrary tools, aliases, and foreign namespaces", () => {
+    const names = new Map(["bash", "read", "edit", "write", "grep", "find", "ls", "powershell", "custom", "Bash", "Read", "Edit", "Write"].map((name) => [`mcp__pi__${name}`, name]));
+    names.set("mcp__pi__tool_1234567890abcdef", "odd tool/name");
+    const rejected = [
+        ...["bash", "read", "edit", "write"].flatMap((name) => [name[0].toUpperCase() + name.slice(1), name.toUpperCase(), name[0] + name.slice(1).toUpperCase(), ` ${name}`, `${name} `]),
+        "grep", "find", "ls", "powershell", "custom", "odd tool/name", "tool_1234567890abcdef", "mcp__other__bash", "mcp__pi__BASH", "", null,
+    ];
+    for (const name of rejected) {
+        const { mapper } = initializedToolMapper(names);
+        mapper.accept({ type: "stream_event", event: { type: "message_start", message: { id: "msg_rejected", usage: {} } } });
+        assert.throws(() => mapper.accept({ type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "toolu_rejected", name, input: {} } } }),
+            (error) => error.code === "tool_unknown", String(name));
+    }
+});
+
+test("bare defaults require their same active lowercase mapping", () => {
+    for (const piName of ["bash", "read", "edit", "write"]) {
+        for (const names of [new Map(), new Map([[`mcp__pi__${piName}`, "different"]])]) {
+            const { mapper } = initializedToolMapper(names);
+            mapper.accept({ type: "stream_event", event: { type: "message_start", message: { id: "msg_inactive", usage: {} } } });
+            assert.throws(() => mapper.accept({ type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "toolu_inactive", name: piName, input: {} } } }),
+                (error) => error.code === "tool_unknown");
+        }
+    }
+});
+
+test("exact advertised custom and capitalized names retain their mapping", async () => {
+    for (const [transportName, piName] of [["mcp__pi__Bash", "Bash"], ["mcp__pi__custom", "custom"], ["mcp__pi__tool_1234567890abcdef", "odd tool/name"]]) {
+        const { mapper, stream } = initializedToolMapper(new Map([[transportName, piName], ["mcp__pi__bash", "bash"]]));
+        for (const record of toolUseEvents({ messageId: "msg_exact", toolUseId: "toolu_exact", name: transportName })) mapper.accept(record);
+        mapper.completeToolUse();
+        assert.equal((await stream.result()).content[0].name, piName);
+    }
+});
 
 test("maps text, thinking, tool arguments, usage, and tool termination", async () => {
     const stream = createAssistantMessageEventStream();

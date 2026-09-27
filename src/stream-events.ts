@@ -63,6 +63,12 @@ interface IndexedBlock {
   parsedLength?: number;
 }
 
+// Issue #14: recover only an omitted MCP prefix on Pi's four default names.
+// Capitalized Claude Code names and argument conversion are intentionally excluded.
+// Keep this exception local to response mapping so it can be removed independently
+// of the advertised catalog and initialization's exact inventory validation.
+const BARE_PI_TOOL_NAMES: ReadonlySet<string> = new Set(["bash", "read", "edit", "write"]);
+
 export type ClaudeTerminationCause = "none" | "tool_handoff" | "caller_abort";
 
 export class ClaudeEventMapper {
@@ -325,6 +331,15 @@ export class ClaudeEventMapper {
     notify();
   }
 
+  private resolveToolName(proposedName: string): string | undefined {
+    const exact = this.toolNames.get(proposedName);
+    if (exact !== undefined) return exact;
+    if (!BARE_PI_TOOL_NAMES.has(proposedName)) return undefined;
+    const active = this.toolNames.get(`mcp__pi__${proposedName}`);
+    // A matching transport key must belong to that same active Pi tool.
+    return active === proposedName ? active : undefined;
+  }
+
   private startBlock(event: Record<string, unknown>): void {
     const sourceIndex = index(event.index);
     if (this.blocks.has(sourceIndex)) throw new ClaudeCodeError("protocol_blocks", `Duplicate content block index ${sourceIndex}`);
@@ -354,9 +369,9 @@ export class ClaudeEventMapper {
       });
       this.stream.push({ type: "thinking_start", contentIndex, partial: this.output });
     } else if (source.type === "tool_use") {
-      const qualifiedName = typeof source.name === "string" ? source.name : "";
-      const name = this.toolNames.get(qualifiedName);
-      if (!name) throw new ClaudeCodeError("tool_unknown", `Claude proposed an unknown tool: ${qualifiedName}`);
+      const proposedName = typeof source.name === "string" ? source.name : "";
+      const name = this.resolveToolName(proposedName);
+      if (!name) throw new ClaudeCodeError("tool_unknown", `Claude proposed an unknown tool: ${proposedName}`);
       if (typeof source.id !== "string" || source.id.length === 0) throw new ClaudeCodeError("tool_id", "Claude emitted a tool without an ID");
       const initial = source.input && typeof source.input === "object" && !Array.isArray(source.input)
         ? source.input as ToolCall["arguments"]

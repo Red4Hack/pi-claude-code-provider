@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import * as piAi from "@earendil-works/pi-ai";
+import { createCodingTools } from "@earendil-works/pi-coding-agent";
 import { isExpectedToolHandoffExit, waitForReadyOrExit } from "../../src/provider.ts";
 import { createTestClaudeStream as createClaudeStream, requestMetrics, settledRequest } from "../support/provider-request.js";
 import { superviseProcess, terminateProcessGroup } from "../../src/process-utils.ts";
@@ -55,6 +56,96 @@ const toolTerminationResult = {
     usage: { input_tokens: 4, output_tokens: 2 },
     modelUsage: { sonnet: { contextWindow: 1000000, maxOutputTokens: 64000 } },
 };
+
+test("provider hands off each bare default Pi name with unchanged arguments and complete cleanup", async (t) => {
+    const tools = createCodingTools(tmpdir());
+    const argsByName = {
+        bash: { command: "printf hello", timeout: 2 },
+        read: { path: "README.md", offset: 1, limit: 3 },
+        edit: { path: "example.txt", edits: [{ oldText: "before", newText: "after" }] },
+        write: { path: "example.txt", content: "hello" },
+    };
+    for (const tool of tools) {
+        await t.test(tool.name, async () => {
+            const args = argsByName[tool.name];
+            assert.ok(args, "the compatibility test covers only the four default names");
+            const records = toolUseEvents({ messageId: "msg_bare", toolUseId: "toolu_bare", name: tool.name, partialJson: JSON.stringify(args) });
+            const fake = await fakeClaude(`
+process.on("SIGTERM", () => process.exit(143));
+process.stdin.resume();
+process.stdin.on("end", () => {
+  const privateDirectory = require("node:path").dirname(process.argv[process.argv.indexOf("--system-prompt-file") + 1]);
+  fs.writeFileSync(require("node:path").join(__dirname, "private-directory"), privateDirectory);
+  process.stdout.write(JSON.stringify(${JSON.stringify({ ...toolInit, tools: [`mcp__pi__${tool.name}`] })}) + "\\n");
+  for (const record of ${JSON.stringify(records)}) process.stdout.write(JSON.stringify(record) + "\\n");
+  setInterval(() => {}, 1000);
+});`);
+            try {
+                const result = await settledRequest(createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, providerContext({ tools: [tool] })));
+                assert.equal(result.stopReason, "toolUse", result.errorMessage);
+                assert.deepEqual(result.content, [{ type: "toolCall", id: "toolu_bare", name: tool.name, arguments: args }]);
+                assert.deepEqual(piAi.validateToolCall([tool], result.content[0]), args);
+                const metrics = await requestMetrics(result);
+                assert.equal(metrics.lastPhase, "completed");
+                assert.equal(metrics.stopReason, "toolUse");
+                assert.equal(metrics.errorCategory, undefined);
+                assert.equal(metrics.cleanupComplete, true);
+                assert.equal(metrics.terminationExpected, true);
+                const privateDirectory = await readFile(join(fake.directory, "private-directory"), "utf8");
+                await assert.rejects(access(privateDirectory), { code: "ENOENT" });
+            } finally {
+                await rm(fake.directory, { recursive: true, force: true });
+            }
+        });
+    }
+});
+
+test("a historical default tool is not callable by its bare name when inactive", async () => {
+    const fake = await fakeClaude(`
+process.stdin.resume();
+process.stdin.on("end", () => {
+  process.stdout.write(JSON.stringify(${JSON.stringify(init)}) + "\\n");
+  for (const record of ${JSON.stringify(toolUseEvents({ messageId: "msg_history", toolUseId: "toolu_history", name: "read" }))}) process.stdout.write(JSON.stringify(record) + "\\n");
+  setInterval(() => {}, 1000);
+});`);
+    const historical = providerContext({ tools: [], messages: [
+        { role: "assistant", content: [{ type: "toolCall", id: "historical", name: "read", arguments: { path: "README.md" } }], api: model.api, provider: model.provider, model: model.id, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "toolUse", timestamp: 1 },
+        { role: "toolResult", toolCallId: "historical", toolName: "read", content: [{ type: "text", text: "old result" }], isError: false, timestamp: 2 },
+        { role: "user", content: "continue", timestamp: 3 },
+    ] });
+    try {
+        const result = await settledRequest(createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, historical));
+        assert.equal(result.stopReason, "error");
+        assert.match(result.errorMessage, /Claude proposed an unknown tool: read/);
+        const metrics = await requestMetrics(result);
+        assert.equal(metrics.errorCategory, "tool_unknown");
+        assert.equal(metrics.cleanupComplete, true);
+    } finally {
+        await rm(fake.directory, { recursive: true, force: true });
+    }
+});
+
+test("bare default-name recovery still rejects malformed tool arguments", async () => {
+    const fake = await fakeClaude(`
+process.on("SIGTERM", () => process.exit(143));
+process.stdin.resume();
+process.stdin.on("end", () => {
+  process.stdout.write(JSON.stringify(${JSON.stringify(toolInit)}) + "\\n");
+  for (const record of ${JSON.stringify(toolUseEvents({ messageId: "msg_bad_args", toolUseId: "toolu_bad_args", name: "read", partialJson: '{"path":' }))}) process.stdout.write(JSON.stringify(record) + "\\n");
+  setInterval(() => {}, 1000);
+});`);
+    try {
+        const result = await settledRequest(createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, toolContext));
+        assert.equal(result.stopReason, "error");
+        assert.match(result.errorMessage, /Claude emitted invalid arguments for tool read/);
+        const metrics = await requestMetrics(result);
+        assert.equal(metrics.errorCategory, "tool_arguments");
+        assert.equal(metrics.cleanupComplete, true);
+    } finally {
+        await rm(fake.directory, { recursive: true, force: true });
+    }
+});
+
 test("overlapping failures keep their own metrics when finalization completes out of order", async () => {
     const idle = await fakeClaude(`process.stdin.resume(); setInterval(() => {}, 1000);`);
     const removed = await mkdtemp(join(tmpdir(), "provider-removed-native-"));
@@ -886,8 +977,9 @@ process.stdin.on("end", () => {
 // These cases start the real MCP bridge. Restricted sandboxes can drop live
 // stdin to nested Node children, which makes readiness time out independently
 // of provider behavior; run this integration coverage outside the sandbox.
-test("provider checks MCP execution violations after tool-use termination", async () => {
-    const fake = await fakeClaude(`
+for (const proposalName of ["mcp__pi__read", "read"]) {
+    test(`provider checks MCP execution violations after ${proposalName} termination`, async () => {
+        const fake = await fakeClaude(`
 const violationConfigIndex = process.argv.indexOf("--mcp-config");
 const violationConfig = JSON.parse(process.argv[violationConfigIndex + 1]);
 const violation = violationConfig.mcpServers.pi.env.PI_CLAUDE_TOOL_VIOLATION;
@@ -899,18 +991,22 @@ else process.on("SIGTERM", () => {
 process.stdin.resume();
 process.stdin.on("end", () => {
   process.stdout.write(JSON.stringify(${JSON.stringify(toolInit)}) + "\\n");
-  for (const record of ${JSON.stringify(toolUseEvents({ messageId: "msg_violation", toolUseId: "toolu_violation" }))}) process.stdout.write(JSON.stringify(record) + "\\n");
+  for (const record of ${JSON.stringify(toolUseEvents({ messageId: "msg_violation", toolUseId: "toolu_violation", name: proposalName }))}) process.stdout.write(JSON.stringify(record) + "\\n");
   setInterval(() => {}, 1000);
 });`);
-    try {
-        const result = await settledRequest(createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, toolContext, { reasoning: "medium" }));
-        assert.equal(result.stopReason, "error");
-        assert.match(result.errorMessage ?? "", /Security invariant violated/);
-    }
-    finally {
-        await rm(fake.directory, { recursive: true, force: true });
-    }
-});
+        try {
+            const result = await settledRequest(createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, toolContext, { reasoning: "medium" }));
+            assert.equal(result.stopReason, "error");
+            assert.match(result.errorMessage ?? "", /Security invariant violated/);
+            const metrics = await requestMetrics(result);
+            assert.equal(metrics.errorCategory, "mcp_execution");
+            assert.equal(metrics.cleanupComplete, true);
+        }
+        finally {
+            await rm(fake.directory, { recursive: true, force: true });
+        }
+    });
+}
 test("provider preserves MCP violation diagnostics when private cleanup also fails", async () => {
     const fake = await fakeClaude(`
 const violationConfigIndex = process.argv.indexOf("--mcp-config");

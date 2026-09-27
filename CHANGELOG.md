@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- An omitted MCP prefix on exactly `bash`, `read`, `edit`, or `write` no longer fails the turn when that lowercase Pi tool is active. Capitalized names and other bare tool names remain errors; arguments are unchanged ([#14](https://github.com/chem/pi-claude-code-provider/issues/14)).
 - Local checkouts now show their directory name in Pi's `[Extensions]` list instead of `extensions`. The single root `index.ts` preserves Git and npm labels on both Pi distributions and replaces the previous entry shim.
 - Provider tests wait for each request's own lifecycle metrics and isolate temporary state, preventing late cleanup from interfering with another test's assertions.
 

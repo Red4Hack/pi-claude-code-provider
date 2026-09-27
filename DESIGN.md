@@ -59,11 +59,13 @@ Claude Code can further append turn nudges to user turns and tool results. Those
 
 Active Pi schemas are sorted into an ephemeral MCP catalog. Names of at most 48 characters made only of the characters Claude Code keeps unchanged in an MCP tool name (letters, digits, `_`, and `-`) are preserved; other names receive deterministic request-local aliases. Removed historical tools receive non-callable labels.
 
+Response mapping resolves exact advertised transport names first. As a deliberate exception for an intermittent model naming error ([#14](https://github.com/chem/pi-claude-code-provider/issues/14)), it also accepts exactly `bash`, `read`, `edit`, and `write` when `mcp__pi__<name>` maps to that same active lowercase Pi name. A same-name Pi override remains the implementation that executes. Capitalized Claude Code names, other bare names, and generated aliases receive no recovery. IDs and arguments are preserved: this does not translate `file_path`, edit fields, timeout units, or any other Claude Code inputs into Pi's schema. Pi remains responsible for schema validation and execution. The whitelist and resolver are confined to the stream mapper; removing that fallback restores strict transport-name matching without changing catalogs, initialization, or transcript serialization.
+
 The Claude child runs in `dontAsk` mode with local tools disabled. A proposal-only MCP server implements `initialize` and `tools/list`; any `tools/call` writes a violation marker and returns an error. The provider waits for catalog readiness, maps complete known proposals back to Pi, terminates Claude, verifies cleanup and violation state, removes private transport files, and only then publishes the Pi `toolUse` result.
 
 On POSIX, a handoff accepts a SIGTERM or SIGKILL exit only when the supervisor recorded sending that signal to its owned process group. This includes cleanup escalating after the SIGTERM grace period; proposal validation and successful cleanup still precede publication. Unrecorded signal exits remain failures.
 
-Unknown tools, malformed arguments, execution attempts, private transport paths, unexpected exits, caller cancellation, and cleanup failures fail the request.
+Tool names outside the advertised mapping and the four-name exception, malformed arguments, execution attempts, private transport paths, unexpected exits, caller cancellation, and cleanup failures fail the request. Initialization still requires the exact advertised MCP inventory; the response-name exception does not admit Claude Code's built-in tools.
 
 ## Process and storage lifecycle
 
