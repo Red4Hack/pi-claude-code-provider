@@ -115,6 +115,8 @@ The outer Pi tool invocation is visible in Pi; Claude's inner WebSearch and WebF
 
 The query is supplied through a private generated file. Output is validated and bounded; truncated full output may be retained in a session-scoped private file that is removed at shutdown. The main provider never gains invisible web access.
 
+Registration is optional. Pi puts an active tool's snippet and guideline in the system prompt of whatever model is selected, not only this provider's, and every call spends Claude subscription capacity. So `PI_CLAUDE_CODE_PROVIDER_WEB_SEARCH=off` leaves the tool unregistered, and the guideline tells models to prefer any other available web-search tool. An unrecognized value also leaves it unregistered, because someone who set the variable most likely meant to opt out; registration is decided once per provider instance, and the doctor reports the outcome.
+
 ## Security and privacy
 
 The package trusts the installed Pi and Claude executables, Node, the operating system, and the user's account. It defends against malformed protocol records, unexpected capabilities, unsafe file references, tool-name confusion, private-path disclosure, child-process leaks, oversized data, and accidental diagnostic content leakage.

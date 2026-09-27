@@ -520,6 +520,97 @@ test("an occupied permanent web-search name is preserved with a prefixed warning
     }
 });
 
+async function withWebSearchSetting(value, body) {
+    const { directory, executable } = await createFakeClaude();
+    const originalPath = process.env.PI_CLAUDE_CODE_PROVIDER_PATH;
+    const originalSetting = process.env.PI_CLAUDE_CODE_PROVIDER_WEB_SEARCH;
+    process.env.PI_CLAUDE_CODE_PROVIDER_PATH = executable;
+    if (value === undefined) delete process.env.PI_CLAUDE_CODE_PROVIDER_WEB_SEARCH;
+    else process.env.PI_CLAUDE_CODE_PROVIDER_WEB_SEARCH = value;
+    try {
+        await body();
+    } finally {
+        if (originalPath === undefined) delete process.env.PI_CLAUDE_CODE_PROVIDER_PATH;
+        else process.env.PI_CLAUDE_CODE_PROVIDER_PATH = originalPath;
+        if (originalSetting === undefined) delete process.env.PI_CLAUDE_CODE_PROVIDER_WEB_SEARCH;
+        else process.env.PI_CLAUDE_CODE_PROVIDER_WEB_SEARCH = originalSetting;
+        await rm(directory, { recursive: true, force: true });
+    }
+}
+
+async function startAndRunDoctor(pi) {
+    const notices = [];
+    const ctx = sessionContext(tmpdir(), { notify(message, level) { notices.push({ message, level }); } });
+    pi.handlers.get("session_start")[0]({}, ctx);
+    const startupNotices = [...notices];
+    await pi.commands.get("pi-claude-code-provider-doctor").handler("", ctx);
+    const doctor = notices.slice(startupNotices.length).map(({ message }) => message).join("\n");
+    await pi.handlers.get("session_shutdown")[0]({}, {});
+    return { startupNotices, doctor };
+}
+
+test("web search is registered by default with guidance that defers to other search tools", async () => {
+    await withWebSearchSetting(undefined, async () => {
+        const pi = fakePi();
+        await piClaudeCodeProvider(pi.api);
+        const beforeSession = [];
+        await pi.commands.get("pi-claude-code-provider-doctor").handler("", sessionContext(tmpdir(), {
+            notify(message) { beforeSession.push(message); },
+        }));
+        assert.match(beforeSession.join("\n"), /^Web search: not registered yet \(no session started\)$/m);
+        const { doctor } = await startAndRunDoctor(pi);
+        const search = pi.tools.get("pi_claude_code_provider_web_search");
+        assert.ok(search);
+        assert.deepEqual(search.promptGuidelines, [
+            "Use pi_claude_code_provider_web_search for current external information or online sources only when no other web-search tool is available or the user asks for it.",
+        ]);
+        assert.match(doctor, /^Web search: enabled$/m);
+    });
+});
+
+test("web search switched off registers no tool and says nothing, while the provider stays available", async () => {
+    await withWebSearchSetting("off", async () => {
+        const pi = fakePi();
+        await piClaudeCodeProvider(pi.api);
+        const { startupNotices, doctor } = await startAndRunDoctor(pi);
+        assert.equal(pi.tools.has("pi_claude_code_provider_web_search"), false);
+        assert.ok(pi.providers.has("pi-claude-code-provider"));
+        assert.equal(startupNotices.some(({ message }) => message.includes("pi_claude_code_provider_web_search")), false);
+        assert.match(doctor, /^Web search: disabled \(PI_CLAUDE_CODE_PROVIDER_WEB_SEARCH=off\)$/m);
+    });
+});
+
+test("web search switched off does not warn about an occupied name", async () => {
+    await withWebSearchSetting("off", async () => {
+        const existingSearch = { name: "pi_claude_code_provider_web_search", owner: "other-extension" };
+        const pi = fakePi([existingSearch]);
+        await piClaudeCodeProvider(pi.api);
+        const { startupNotices } = await startAndRunDoctor(pi);
+        assert.equal(pi.tools.get("pi_claude_code_provider_web_search"), existingSearch);
+        assert.equal(startupNotices.some(({ message }) => message.includes("already occupied")), false);
+    });
+});
+
+test("an unrecognized web-search switch leaves the tool unregistered with one warning", async () => {
+    await withWebSearchSetting("0", async () => {
+        const pi = fakePi();
+        await piClaudeCodeProvider(pi.api);
+        const { startupNotices, doctor } = await startAndRunDoctor(pi);
+        assert.equal(pi.tools.has("pi_claude_code_provider_web_search"), false);
+        assert.ok(pi.providers.has("pi-claude-code-provider"));
+        const warnings = startupNotices.filter(({ message }) => message.includes("PI_CLAUDE_CODE_PROVIDER_WEB_SEARCH"));
+        assert.equal(warnings.length, 1);
+        assert.equal(warnings[0].level, "warning");
+        assert.match(warnings[0].message, /^\[pi-claude-code-provider\] pi_claude_code_provider_web_search was not registered: PI_CLAUDE_CODE_PROVIDER_WEB_SEARCH must be "on" or "off"$/);
+        assert.match(doctor, /^Web search: not registered \(PI_CLAUDE_CODE_PROVIDER_WEB_SEARCH must be "on" or "off"\)$/m);
+        // Registration is attempted once per instance, so a later session does not repeat it.
+        const later = [];
+        pi.handlers.get("session_start")[0]({}, sessionContext(tmpdir(), { notify(message, level) { later.push({ message, level }); } }));
+        assert.equal(later.some(({ message }) => message.includes("PI_CLAUDE_CODE_PROVIDER_WEB_SEARCH")), false);
+        await pi.handlers.get("session_shutdown")[0]({}, {});
+    });
+});
+
 test("provider requests run Claude in the current Pi session's directory, never the host process cwd", async () => {
     const { directory, executable } = await createFakeClaude("ok", { reportCwd: true });
     const sessionB = await mkdtemp(join(tmpdir(), "pi-claude-code-provider-session-b-"));

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- `PI_CLAUDE_CODE_PROVIDER_WEB_SEARCH=off` leaves `pi_claude_code_provider_web_search` unregistered, so users with their own search tools or other providers' models no longer have Claude-backed search, or its prompt guidance, added to every session. The default stays `on`; an unrecognized value also leaves the tool unregistered, with a warning. The doctor and diagnostic report show the web-search state ([#15](https://github.com/chem/pi-claude-code-provider/issues/15)).
+
 ### Fixed
 
 - Capture cleanup terminates the owned POSIX process group even after its leader closes, preventing surviving descendants from outliving temporary capture files.
@@ -13,6 +17,7 @@
 
 ### Changed
 
+- The web-search tool's prompt guidance now tells models to use it only when no other web-search tool is available or the user asks for it, and its summary notes that it uses Claude subscription capacity.
 - Claude Code's built-in telemetry plugin is explicitly disabled alongside the existing traffic-disable environment setting.
 - Quota-free surface capture now reports startup plugins and pre-init records and verifies all Sonnet/Opus effort levels in the API request.
 

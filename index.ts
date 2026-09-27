@@ -11,13 +11,13 @@ import { readClaudeModelAliases } from "./src/claude-models.ts";
 import { MINIMUM_VERSIONS, VERIFIED_VERSIONS, platformStatus, startupPlatformWarning, versionStatus } from "./src/compatibility.ts";
 import { writeDiagnosticReport } from "./src/diagnostics.ts";
 import { errorText, normalizeClaudeOverflow } from "./src/errors.ts";
-import { formatDoctorSummary, probeBridge } from "./src/doctor.ts";
+import { formatDoctorSummary, probeBridge, type WebSearchStatus } from "./src/doctor.ts";
 import { flushMetricsLog, getLastRequestMetrics, getLastSearchMetrics, getMetricsLogError } from "./src/metrics.ts";
 import { createClaudeStream } from "./src/provider.ts";
 import { cleanupStaleRuntimeDirectories, createRuntimeDirectory } from "./src/runtime-directories.ts";
 import { SessionImageStore } from "./src/session-image-store.ts";
 import { resolveSession, sessionRegistry } from "./src/session-registry.ts";
-import { searchWithClaude } from "./src/web-search.ts";
+import { WEB_SEARCH_ENV, searchWithClaude, webSearchSetting } from "./src/web-search.ts";
 import type { RateLimitNotice } from "./src/claude-protocol.ts";
 import type { RuntimeCleanupResult } from "./src/runtime-directories.ts";
 import type { ClaudeInstallation } from "./src/types.ts";
@@ -30,7 +30,10 @@ const MAX_TRACKED_RATE_LIMIT_NOTICES = 64;
 
 export default async function piClaudeCodeProvider(pi: ExtensionAPI): Promise<void> {
   const runtimeCleanup = await cleanupStaleRuntimeDirectories();
-  registerDoctorCommand(pi, runtimeCleanup);
+  // Declared ahead of the doctor, which is registered before preflight and stays
+  // undefined until the first session start attempts registration.
+  let webSearchStatus: WebSearchStatus | undefined;
+  registerDoctorCommand(pi, runtimeCleanup, () => webSearchStatus);
 
   let installation: ClaudeInstallation;
   try {
@@ -43,7 +46,6 @@ export default async function piClaudeCodeProvider(pi: ExtensionAPI): Promise<vo
   const currentPlatform = platformStatus();
   const searchOutputs = createSearchOutputOwner();
   const imageStore = new SessionImageStore();
-  let searchRegistrationAttempted = false;
   let activeRateLimitNotify: ((notice: RateLimitNotice) => void) | undefined;
   // Sessions are registered process-wide, not in this closure: Pi re-runs this
   // factory for every new, resumed, forked or cloned session, and a host can hold
@@ -113,9 +115,8 @@ export default async function piClaudeCodeProvider(pi: ExtensionAPI): Promise<vo
     });
     const platformWarning = startupPlatformWarning(currentPlatform);
     if (platformWarning) ctx.ui.notify(`${NOTICE_PREFIX} ${platformWarning}`, "warning");
-    if (searchRegistrationAttempted) return;
-    searchRegistrationAttempted = true;
-    registerWebSearchTool(
+    if (webSearchStatus !== undefined) return;
+    webSearchStatus = registerWebSearchTool(
       pi,
       installation,
       searchOutputs.retain,
@@ -151,7 +152,11 @@ export default async function piClaudeCodeProvider(pi: ExtensionAPI): Promise<vo
   });
 }
 
-function registerDoctorCommand(pi: ExtensionAPI, runtimeCleanup: RuntimeCleanupResult): void {
+function registerDoctorCommand(
+  pi: ExtensionAPI,
+  runtimeCleanup: RuntimeCleanupResult,
+  webSearchStatus: () => WebSearchStatus | undefined,
+): void {
   pi.registerCommand("pi-claude-code-provider-doctor", {
     description: "Check Claude Code compatibility or write a diagnostic report",
     handler: async (args, ctx) => {
@@ -187,6 +192,7 @@ function registerDoctorCommand(pi: ExtensionAPI, runtimeCleanup: RuntimeCleanupR
             metricsLogError: getMetricsLogError(),
             runtimeCleanup,
             bridgeProbe,
+            webSearch: webSearchStatus(),
           });
           ctx.ui.notify(
             `Claude Code diagnostic report written to ${path}${preflightError ? "; preflight failed, so installation details may be incomplete" : ""}`,
@@ -209,6 +215,7 @@ function registerDoctorCommand(pi: ExtensionAPI, runtimeCleanup: RuntimeCleanupR
           metricsLogError: getMetricsLogError(),
           runtimeCleanup,
           bridgeProbe,
+          webSearch: webSearchStatus(),
         }), bridgeProbe.ok && claudeStatus.isVerified && piStatus.isVerified && currentPlatform.isVerified ? "info" : "warning");
       } catch (error) {
         ctx.ui.notify(errorText(error), "error");
@@ -283,17 +290,29 @@ function registerWebSearchTool(
   retainOutput: (result: string) => Promise<{ directory: string; path: string } | undefined>,
   onRateLimitNotice: (notice: RateLimitNotice) => void,
   notify: (message: string) => void,
-): void {
+): WebSearchStatus {
+  // Pi puts an active tool's snippet and guideline in every model's system
+  // prompt, not only this provider's, and each call spends Claude subscription
+  // capacity. Users with their own search tools can therefore opt out entirely;
+  // `off` is deliberate, so it skips the name check and its warning too.
+  const setting = webSearchSetting();
+  if (setting === "off") return "disabled";
+  if (setting === "invalid") {
+    notify(`${NOTICE_PREFIX} ${SEARCH_TOOL} was not registered: ${WEB_SEARCH_ENV} must be "on" or "off"`);
+    return "invalid";
+  }
   if (pi.getAllTools().some((tool) => tool.name === SEARCH_TOOL)) {
     notify(`${NOTICE_PREFIX} ${SEARCH_TOOL} was not registered because that tool name is already occupied`);
-    return;
+    return "occupied";
   }
   pi.registerTool({
     name: SEARCH_TOOL,
     label: "Web Search",
     description: `Search the current web through Claude Code and return a concise synthesis with source URLs. Output is truncated to ${formatSize(DEFAULT_MAX_BYTES)} or ${DEFAULT_MAX_LINES} lines.`,
-    promptSnippet: "Search the current web and return sourced results",
-    promptGuidelines: [`Use ${SEARCH_TOOL} when current external information or online sources are required.`],
+    promptSnippet: "Search the current web through Claude Code (uses Claude subscription capacity)",
+    // Deferential on purpose: the guideline reaches every provider's model, and
+    // the user's own search tool should win wherever one is available.
+    promptGuidelines: [`Use ${SEARCH_TOOL} for current external information or online sources only when no other web-search tool is available or the user asks for it.`],
     parameters: Type.Object({
       query: Type.String({ minLength: 1, description: "Search query" }),
       focus: Type.Optional(Type.String({ description: "Optional guidance about what to prioritize" })),
@@ -318,6 +337,7 @@ function registerWebSearchTool(
       return { content: [{ type: "text", text }], details: { truncated: truncated.truncated, fullOutputPath } };
     },
   });
+  return "enabled";
 }
 
 /**

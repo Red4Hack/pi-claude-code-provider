@@ -181,8 +181,23 @@ test("doctor identifies each working-directory source without logging the path",
 test("doctor summary puts one labeled fact on each line", () => {
     const lines = formatDoctorSummary({ ...doctorBase(), metrics, metricsLogError: "EACCES" }).split("\n");
     assert.equal(lines[0], "Platform linux/x64 (verified); Pi 1 (verified); Claude Code 2 (unverified; tested 1)");
-    assert.deepEqual(lines.slice(1).map((line) => line.slice(0, line.indexOf(":"))), ["Runtime", "Claude", "Models", "Last request", "Working directory source", "Metrics log error"]);
+    assert.deepEqual(lines.slice(1).map((line) => line.slice(0, line.indexOf(":"))), ["Runtime", "Claude", "Models", "Web search", "Last request", "Working directory source", "Metrics log error"]);
     assert.equal(lines[2], "Claude: /usr/bin/claude (pro subscription)");
+});
+
+test("doctor states the web-search registration outcome on its own line", () => {
+    const expected = new Map([
+        [undefined, "Web search: not registered yet (no session started)"],
+        ["enabled", "Web search: enabled"],
+        ["disabled", "Web search: disabled (PI_CLAUDE_CODE_PROVIDER_WEB_SEARCH=off)"],
+        ["invalid", 'Web search: not registered (PI_CLAUDE_CODE_PROVIDER_WEB_SEARCH must be "on" or "off")'],
+        ["occupied", "Web search: not registered (tool name already occupied)"],
+    ]);
+    for (const [webSearch, line] of expected) {
+        const lines = formatDoctorSummary({ ...doctorBase(), webSearch }).split("\n");
+        assert.equal(lines.filter((candidate) => candidate.startsWith("Web search:")).length, 1);
+        assert.ok(lines.includes(line), `${webSearch}: ${lines.join(" | ")}`);
+    }
 });
 
 test("doctor reports a served context window only once it stops matching the configured one", () => {
@@ -235,6 +250,23 @@ test("the diagnostic report records whether the transcript breakpoint is disable
     finally {
         if (original === undefined) delete process.env.PI_CLAUDE_CODE_PROVIDER_TRANSCRIPT_BREAKPOINT;
         else process.env.PI_CLAUDE_CODE_PROVIDER_TRANSCRIPT_BREAKPOINT = original;
+        if (path) await rm(dirname(path), { recursive: true, force: true });
+    }
+});
+
+test("the diagnostic report records the web-search switch and registration outcome", async () => {
+    const original = process.env.PI_CLAUDE_CODE_PROVIDER_WEB_SEARCH;
+    process.env.PI_CLAUDE_CODE_PROVIDER_WEB_SEARCH = "off";
+    let path;
+    try {
+        path = await writeDiagnosticReport({ ...doctorBase(), webSearch: "disabled" });
+        const report = JSON.parse(await readFile(path, "utf8"));
+        assert.equal(report.overrides.webSearch, "off");
+        assert.equal(report.webSearchRegistration, "disabled");
+    }
+    finally {
+        if (original === undefined) delete process.env.PI_CLAUDE_CODE_PROVIDER_WEB_SEARCH;
+        else process.env.PI_CLAUDE_CODE_PROVIDER_WEB_SEARCH = original;
         if (path) await rm(dirname(path), { recursive: true, force: true });
     }
 });

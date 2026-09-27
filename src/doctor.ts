@@ -10,6 +10,7 @@ import { NEUTRAL_BUN_CONFIG, hostRuntimeDescription, needsBunConfig } from "./ho
 import { superviseProcess, terminateProcessGroup, type ProcessResult, type ProcessSupervisor } from "./process-utils.ts";
 import { createRuntimeDirectory, recordRuntimeChild, removeRuntimeDirectory, type RuntimeCleanupResult } from "./runtime-directories.ts";
 import type { ClaudeInstallation, RequestMetrics } from "./types.ts";
+import { WEB_SEARCH_ENV } from "./web-search.ts";
 
 // Haiku 4.5 caches nothing below this, so a smaller request that reuses nothing
 // says nothing about caching; see DEVELOPING.md#prompt-caching.
@@ -134,6 +135,13 @@ export async function probeBridge(
   }
 }
 
+/**
+ * Outcome of the one web-search registration attempt a provider instance makes
+ * at its first session start. `invalid` means the switch held an unrecognized
+ * value, which leaves the tool unregistered.
+ */
+export type WebSearchStatus = "enabled" | "disabled" | "invalid" | "occupied";
+
 export interface DoctorSummaryInput {
   platformStatus: VersionStatus;
   piStatus: VersionStatus;
@@ -145,6 +153,7 @@ export interface DoctorSummaryInput {
   metricsLogError?: string;
   runtimeCleanup: RuntimeCleanupResult;
   bridgeProbe?: BridgeProbeResult;
+  webSearch?: WebSearchStatus;
 }
 
 export function formatDoctorSummary(input: DoctorSummaryInput): string {
@@ -175,6 +184,7 @@ export function formatDoctorSummary(input: DoctorSummaryInput): string {
   if (input.bridgeProbe) {
     lines.push(`Bridge: ${input.bridgeProbe.ok ? "ok" : "BROKEN"} via ${formatBridgeArgv(input.bridgeProbe.argv)} (${input.bridgeProbe.detail})`);
   }
+  lines.push(`Web search: ${webSearchDescription(input.webSearch)}`);
   lines.push(metrics
     ? `Last request: ${metrics.requestedModel}/${metrics.effort}, ${metrics.messageCount} messages, ${metrics.estimatedInputTokens} estimated transport tokens, ${reportedUsage}, ${metrics.durationMs ?? 0}ms, ${metrics.stopReason ?? "unknown"}${metrics.errorCategory ? ` (${metrics.errorCategory})` : ""}${metrics.cleanupComplete ? "" : ", cleanup incomplete"}`
     : "Last request: no request metrics recorded yet");
@@ -196,6 +206,16 @@ export function formatDoctorSummary(input: DoctorSummaryInput): string {
     lines.push(`Stale runtime cleanup: ${input.runtimeCleanup.removed} removed, ${input.runtimeCleanup.failures} ${input.runtimeCleanup.failures === 1 ? "failure" : "failures"}`);
   }
   return lines.join("\n");
+}
+
+function webSearchDescription(status: WebSearchStatus | undefined): string {
+  switch (status) {
+    case "enabled": return "enabled";
+    case "disabled": return `disabled (${WEB_SEARCH_ENV}=off)`;
+    case "invalid": return `not registered (${WEB_SEARCH_ENV} must be "on" or "off")`;
+    case "occupied": return "not registered (tool name already occupied)";
+    default: return "not registered yet (no session started)";
+  }
 }
 
 /**

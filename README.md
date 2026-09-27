@@ -63,7 +63,7 @@ The doctor checks versions, model aliases, and the tool bridge without consuming
 
 Run `/pi-claude-code-provider-doctor report` for a content-free diagnostic report. Inspect it before sharing it.
 
-The `pi_claude_code_provider_web_search` tool uses Claude's WebSearch and WebFetch. It always uses Sonnet at medium effort, regardless of the selected model, and has a three-minute limit. If unavailable, check Pi's tool filters and whether another extension owns the name.
+The `pi_claude_code_provider_web_search` tool uses Claude's WebSearch and WebFetch. It always uses Sonnet at medium effort, regardless of the selected model, and has a three-minute limit. Pi offers it to every model, including other providers' models, so each call consumes Claude subscription capacity. Its prompt guidance defers to any other web-search tool you have. To remove it entirely, set `PI_CLAUDE_CODE_PROVIDER_WEB_SEARCH=off`; for a single launch, `pi --exclude-tools pi_claude_code_provider_web_search` also works. If it is unexpectedly unavailable, run the doctor, which reports its state, then check that variable, Pi's tool filters, and whether another extension owns the name.
 
 ## Subscription usage
 
@@ -91,6 +91,7 @@ Images remain available throughout the current Pi context. Each request allows u
 | `PI_CLAUDE_CODE_PROVIDER_TOTAL_TIMEOUT_MS` | Override the 30-minute timeout from Claude launch through response processing, including response observers, in positive milliseconds. |
 | `PI_CLAUDE_CODE_PROVIDER_MCP_READY_TIMEOUT_MS` | Override the five-second tool bridge readiness timeout, in positive milliseconds. |
 | `PI_CLAUDE_CODE_PROVIDER_THINKING_DISPLAY` | `summarized` (default), `omitted` (hide thinking text), or `off` (disable the display request if Claude Code rejects it). |
+| `PI_CLAUDE_CODE_PROVIDER_WEB_SEARCH` | `on` (default) or `off`. `off` leaves `pi_claude_code_provider_web_search` unregistered, so no model sees the tool or its prompt guidance. Any other value also leaves it unregistered and shows a warning. Takes effect at the next Pi start or `/reload`. |
 | `PI_CLAUDE_CODE_PROVIDER_TRANSCRIPT_BREAKPOINT` | `on` (default) or `off`. Turn it off only if Claude Code rejects excess cache breakpoints; this disables the provider's prompt caching. |
 
 Metrics exclude prompts, messages, queries, output, credentials, stderr, and temporary paths. On POSIX, the log is mode 0600; Windows uses the selected location's ACL.

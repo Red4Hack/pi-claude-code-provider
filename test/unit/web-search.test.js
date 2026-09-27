@@ -7,7 +7,7 @@ import test from "node:test";
 import { withTimeout, waitForPath } from "../support/wait.js";
 import { getLastSearchMetrics } from "../../src/metrics.ts";
 import { superviseProcess, terminateProcessGroup } from "../../src/process-utils.ts";
-import { searchWithClaude } from "../../src/web-search.ts";
+import { WEB_SEARCH_ENV, searchWithClaude, webSearchSetting } from "../../src/web-search.ts";
 import { supervisorWithCleanupFailure } from "../support/process-fixture.js";
 import { createNodeFixture, nodeFixtureSource } from "../support/node-fixture.js";
 
@@ -19,6 +19,27 @@ const searchInit = {
 async function fakeSearch(body) {
     return createNodeFixture(body, { prefix: "fake-search-" });
 }
+
+test("the web-search switch accepts only on and off, and treats anything else as invalid", () => {
+    const cases = [
+        [undefined, "on"],
+        ["", "on"],
+        [" on ", "on"],
+        ["on", "on"],
+        ["off", "off"],
+        [" off\n", "off"],
+        // Strict like the other switches: a guessed spelling is reported, not
+        // silently read as either state.
+        ["0", "invalid"],
+        ["false", "invalid"],
+        ["OFF", "invalid"],
+        ["disabled", "invalid"],
+    ];
+    for (const [value, expected] of cases) {
+        const environment = value === undefined ? {} : { [WEB_SEARCH_ENV]: value };
+        assert.equal(webSearchSetting(environment), expected, `${JSON.stringify(value)}`);
+    }
+});
 
 test("web search uses a relative private request reference and validates its result", async () => {
     const directory = await mkdtemp(join(tmpdir(), "pi-claude-code-provider-search-test-"));

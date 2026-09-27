@@ -46,3 +46,18 @@ export const MINIMUM_TOOL_BEARING_CAP = 2;
 export function releaseCap() {
   return RELEASE_ORDER.reduce((total, name) => total + PAID_STAGES[name].cap, 0);
 }
+
+/**
+ * Provider settings every stage pins regardless of the maintainer's shell. The
+ * release suite verifies visible web search, so an ambient opt-out from a
+ * profile would otherwise fail the gate for a reason unrelated to the release.
+ * Plain literals keep this module importable without TypeScript support.
+ */
+export const PINNED_STAGE_SETTINGS = Object.freeze({
+  PI_CLAUDE_CODE_PROVIDER_WEB_SEARCH: "on",
+});
+
+/** A stage's child environment: ambient values, then stage values, then pins. */
+export function stageEnvironment(base, stageValues) {
+  return { ...base, ...stageValues, ...PINNED_STAGE_SETTINGS };
+}
