@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
-import { access, stat } from "node:fs/promises";
+import { access, realpath, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { isAbsolute, posix, win32 } from "node:path";
 import type {
   Api,
@@ -20,7 +21,7 @@ import { recordRequestMetrics } from "./metrics.ts";
 import { createOutput } from "./output.ts";
 import { claimPaidTestLaunch } from "./paid-launch-budget.ts";
 import { ProcessTerminationError, superviseProcess, type ProcessResult } from "./process-utils.ts";
-import { removeRuntimeDirectory } from "./runtime-directories.ts";
+import { privatePathSpellings, removeRuntimeDirectory } from "./runtime-directories.ts";
 import type { ImageStoreLease } from "./session-image-store.ts";
 import type { ResolvedSession, SessionRequest } from "./session-registry.ts";
 import { ClaudeEventMapper, type ClaudeTerminationCause } from "./stream-events.ts";
@@ -277,6 +278,14 @@ export function createClaudeStream(
         validateSystemPromptBudget(model, systemPromptTokens);
         prepared = await prepareRequest(effectiveContext, imageLease);
         metrics.cleanupComplete = false;
+        // Both spellings of the temporary root, for the private-path guard and
+        // diagnostic redaction; see privatePathSpellings.
+        const lexicalTempRoot = tmpdir();
+        const privateDirectories = privatePathSpellings(
+          [prepared.directory, ...(prepared.imageStoreDirectory ? [prepared.imageStoreDirectory] : [])],
+          lexicalTempRoot,
+          await realpath(lexicalTempRoot).catch(() => lexicalTempRoot),
+        );
         metrics.lastPhase = "prepared";
         metrics.imageCount = prepared.imageCount;
         metrics.transcriptBytes = prepared.transcriptBytes;
@@ -324,7 +333,7 @@ export function createClaudeStream(
           onLengthStop: stopForLength,
           onRateLimitNotice,
           onResponseAnnouncement: announceResponse,
-          privatePaths: [prepared.directory, ...(prepared.imageStoreDirectory ? [prepared.imageStoreDirectory] : [])],
+          privatePaths: privateDirectories,
         });
 
         // Phase 2 — claim the launch, spawn Claude, and record exact ownership.
@@ -345,7 +354,7 @@ export function createClaudeStream(
             ...(prepared.catalogPath ? { PI_CLAUDE_TOOL_CATALOG: prepared.catalogPath } : {}),
           },
           directory: prepared.directory,
-          privatePaths: prepared.imageStoreDirectory ? [prepared.imageStoreDirectory] : [],
+          privatePaths: privateDirectories,
           cwd,
           stdin: "pipe",
           idleTimeoutMs,
@@ -459,6 +468,7 @@ export function createClaudeStream(
           output,
           prepared,
           cwd,
+          privateDirectories,
           result,
           handoff: toolUse ? "tool" : lengthStop ? "length" : undefined,
           stderrExcerpt: () => running.stderrExcerpt(),
@@ -557,6 +567,8 @@ interface ExitSettlement {
   output: MutableOutput;
   prepared: { directory: string; imageStoreDirectory?: string; violationPath?: string };
   cwd: string;
+  /** Every spelling of the request and image directories. */
+  privateDirectories: readonly string[];
   result: ProcessResult;
   handoff: "tool" | "length" | undefined;
   stderrExcerpt: () => string;
@@ -611,7 +623,7 @@ async function settleExit(settlement: ExitSettlement): Promise<ExitOutcome> {
     if (prepared.violationPath && (await pathExists(prepared.violationPath))) {
       return fail("mcp_execution", true, "Security invariant violated: Claude Code attempted to execute a Pi proposal tool internally");
     }
-    if (containsPrivateTransportToolArgument(output, [prepared.directory, ...(prepared.imageStoreDirectory ? [prepared.imageStoreDirectory] : [])], settlement.cwd)) {
+    if (containsPrivateTransportToolArgument(output, settlement.privateDirectories, settlement.cwd)) {
       return fail("private_transport", true, "Claude Code proposed a Pi tool call against provider-private transport state");
     }
     return settleHandoff("tool handoff", isExpectedToolHandoffExit(result), () => mapper.completeToolUse());
@@ -866,7 +878,10 @@ export function containsPrivateTransportPath(
     const paths = platform === "win32" ? win32 : posix;
     const spelling = (path: string): string => {
       const normalized = path.normalize("NFC");
-      return platform === "win32" ? normalized.replace(/\\/g, "/").toLowerCase() : normalized;
+      // macOS volumes are case-insensitive by default; folding there can only add
+      // matches on a case-sensitive one, which is the safe side for this guard.
+      if (platform === "win32") return normalized.replace(/\\/g, "/").toLowerCase();
+      return platform === "darwin" ? normalized.toLowerCase() : normalized;
     };
     // Literal references also catch paths embedded in commands. Complete
     // values additionally get native path resolution; this does not interpret

@@ -130,8 +130,25 @@ function hasCliOption(helpOutput: string, option: string): boolean {
   return new RegExp(`(?:^|[\\s,])${escaped}(?=$|[\\s,=<\\[])`, "m").test(helpOutput);
 }
 
+/**
+ * A Windows `.cmd` or `.bat` launcher, such as the shim an npm install puts on
+ * PATH. Node refuses to spawn these without a shell, and the provider never
+ * uses one, so they are named rather than tried.
+ */
+export function windowsCommandShim(path: string, platform: NodeJS.Platform = process.platform): boolean {
+  return platform === "win32" && /\.(?:cmd|bat)$/i.test(path);
+}
+
+function commandShimAdvice(path: string): string {
+  return `${path} is a Windows command shim, which cannot be launched without a shell; install the native Claude Code (claude.exe), ` +
+    "or set PI_CLAUDE_CODE_PROVIDER_PATH to Claude Code's JavaScript entry point, which the provider launches directly";
+}
+
 async function resolveExecutable(configured: string): Promise<string> {
   if (isAbsolute(configured) || configured.includes("/") || configured.includes("\\")) {
+    if (windowsCommandShim(configured)) {
+      throw new ClaudeCodeError("executable_unsupported", `Claude Code executable is not launchable: ${commandShimAdvice(configured)}`);
+    }
     try {
       await access(configured, process.platform === "win32" ? constants.F_OK : constants.X_OK);
       return await realpath(configured);
@@ -140,8 +157,15 @@ async function resolveExecutable(configured: string): Promise<string> {
     }
   }
   const suffixes = process.platform === "win32" ? windowsExecutableSuffixes() : [""];
+  let shim: string | undefined;
   for (const directory of (process.env.PATH ?? "").split(delimiter)) {
     if (!directory) continue;
+    if (process.platform === "win32" && shim === undefined) {
+      for (const extension of [".cmd", ".bat"]) {
+        const candidate = join(directory, `${configured}${extension}`);
+        if (shim === undefined && (await access(candidate, constants.F_OK).then(() => true, () => false))) shim = candidate;
+      }
+    }
     for (const suffix of suffixes) {
       const candidate = join(directory, `${configured}${suffix}`);
       try {
@@ -154,7 +178,8 @@ async function resolveExecutable(configured: string): Promise<string> {
   }
   throw new ClaudeCodeError(
     "executable_missing",
-    `Claude Code is required but ${configured} was not found on PATH; install it or set PI_CLAUDE_CODE_PROVIDER_PATH to its executable`,
+    `Claude Code is required but ${configured} was not found on PATH; install it or set PI_CLAUDE_CODE_PROVIDER_PATH to its executable` +
+      (shim ? `. Found ${commandShimAdvice(shim)}` : ""),
   );
 }
 

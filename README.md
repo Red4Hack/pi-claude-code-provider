@@ -104,11 +104,12 @@ Pi packages run with your permissions; review the source before installation. Cl
 
 Tool-bearing side requests need a registered Pi session or a working-directory declaration in the system prompt. That declaration is caller-controlled; see [DESIGN.md](DESIGN.md#process-and-storage-lifecycle) for routing details.
 
-The provider rejects detected tool arguments aimed at its private request and image directories, including equivalent path spellings resolved against the request's working directory. This guard is a heuristic: it does not follow symlinks or interpret arbitrary shell expressions. Pi tools run with your permissions.
+The provider rejects detected tool arguments aimed at its private request and image directories, including equivalent path spellings resolved against the request's working directory. It also recognizes the temporary directory's alias spellings, such as macOS's `/var/folders` for `/private/var/folders`. This guard is a heuristic: it does not follow other symlinks or interpret arbitrary shell expressions. Pi tools run with your permissions.
 
 ### Troubleshooting
 
 - **Provider missing or unavailable:** run `/pi-claude-code-provider-doctor`, correct the problem it reports, then run `/reload`.
+- **Windows reports Claude Code missing although `claude` works in your shell:** that `claude` is probably a `.cmd` or `.bat` shim, such as an npm install creates, which cannot run without a shell. Install the native Claude Code (`claude.exe`), or set `PI_CLAUDE_CODE_PROVIDER_PATH` to Claude Code's JavaScript entry point.
 - **Requests fail right after Claude Code updated:** run the doctor. If it reports your Claude Code version as unverified, install the tested version it names with `claude install <version>`. To avoid a repeat, set `"autoUpdatesChannel": "stable"` in Claude Code's settings, which waits about a week and skips releases with major regressions, or set `DISABLE_AUTOUPDATER` to `"1"` in their `env`. See [Claude Code's setup guide](https://code.claude.com/docs/en/setup).
 - **Authentication or subscription failure:** run `claude auth status` and sign in with an eligible subscription. For rate-limit or billing errors, check your subscription limits and usage-credit settings. Logins through `CLAUDE_CODE_OAUTH_TOKEN` are unsupported.
 - **Tools fail or requests report `mcp_startup`:** run the doctor to check the tool bridge handshake.

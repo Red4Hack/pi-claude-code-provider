@@ -214,6 +214,7 @@ export async function terminateProcessGroup(
   child: ChildProcess,
   graceMs = 500,
   killProcess: ProcessKiller = process.kill,
+  groupMemberStates: GroupMemberStates = processGroupMemberStatesSync,
 ): Promise<void> {
   const pid = child.pid;
   if (!pid) return;
@@ -230,7 +231,12 @@ export async function terminateProcessGroup(
       await terminateDirectChild(child, graceMs);
       return;
     }
-    throw processGroupCleanupError(pid, "SIGTERM", child, error);
+    // Claude can exit on its own just before it is stopped, an output-limit
+    // handoff most of all, and until Node reaps it macOS refuses to signal a
+    // group of zombies. They are already dead: wait for the reap to show ESRCH.
+    if (!isPermissionDenied(error) || !groupHoldsOnlyZombies(pid, groupMemberStates)) {
+      throw processGroupCleanupError(pid, "SIGTERM", child, error);
+    }
   }
 
   if (await waitForProcessGroupExit(pid, graceMs, killProcess)) return;
@@ -238,7 +244,9 @@ export async function terminateProcessGroup(
     killProcess(-pid, "SIGKILL");
   } catch (error) {
     if (isMissingProcess(error)) return;
-    throw processGroupCleanupError(pid, "SIGKILL", child, error);
+    if (!isPermissionDenied(error) || !groupHoldsOnlyZombies(pid, groupMemberStates)) {
+      throw processGroupCleanupError(pid, "SIGKILL", child, error);
+    }
   }
   if (!(await waitForProcessGroupExit(pid, graceMs, killProcess))) {
     throw new Error(
@@ -254,7 +262,7 @@ export interface ForceTerminateSyncDependencies {
   /** Runs `taskkill /PID <pid> /T /F` and returns its exit status, or null if it did not complete. */
   taskkill?: (pid: number) => number | null;
   /** POSIX: `ps` state codes of a process group's members, or undefined if unavailable. */
-  groupMemberStates?: (pgid: number) => string[] | undefined;
+  groupMemberStates?: GroupMemberStates;
 }
 
 /**
@@ -288,9 +296,20 @@ export function forceTerminateProcessTreeSync(
     // exiting host will never reap it. A zombie can touch nothing, so only a
     // listed live member keeps the state; an unreadable listing is unknown.
     if (!isPermissionDenied(error)) return false;
-    const states = (dependencies.groupMemberStates ?? processGroupMemberStatesSync)(pid);
-    return states !== undefined && states.every((state) => state.startsWith("Z"));
+    return groupHoldsOnlyZombies(pid, dependencies.groupMemberStates ?? processGroupMemberStatesSync);
   }
+}
+
+type GroupMemberStates = (pgid: number) => string[] | undefined;
+
+/**
+ * macOS answers a group signal with EPERM when every member is an unreaped
+ * zombie. Zombies cannot run or touch files, so such a group is as good as gone;
+ * a live member, or a listing that cannot be read, is not.
+ */
+function groupHoldsOnlyZombies(pgid: number, groupMemberStates: GroupMemberStates): boolean {
+  const states = groupMemberStates(pgid);
+  return states !== undefined && states.every((state) => state.startsWith("Z"));
 }
 
 /** `ps` state codes of the group's members, or undefined if they cannot be listed. */

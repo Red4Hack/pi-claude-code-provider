@@ -7,6 +7,7 @@ import {
   cleanupStaleRuntimeDirectories,
   confirmRuntimeChildExit,
   createRuntimeDirectory,
+  privatePathSpellings,
   reapRuntimeStateAtExit,
   recordRuntimeChild,
   removeRuntimeDirectory,
@@ -354,4 +355,28 @@ test("one exit listener serves every evaluation of the module", async (t) => {
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("private directories are spelled through both the resolved and the aliased temporary root", () => {
+  // macOS: TMPDIR is under /var, a link into /private/var.
+  assert.deepEqual(
+    privatePathSpellings(["/private/var/folders/x/T/pi-claude-code-provider-request-A"], "/var/folders/x/T/", "/private/var/folders/x/T"),
+    ["/private/var/folders/x/T/pi-claude-code-provider-request-A", "/var/folders/x/T/pi-claude-code-provider-request-A"],
+  );
+  // Windows: TEMP can hold an 8.3 short name that realpath expands.
+  assert.deepEqual(
+    privatePathSpellings(
+      ["C:\\Users\\runneradmin\\AppData\\Local\\Temp\\pi-claude-code-provider-images-B"],
+      "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp",
+      "C:\\Users\\runneradmin\\AppData\\Local\\Temp\\",
+    ),
+    [
+      "C:\\Users\\runneradmin\\AppData\\Local\\Temp\\pi-claude-code-provider-images-B",
+      "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\pi-claude-code-provider-images-B",
+    ],
+  );
+  // No alias, a directory elsewhere, and a sibling that only shares a prefix.
+  assert.deepEqual(privatePathSpellings(["/tmp/a"], "/tmp", "/tmp"), ["/tmp/a"]);
+  assert.deepEqual(privatePathSpellings(["/elsewhere/a"], "/var/t", "/private/var/t"), ["/elsewhere/a"]);
+  assert.deepEqual(privatePathSpellings(["/private/var/tx/a"], "/var/t", "/private/var/t"), ["/private/var/tx/a"]);
 });

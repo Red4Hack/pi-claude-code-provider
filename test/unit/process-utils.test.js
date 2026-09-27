@@ -348,3 +348,39 @@ test("synchronous forced termination on Windows trusts only taskkill's own outco
     // An exited leader cannot be traced to descendants, and its PID may be reused.
     assert.deepEqual(run(0, { exitCode: 0, signalCode: null }), { outcome: true, calls: [] });
 });
+
+// macOS refuses to signal a group whose members are all unreaped zombies. A
+// fake child and killer drive terminateProcessGroup through that answer.
+function zombieGroupKiller({ sigterm = "ok", sigkill = "ok", probeBeforeKill = "ESRCH" } = {}) {
+    let killed = false;
+    const raise = (code) => { throw Object.assign(new Error(code), { code }); };
+    return (pid, signal) => {
+        if (signal === "SIGTERM") { if (sigterm !== "ok") raise(sigterm); return true; }
+        if (signal === "SIGKILL") { killed = true; if (sigkill !== "ok") raise(sigkill); return true; }
+        // Signal 0: the existence probe. After SIGKILL the reap has happened.
+        return raise(killed ? "ESRCH" : probeBeforeKill);
+    };
+}
+const zombieChild = { pid: 424_242, exitCode: null, signalCode: null };
+
+test("process-group termination treats a zombie-only group's EPERM as delivered", { skip: process.platform === "win32" }, async () => {
+    await terminateProcessGroup(zombieChild, 50, zombieGroupKiller({ sigterm: "EPERM" }), () => ["Z"]);
+    await terminateProcessGroup(zombieChild, 50, zombieGroupKiller({ sigterm: "EPERM" }), () => ["Z+", "Zs"]);
+    // Still unreaped when the grace period ends: SIGKILL meets the same EPERM.
+    await terminateProcessGroup(zombieChild, 50, zombieGroupKiller({ sigkill: "EPERM", probeBeforeKill: "EPERM" }), () => ["Z"]);
+});
+
+test("process-group termination still fails on EPERM when a member may be alive", { skip: process.platform === "win32" }, async () => {
+    for (const states of [["S"], ["Z", "R+"], undefined]) {
+        await assert.rejects(
+            terminateProcessGroup(zombieChild, 50, zombieGroupKiller({ sigterm: "EPERM" }), () => states),
+            /Process group 424242 cleanup failed during SIGTERM/,
+            JSON.stringify(states),
+        );
+    }
+    await assert.rejects(
+        terminateProcessGroup(zombieChild, 50, zombieGroupKiller({ sigkill: "EPERM", probeBeforeKill: "EPERM" }), () => ["S"]),
+        /cleanup failed during SIGKILL/,
+    );
+    await assert.rejects(terminateProcessGroup(zombieChild, 50, zombieGroupKiller({ sigterm: "EINVAL" }), () => ["Z"]), /cleanup failed during SIGTERM/);
+});

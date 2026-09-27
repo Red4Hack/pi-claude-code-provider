@@ -10,6 +10,7 @@ import { containsPrivateTransportPath, isExpectedToolHandoffExit, waitForReadyOr
 import { createTestClaudeStream as createClaudeStream, requestMetrics, settledRequest } from "../support/provider-request.js";
 import { ProcessTerminationError, superviseProcess, terminateProcessGroup } from "../../src/process-utils.ts";
 import { SessionImageStore } from "../../src/session-image-store.ts";
+import { privatePathSpellings } from "../../src/runtime-directories.ts";
 import { resolveSession } from "../../src/session-registry.ts";
 import { supervisorWithCleanupFailure } from "../support/process-fixture.js";
 import { waitFor, waitForRemoval, withTimeout } from "../support/wait.js";
@@ -997,6 +998,13 @@ test("private-path comparison follows native spelling and cwd rules recursively"
             "README.md", "c:/temp/./private-neighbor/image.png", "C:\\Temp\\.\\Private\\..\\Public\\image.png",
             "D:\\Temp\\Private\\image.png",
         ] },
+        // A macOS volume is case-insensitive by default, so case is folded there too.
+        { platform: "darwin", directory: "/private/var/folders/x/T/pi-claude-code-provider-request-A", cwd: "/Users/me/project", rejected: [
+            "/private/var/folders/x/T/PI-CLAUDE-CODE-PROVIDER-REQUEST-A/prompt.txt",
+            "/Private/var/folders/x/T/pi-claude-code-provider-request-A",
+        ], accepted: [
+            "/private/var/folders/x/T/pi-claude-code-provider-images-A/image.png", "README.md",
+        ] },
     ];
     for (const { platform, directory, cwd, rejected, accepted } of cases) {
         for (const path of rejected) {
@@ -1007,6 +1015,12 @@ test("private-path comparison follows native spelling and cwd rules recursively"
         }
     }
     assert.equal(containsPrivateTransportPath("/tmp/prívate/image.png", "/tmp/prívate", "/work", "linux"), true);
+    // The temporary root's alias spelling is caught once both spellings are checked.
+    const macDirectory = "/private/var/folders/x/T/pi-claude-code-provider-request-A";
+    const macSpellings = privatePathSpellings([macDirectory], "/var/folders/x/T/", "/private/var/folders/x/T");
+    const macAlias = "/var/folders/x/T/pi-claude-code-provider-request-A/prompt.txt";
+    assert.equal(containsPrivateTransportPath(macAlias, macDirectory, "/work", "darwin"), false, "one spelling alone misses the alias");
+    assert.equal(macSpellings.some((directory) => containsPrivateTransportPath(macAlias, directory, "/work", "darwin")), true);
 });
 
 for (const sessionImage of [false, true]) {

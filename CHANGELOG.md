@@ -9,6 +9,9 @@
 ### Fixed
 
 - Private request and session image directories are now removed when Pi, or a pi-subagents runner, exits while a request is in flight, such as quitting mid-turn or stopping a background subagent. Previously they stayed until a later start's stale recovery at least an hour later, and on Windows indefinitely. A Claude process still shutting down at that moment is force-killed; state whose process liveness is unknown is still retained.
+- On macOS, a Claude process that exits on its own just before the provider stops it, as after an output limit, no longer fails the request as a process-cleanup failure with retained private state.
+- On Windows, a `.cmd` or `.bat` Claude Code shim now gets a clear error naming the fix instead of "not found on PATH" or `spawn EINVAL`.
+- The private-path guard now also recognizes the temporary directory's alias spellings, such as macOS's `/var/folders` for `/private/var/folders` and Windows 8.3 short names, and ignores case on macOS.
 - When Claude Code closes its input and exits before the prompt is written, such as after a failed login, requests now report Claude's own error or exit details instead of "Claude Code stdin failed: write EPIPE".
 - A Claude process that exits right after starting no longer loses its output: the provider and web search now read stdout before recording process ownership, instead of after, when Node could already have discarded it. A fast failure previously surfaced as "omitted initialization" instead of Claude's own error.
 - Capture cleanup terminates the owned POSIX process group even after its leader closes, preventing surviving descendants from outliving temporary capture files.

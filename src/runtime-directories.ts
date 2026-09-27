@@ -201,6 +201,29 @@ function removeRuntimeDirectorySync(directory: string): void {
   rmSync(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 }
 
+/**
+ * Every spelling of the given private directories under the temporary root.
+ * The directories are created at their resolved path, but the temporary root
+ * is often reached through an alias -- macOS's `/var/folders` is a link into
+ * `/private/var`, and Windows `TEMP` can hold an 8.3 short name -- so a path
+ * check or redaction that knows only one spelling misses the other. Other
+ * links are still not followed.
+ */
+export function privatePathSpellings(directories: readonly string[], lexicalRoot: string, physicalRoot: string): string[] {
+  const trim = (root: string): string => root.replace(/[\\/]+$/, "");
+  const roots = [trim(physicalRoot), trim(lexicalRoot)];
+  const spellings = new Set<string>();
+  for (const directory of directories) {
+    spellings.add(directory);
+    for (const [from, to] of [[roots[0]!, roots[1]!], [roots[1]!, roots[0]!]] as const) {
+      if (from === to || !from) continue;
+      const rest = directory.slice(from.length);
+      if (directory.startsWith(from) && (rest === "" || rest.startsWith("/") || rest.startsWith("\\"))) spellings.add(`${to}${rest}`);
+    }
+  }
+  return [...spellings];
+}
+
 /** Best-effort recovery for state left by an abruptly terminated Pi process. */
 export async function cleanupStaleRuntimeDirectories(
   options: CleanupRuntimeDirectoryOptions = {},
