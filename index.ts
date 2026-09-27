@@ -13,6 +13,7 @@ import { writeDiagnosticReport } from "./src/diagnostics.ts";
 import { errorText, normalizeClaudeOverflow } from "./src/errors.ts";
 import { formatDoctorSummary, probeBridge, type WebSearchStatus } from "./src/doctor.ts";
 import { flushMetricsLog, getLastRequestMetrics, getLastSearchMetrics, getMetricsLogError } from "./src/metrics.ts";
+import { readProviderPackage } from "./src/package-info.ts";
 import { createClaudeStream } from "./src/provider.ts";
 import { cleanupStaleRuntimeDirectories, createRuntimeDirectory } from "./src/runtime-directories.ts";
 import { SessionImageStore } from "./src/session-image-store.ts";
@@ -168,6 +169,7 @@ function registerDoctorCommand(
         }
         const currentPlatform = platformStatus();
         const piStatus = versionStatus("Pi", VERSION, VERIFIED_VERSIONS.pi, MINIMUM_VERSIONS.pi);
+        const providerPackage = await readProviderPackage();
         // Version and path checks can pass even when the proposal bridge cannot
         // start, so prove it with a real dependency-free handshake.
         const bridgeProbe = await probeBridge().catch((error: unknown) => ({
@@ -185,6 +187,7 @@ function registerDoctorCommand(
             piStatus,
             claudeStatus: current ? versionStatus("Claude Code", current.version, VERIFIED_VERSIONS.claudeCode, MINIMUM_VERSIONS.claudeCode) : undefined,
             installation: current,
+            providerPackage,
             modelVersions,
             preflightError,
             metrics: getLastRequestMetrics(),
@@ -207,6 +210,7 @@ function registerDoctorCommand(
           piStatus,
           claudeStatus,
           installation: current,
+          providerPackage,
           modelIds: catalogModels().map((model) => model.id),
           // Diagnostic only, and fail-soft: a doctor run must never fail
           // because Claude Code moved an undocumented internal table.

@@ -9,6 +9,7 @@ import { ClaudeCodeError } from "./errors.ts";
 import { TRANSCRIPT_BREAKPOINT_ENV } from "./claude-args.ts";
 import { hostRuntimeDescription } from "./host-runtime.ts";
 import type { BridgeProbeResult, WebSearchStatus } from "./doctor.ts";
+import type { ProviderPackage } from "./package-info.ts";
 import type { RuntimeCleanupResult } from "./runtime-directories.ts";
 import type { ClaudeInstallation, RequestMetrics, SearchMetrics } from "./types.ts";
 import { webSearchSetting } from "./web-search.ts";
@@ -21,6 +22,7 @@ export interface DiagnosticReportInput {
   piStatus: VersionStatus;
   claudeStatus?: VersionStatus;
   installation?: ClaudeInstallation;
+  providerPackage?: ProviderPackage;
   modelVersions?: ModelAliasVersions;
   preflightError?: unknown;
   metrics?: RequestMetrics;
@@ -71,6 +73,13 @@ export async function writeDiagnosticReport(input: DiagnosticReportInput): Promi
       transcriptBreakpointDisabled: process.env[TRANSCRIPT_BREAKPOINT_ENV]?.trim() === "off",
       webSearch: webSearchSetting(),
     },
+    // Which copy of this package Pi loaded, with the home directory redacted.
+    provider: input.providerPackage
+      ? {
+          version: input.providerPackage.version,
+          root: sanitize(input.providerPackage.root, lexicalTempRoot, physicalTempRoot),
+        }
+      : undefined,
     installation: input.installation
       ? {
           executable: sanitize(input.installation.executable, lexicalTempRoot, physicalTempRoot),

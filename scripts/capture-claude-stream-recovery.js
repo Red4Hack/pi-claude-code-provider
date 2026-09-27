@@ -53,7 +53,16 @@ const messageEnd = (reason) =>
   frame("message_delta", { type: "message_delta", delta: { stop_reason: reason, stop_sequence: null }, usage: { output_tokens: 2 } }) +
   frame("message_stop", { type: "message_stop" });
 
-const OVERLOADED = '{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}';
+// A safety classifier's stop, as the API reports it: a refusal stop reason with the
+// flagged category in stop_details.
+const refusalEnd = () =>
+  frame("message_delta", {
+    type: "message_delta",
+    delta: { stop_reason: "refusal", stop_sequence: null, stop_details: { type: "refusal", category: "cyber", explanation: null } },
+    usage: { output_tokens: 2 },
+  }) + frame("message_stop", { type: "message_stop" });
+
+const OVERLOADED ='{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}';
 const complete = (text) => messageStart("msg_done", "claude-sonnet-5") + textStart(0, text) + blockStop(0) + messageEnd("end_turn");
 
 /**
@@ -104,6 +113,20 @@ const SCENARIOS = {
   "context-window-exceeded": ({ attempt, model }) => ({
     sse: messageStart(`msg_${attempt}`, model) + textStart(0, attempt === 1 ? "cut off by the window" : "continued") + blockStop(0) +
       messageEnd(attempt === 1 ? "model_context_window_exceeded" : "end_turn"),
+  }),
+  // A safety classifier stops the response after some text. Claude Code may answer with
+  // a same-model retry of its own; the provider must report the refusal either way.
+  refusal: ({ attempt, model }) => ({
+    sse: messageStart(`msg_${attempt}`, model) + textStart(0, attempt === 1 ? "partial before the flag" : "answer after the flag") + blockStop(0) +
+      (attempt === 1 ? refusalEnd() : messageEnd("end_turn")),
+  }),
+  // Every attempt is flagged, so Claude Code ends with its final refusal records.
+  "refusal-twice": ({ attempt, model }) => ({
+    sse: messageStart(`msg_${attempt}`, model) + textStart(0, `flagged attempt ${attempt}`) + blockStop(0) + refusalEnd(),
+  }),
+  // A refusal before any content block.
+  "refusal-empty": ({ attempt, model }) => ({
+    sse: messageStart(`msg_${attempt}`, model) + (attempt === 1 ? refusalEnd() : textStart(0, "answer after the flag") + blockStop(0) + messageEnd("end_turn")),
   }),
   // A normal tool proposal, including the permission_denied and tool_result records
   // Claude Code emits before the stop reason in every handoff.

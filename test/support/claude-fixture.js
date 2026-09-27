@@ -20,7 +20,7 @@ export function startupSurface() {
 // Claude Code stdout for the mid-response recovery scenarios, captured from this
 // version and sanitized. Regenerate with `npm run capture:claude-stream-recovery`; these
 // shapes are only worth testing against because Claude Code really emitted them.
-export const CAPTURED_STREAM_RECOVERY_VERSION = "2.1.281";
+export const CAPTURED_STREAM_RECOVERY_VERSION = "2.1.283";
 
 // live-cut-late came from a real API stream cut by a forwarding proxy, so it cost
 // quota and the capture script cannot regenerate it. It keeps the version in its

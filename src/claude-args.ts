@@ -11,10 +11,16 @@ import type { PreparedRequest } from "./types.ts";
 // Claude Code 2.1.281 loads its built-in agents-md plugin regardless of setting
 // sources; initialization would then report it and fail the isolation check.
 // Pin telemetry too, supplementing the environment's nonessential-traffic switch.
+// switchModelsOnFlag is Claude Code's documented setting for a request a model's
+// safety classifiers flag. By default it re-runs the request on another model, which
+// this provider can never publish: Pi's events are append-only and the served model
+// would change mid-response. Off, a print-mode request ends with the refusal instead.
+// Managed settings can still turn it on, so stream-events.ts also recognizes the switch.
 const SETTINGS = JSON.stringify({
   disableAllHooks: true,
   autoMemoryEnabled: false,
   totalTokensReminder: "off",
+  switchModelsOnFlag: false,
   enabledPlugins: { "agents-md@builtin": false, "telemetry@builtin": false },
 });
 export const EMPTY_MCP = JSON.stringify({ mcpServers: {} });

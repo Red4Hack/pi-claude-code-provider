@@ -59,7 +59,7 @@ After installation or an upstream update, run:
 /pi-claude-code-provider-doctor
 ```
 
-The doctor checks versions, model aliases, and the tool bridge without consuming subscription quota. It also reports recent prompt-cache reuse and context-window mismatches. Its last-request metrics describe the request whose process cleanup and lifecycle finished most recently; overlapping requests can finish out of start order, and a terminal response can appear before its metrics finalize.
+The doctor checks versions, model aliases, and the tool bridge without consuming subscription quota. It names the provider version Pi actually loaded and its install directory, which exposes an older project-local or duplicate installation. It also reports recent prompt-cache reuse and context-window mismatches. Its last-request metrics describe the request whose process cleanup and lifecycle finished most recently; overlapping requests can finish out of start order, and a terminal response can appear before its metrics finalize.
 
 Run `/pi-claude-code-provider-doctor report` for a content-free diagnostic report. Inspect it before sharing it.
 
@@ -113,6 +113,7 @@ The provider rejects detected tool arguments aimed at its private request and im
 - **Requests fail right after Claude Code updated:** run the doctor. If it reports your Claude Code version as unverified, install the tested version it names with `claude install <version>`. To avoid a repeat, set `"autoUpdatesChannel": "stable"` in Claude Code's settings, which waits about a week and skips releases with major regressions, or set `DISABLE_AUTOUPDATER` to `"1"` in their `env`. See [Claude Code's setup guide](https://code.claude.com/docs/en/setup).
 - **Authentication or subscription failure:** run `claude auth status` and sign in with an eligible subscription. For rate-limit or billing errors, check your subscription limits and usage-credit settings. Logins through `CLAUDE_CODE_OAUTH_TOKEN` are unsupported.
 - **Tools fail or requests report `mcp_startup`:** run the doctor to check the tool bridge handshake.
+- **"The model refused to complete the request":** Fable, Opus 5.5, and Opus 5 run safety classifiers, most often triggered by cybersecurity and biology content, including context such as project files. Claude Code can re-run a flagged request on another model, but the provider turns that switch off because it cannot publish a response rewritten mid-stream, so the request ends with this error and Pi does not retry it. See Anthropic's [automatic model fallback](https://code.claude.com/docs/en/model-config#automatic-model-fallback).
 - **A request keeps failing:** run `/pi-claude-code-provider-doctor report` and inspect the report before sharing it. Include the exact error and steps to reproduce when [opening an issue](https://github.com/chem/pi-claude-code-provider/issues).
 
 ## Development and license

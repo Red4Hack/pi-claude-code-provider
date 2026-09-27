@@ -9,6 +9,7 @@ import type { VersionStatus } from "./compatibility.ts";
 import { NEUTRAL_BUN_CONFIG, hostRuntimeDescription, needsBunConfig } from "./host-runtime.ts";
 import { superviseProcess, terminateProcessGroup, type ProcessResult, type ProcessSupervisor } from "./process-utils.ts";
 import { confirmRuntimeChildExit, createRuntimeDirectory, recordRuntimeChild, removeRuntimeDirectory, retainRuntimeDirectory, type RuntimeCleanupResult } from "./runtime-directories.ts";
+import type { ProviderPackage } from "./package-info.ts";
 import type { ClaudeInstallation, RequestMetrics } from "./types.ts";
 import { WEB_SEARCH_ENV } from "./web-search.ts";
 
@@ -150,6 +151,7 @@ export interface DoctorSummaryInput {
   piStatus: VersionStatus;
   claudeStatus: VersionStatus;
   installation: ClaudeInstallation;
+  providerPackage?: ProviderPackage;
   modelIds: readonly string[];
   modelVersions?: ModelAliasVersions;
   metrics?: RequestMetrics;
@@ -176,12 +178,15 @@ export function formatDoctorSummary(input: DoctorSummaryInput): string {
       ? `reported usage: ${metrics.inputTokens} input, ${metrics.cacheRead} cache read, ${metrics.cacheWrite} cache write${metrics.cacheHitPercent === undefined ? "" : `, ${metrics.cacheHitPercent}% cache hit`}`
       : "reported token usage unavailable";
   // One labeled fact per line: this is read in a notification, not parsed.
-  const lines = [
-    verification,
+  const lines = [verification];
+  if (input.providerPackage) {
+    lines.push(`Provider: pi-claude-code-provider ${input.providerPackage.version ?? "(version unreadable)"} at ${input.providerPackage.root}`);
+  }
+  lines.push(
     `Runtime: ${hostRuntimeDescription()}`,
     `Claude: ${input.installation.executable} (${input.installation.subscriptionType} subscription)`,
     `Models: ${input.modelIds.join(", ")}`,
-  ];
+  );
   const servedModels = formatServedModels(input);
   if (servedModels) lines.push(`Served models (Claude Code install): ${servedModels}`);
   if (input.bridgeProbe) {

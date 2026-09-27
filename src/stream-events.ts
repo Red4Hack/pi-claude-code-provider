@@ -1,4 +1,4 @@
-import { parseStreamingJson } from "@earendil-works/pi-ai";
+import { isRetryableAssistantError, parseStreamingJson } from "@earendil-works/pi-ai";
 import type { AssistantMessageEventStream, ToolCall } from "@earendil-works/pi-ai";
 import { TRANSCRIPT_BREAKPOINT_ENV } from "./claude-args.ts";
 import { ClaudeCodeError } from "./errors.ts";
@@ -191,12 +191,14 @@ export class ClaudeEventMapper {
     } else if (record.type === "rate_limit_event") {
       this.acceptRateLimit(record.rate_limit_info);
     } else if (record.type === "assistant") {
+      this.rejectRefusal(record);
       this.rejectInterruptedStream(record);
       this.acceptAssistant(record);
     } else if (record.type === "user" || record.type === "system") {
+      this.rejectRefusal(record);
       this.rejectInterruptedStream(record);
-      // Completed user echoes and non-init system status records are redundant
-      // because include-partial-messages supplies the canonical stream events.
+      // Otherwise completed user echoes and other non-init system status records are
+      // redundant because include-partial-messages supplies the canonical stream events.
     } else {
       throw new ClaudeCodeError("protocol_record", `Unsupported Claude record type: ${String(record.type)}`);
     }
@@ -235,15 +237,61 @@ export class ClaudeEventMapper {
   }
 
   /**
+   * A model's safety classifiers can stop a response with a refusal. Claude Code then
+   * retries it once on the same model behind a synthetic prompt, or re-runs it on a
+   * fallback model when a managed policy re-enables switchModelsOnFlag. Neither can be
+   * published, for the reasons rejectInterruptedStream gives, and repeating the turn
+   * would be refused again, so the refusal is final and deliberately worded outside Pi's
+   * retry classifier, as Pi's own Anthropic provider reports it. After a handoff the
+   * records belong to Claude Code's next internal turn and cannot spoil the proposal.
+   */
+  private rejectRefusal(record: StreamEventEnvelope): void {
+    if (this.handoffLatched) return;
+    const raw = record as Record<string, unknown>;
+    if (record.type === "system" && (record.subtype === "model_refusal_fallback" || record.subtype === "model_refusal_no_fallback")) {
+      throw this.refusalFailure(raw.original_model, raw.api_refusal_category);
+    }
+    if (record.type !== "assistant") return;
+    const message = raw.message && typeof raw.message === "object" && !Array.isArray(raw.message)
+      ? raw.message as Record<string, unknown>
+      : undefined;
+    if (message?.stop_reason !== "refusal") return;
+    // Claude Code's own error record names no served model.
+    throw this.refusalFailure(message.model === "<synthetic>" ? undefined : message.model, refusalCategory(message.stop_details));
+  }
+
+  /**
+   * Built only from plain tokens, never Claude Code's explanatory text, and each detail
+   * is kept only while the host's own retry classifier still reads the message as final:
+   * a category or model id such as "overloaded" or one containing "500" would otherwise
+   * turn a refusal back into a retry.
+   */
+  private refusalFailure(model: unknown, category: unknown): ClaudeCodeError {
+    const servedModel = refusalToken(model) ? model : this.output.responseModel;
+    const candidates = [
+      refusalToken(category) ? `safety classifier category: ${category}` : undefined,
+      refusalToken(servedModel) ? `model ${servedModel}` : undefined,
+    ];
+    const details: string[] = [];
+    for (const candidate of candidates) {
+      if (candidate && !isRetryableAssistantError({ ...this.output, stopReason: "error", errorMessage: refusalMessage([...details, candidate]) })) {
+        details.push(candidate);
+      }
+    }
+    return new ClaudeCodeError("refusal", refusalMessage(details));
+  }
+
+  /**
    * Claude Code recovers from an API failure that arrives after this response began
    * streaming by replaying the request, by continuing from the partial it kept, or by
-   * re-requesting without streaming. Pi has already received the blocks streamed so far
-   * and its events are append-only, so none of those recoveries can be published here:
-   * rewriting content breaks Pi's contract, and content produced after the interruption
-   * follows internal prompts Pi never saw. The provider instead reports one failure
-   * whose wording Pi's own retry policy accepts, and Pi re-runs the turn from the
-   * unchanged context in a fresh process. The replayed transcript is a prompt-cache hit,
-   * so only the output tokens are produced twice.
+   * re-requesting without streaming; a managed fallback-model chain can also move it to
+   * another model. Pi has already received the blocks streamed so far and its events
+   * are append-only, so none of those recoveries can be published here: rewriting
+   * content breaks Pi's contract, and content produced after the interruption follows
+   * internal prompts Pi never saw. The provider instead reports one failure whose
+   * wording Pi's own retry policy accepts, and Pi re-runs the turn from the unchanged
+   * context in a fresh process. The replayed transcript is a prompt-cache hit, so only
+   * the output tokens are produced twice. Refusals are handled by rejectRefusal first.
    */
   private rejectInterruptedStream(record: StreamEventEnvelope): void {
     // Before the response starts, a retry is an ordinary pre-stream retry that costs
@@ -264,6 +312,10 @@ export class ClaudeEventMapper {
         throw new ClaudeCodeError("stream_interrupted", `Claude Code API request failed mid-response (${category}${status})`);
       }
       cause = `Claude Code began retrying: ${category}${status}`;
+    } else if (record.type === "system" && record.subtype === "model_fallback") {
+      // A fallback-model chain only switches for overload and unavailability, which
+      // Pi's retry in a fresh process on the primary model can clear.
+      cause = "Claude Code switched to a fallback model";
     } else if (record.type === "assistant") {
       if (typeof raw.error === "string" || raw.is_api_error_message === true) {
         cause = "Claude Code reported a mid-response API error";
@@ -291,7 +343,14 @@ export class ClaudeEventMapper {
   private acceptStreamEvent(event: Record<string, unknown>): void {
     const type = event.type;
     if (type === "message_start") {
-      if (this.messageStarted) throw new ClaudeCodeError("protocol_message", "Claude emitted duplicate message_start");
+      // Every second message_start observed so far was Claude Code starting another model
+      // request on its own, after a recovery signal this mapper recognizes. One that
+      // arrives without such a signal is the same situation through a path not yet
+      // recognized, so it gets the same retryable treatment instead of losing the turn.
+      // Handoff continuations never reach here, and refusals have already failed.
+      if (this.messageStarted) {
+        throw new ClaudeCodeError("stream_interrupted", "Claude Code API stream ended before message_stop (Claude Code started another model request)");
+      }
       const message = requireRecord(event.message, "message_start.message");
       if (typeof message.model === "string") this.output.responseModel = message.model;
       if (typeof message.id === "string") this.output.responseId = message.id;
@@ -321,6 +380,8 @@ export class ClaudeEventMapper {
       this.stopReason = stopReason(delta.stop_reason);
     }
     this.applyUsage(event.usage);
+    // Fail at the stop itself, ahead of whatever retry or fallback Claude Code starts next.
+    if (this.stopReason === "refusal") throw this.refusalFailure(undefined, refusalCategory(delta.stop_details));
     if (this.stopReason === "tool_use") this.latchHandoff(this.onToolUse);
     else if (isLengthStop(this.stopReason)) this.latchHandoff(this.onLengthStop);
   }
@@ -458,6 +519,9 @@ export class ClaudeEventMapper {
     this.resultReceived = true;
     this.applyUsage(record.usage);
     this.applyModelUsage(record.modelUsage);
+    // Normally the stream's own refusal stop has already failed the request. Claude Code
+    // reports a refusal it could not recover from as either a success or an error result.
+    if (record.stop_reason === "refusal" && !this.handoffLatched) throw this.refusalFailure(undefined, undefined);
     if (record.is_error) {
       if (this.isExpectedHandoffTermination(record, terminationCause)) return;
       this.throwDeferredFailure();
@@ -644,6 +708,21 @@ function stopReason(value: unknown): string {
     throw new ClaudeCodeError("protocol_stop", `Invalid Claude stop reason: ${String(value)}`);
   }
   return value;
+}
+
+function refusalMessage(details: readonly string[]): string {
+  return `The model refused to complete the request${details.length > 0 ? ` (${details.join(", ")})` : ""}`;
+}
+
+/** A model id or refusal category plain enough to repeat in an error message. */
+function refusalToken(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9._[\]-]{1,64}$/.test(value);
+}
+
+function refusalCategory(stopDetails: unknown): unknown {
+  return stopDetails && typeof stopDetails === "object" && !Array.isArray(stopDetails)
+    ? (stopDetails as Record<string, unknown>).category
+    : undefined;
 }
 
 function number(value: unknown): number | undefined {

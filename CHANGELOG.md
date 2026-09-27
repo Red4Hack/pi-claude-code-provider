@@ -4,10 +4,14 @@
 
 ### Added
 
+- The doctor and diagnostic report name the provider version Pi actually loaded and its install directory, so an older project-local or duplicate installation is visible.
 - `PI_CLAUDE_CODE_PROVIDER_WEB_SEARCH=off` leaves `pi_claude_code_provider_web_search` unregistered, so users with their own search tools or other providers' models no longer have Claude-backed search, or its prompt guidance, added to every session. The default stays `on`; an unrecognized value also leaves the tool unregistered, with a warning. The doctor and diagnostic report show the web-search state ([#15](https://github.com/chem/pi-claude-code-provider/issues/15)).
 
 ### Fixed
 
+- A request whose response a safety classifier flags no longer fails with "Claude emitted duplicate message_start". Claude Code re-ran such requests on a fallback model, such as Opus 4.8 for a flagged Fable 5.1 or Opus 5.5 response, which the provider cannot publish ([#5](https://github.com/chem/pi-claude-code-provider/pull/5)).
+- Refusals now fail as "The model refused to complete the request", naming the category and model when Claude Code reports them. Pi no longer retries them. Previously they were reported as retryable stream interruptions, so Pi re-sent a refused request up to three times.
+- A second response that Claude Code starts on its own, through a recovery the provider does not specifically recognize, now fails as a retryable interruption instead of a protocol error that lost the turn. A mid-response switch by a managed fallback-model chain is recognized the same way.
 - Private request and session image directories are now removed when Pi, or a pi-subagents runner, exits while a request is in flight, such as quitting mid-turn or stopping a background subagent. Previously they stayed until a later start's stale recovery at least an hour later, and on Windows indefinitely. A Claude process still shutting down at that moment is force-killed; state whose process liveness is unknown is still retained.
 - On macOS, a Claude process that exits on its own just before the provider stops it, as after an output limit, no longer fails the request as a process-cleanup failure with retained private state.
 - On Windows, a Claude Code descendant exiting while the provider stops the process tree no longer fails the request as "process liveness is unknown" with retained private state that Windows never reclaims.
@@ -24,7 +28,8 @@
 
 ### Changed
 
-- Claude Code 2.1.283 is now the validated baseline; the minimum supported version remains 2.1.281.
+- The pinned Claude Code settings now include `switchModelsOnFlag: false`, so a safety-classifier flag ends with the refusal instead of re-running the request on another model. Managed settings can still override it.
+- Claude Code 2.1.283 is now the validated baseline; the minimum supported version remains 2.1.281. The quota-free stream-recovery captures are re-pinned to 2.1.283 and add refusal scenarios.
 - The web-search tool's prompt guidance now tells models to use it only when no other web-search tool is available or the user asks for it, and its summary notes that it uses Claude subscription capacity.
 - Claude Code's built-in telemetry plugin is explicitly disabled alongside the existing traffic-disable environment setting.
 - Quota-free surface capture now reports startup plugins and pre-init records and verifies all Sonnet/Opus effort levels in the API request.

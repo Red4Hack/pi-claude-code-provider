@@ -7,6 +7,8 @@ import { platformStatus, versionStatus } from "../../src/compatibility.ts";
 import { writeDiagnosticReport } from "../../src/diagnostics.ts";
 import { bridgeArgv, formatBridgeArgv } from "../../src/claude-args.ts";
 import { formatDoctorSummary, probeBridge } from "../../src/doctor.ts";
+import { readProviderPackage } from "../../src/package-info.ts";
+import { fileURLToPath } from "node:url";
 import { EventEmitter } from "node:events";
 import { writeFileSync } from "node:fs";
 import { cleanupStaleRuntimeDirectories } from "../../src/runtime-directories.ts";
@@ -412,4 +414,28 @@ test("bridge argv diagnostics preserve argument boundaries", () => {
         bridgeProbe: { ok: false, argv, detail: "handshake failed" },
     });
     assert.ok(summary.includes(formatBridgeArgv(argv)));
+});
+
+test("the doctor names the provider copy Pi loaded", async () => {
+    // Read from this checkout's own manifest, the file an installed copy carries too.
+    const loaded = await readProviderPackage();
+    const manifest = JSON.parse(await readFile(new URL("../../package.json", import.meta.url), "utf8"));
+    assert.deepEqual(loaded, { version: manifest.version, root: fileURLToPath(new URL("../..", import.meta.url)).replace(/[\\/]$/, "") });
+    assert.match(formatDoctorSummary({ ...doctorBase(), providerPackage: loaded }), new RegExp(`^Provider: pi-claude-code-provider ${manifest.version.replace(/\./g, "\\.")} at `, "m"));
+    assert.doesNotMatch(formatDoctorSummary(doctorBase()), /^Provider:/m);
+    // Unreadable manifests degrade to an unknown version instead of failing the doctor.
+    const missing = await readProviderPackage(new URL("./missing-directory/package.json", import.meta.url));
+    assert.equal(missing.version, undefined);
+    assert.match(formatDoctorSummary({ ...doctorBase(), providerPackage: missing }), /Provider: pi-claude-code-provider \(version unreadable\) at /);
+});
+
+test("the diagnostic report records the loaded provider copy with its home redacted", async () => {
+    const path = await writeDiagnosticReport({ ...doctorBase(), providerPackage: { version: "9.9.9", root: join(homedir(), "pi", "pi-claude-code-provider") } });
+    try {
+        const report = JSON.parse(await readFile(path, "utf8"));
+        assert.deepEqual(report.provider, { version: "9.9.9", root: join("<HOME>", "pi", "pi-claude-code-provider") });
+    }
+    finally {
+        await rm(dirname(path), { recursive: true, force: true });
+    }
 });
