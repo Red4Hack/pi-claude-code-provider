@@ -12,7 +12,7 @@ import { ProcessTerminationError, superviseProcess, terminateProcessGroup } from
 import { SessionImageStore } from "../../src/session-image-store.ts";
 import { resolveSession } from "../../src/session-registry.ts";
 import { supervisorWithCleanupFailure } from "../support/process-fixture.js";
-import { waitForRemoval, withTimeout } from "../support/wait.js";
+import { waitFor, waitForRemoval, withTimeout } from "../support/wait.js";
 import { getLastRequestMetrics, recordRequestMetrics } from "../../src/metrics.ts";
 import { createNodeFixture } from "../support/node-fixture.js";
 import { CAPTURED_CLAUDE_VERSION, PROVIDER_INIT_FIELDS, claudeFixtureBody, initRecord, streamRecoveryRecords, toolUseEvents } from "../support/claude-fixture.js";
@@ -779,7 +779,10 @@ process.stdin.on("end", () => {
 });
 
 test("provider aborts and returns an aborted terminal event", async () => {
+    // Abort only once Claude is running: a fixed delay could land before launch on
+    // a loaded runner, which takes the separately tested pre-launch path instead.
     const fake = await fakeClaude(`
+fs.writeFileSync(require("node:path").join(__dirname, "started"), "");
 process.stdin.resume();
 process.stdout.write(JSON.stringify(${JSON.stringify(init)}) + "\\n");
 process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"message_start",message:{id:"msg_abort",model:"claude-sonnet-5",usage:{input_tokens:0,output_tokens:0}}}}) + "\\n");
@@ -791,7 +794,8 @@ setInterval(() => {}, 1000);`);
             version: CAPTURED_CLAUDE_VERSION,
             subscriptionType: "pro",
         })(model, context, { reasoning: "medium", signal: controller.signal });
-        setTimeout(() => controller.abort(), 50);
+        void waitFor(async () => access(join(fake.directory, "started")).then(() => true, () => false), "fake Claude launch")
+            .then(() => controller.abort());
         const events = [];
         for await (const event of stream) events.push(event.type);
         const result = await settledRequest(stream);
@@ -2060,6 +2064,56 @@ process.stdin.on("end", () => {
         assert.match(result.errorMessage ?? "", /PI_CLAUDE_CODE_PROVIDER_TRANSCRIPT_BREAKPOINT=off/);
         const metrics = await requestMetrics(result, (entry) => entry.errorCategory === "cache_breakpoint_limit");
         assert.equal(metrics.stopReason, "error");
+    }
+    finally {
+        await rm(fake.directory, { recursive: true, force: true });
+    }
+});
+
+// Claude Code can close its input and exit on its own, for example on a failed
+// login, before the provider writes the prompt. The write then meets a closed
+// pipe, and that broken pipe must not replace what Claude reported on its way out.
+// The provider writes the prompt only once the tool bridge is ready, so closing
+// stdin before announcing readiness makes that write meet a closed pipe every time.
+function closedInputClaude(records, exitCode) {
+    return fakeClaude(`
+const NL = String.fromCharCode(10);
+fs.closeSync(0);
+const mcpIndex = process.argv.indexOf("--mcp-config");
+fs.writeFileSync(JSON.parse(process.argv[mcpIndex + 1]).mcpServers.pi.env.PI_CLAUDE_TOOL_READY, "ready" + NL);
+setTimeout(() => {
+  for (const record of ${JSON.stringify(records)}) process.stdout.write(JSON.stringify(record) + NL);
+  process.stderr.write("fake startup failure" + NL);
+  process.exit(${exitCode});
+}, 200);`, { writeReady: false });
+}
+
+test("a Claude that closed its input reports its own error, not the broken pipe", async () => {
+    const failure = { type: "result", is_error: true, result: "Not logged in · Please run /login" };
+    const fake = await closedInputClaude([toolInit, failure], 1);
+    try {
+        const result = await settledRequest(createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, toolContext, { reasoning: "medium" }));
+        assert.equal(result.stopReason, "error");
+        assert.match(result.errorMessage ?? "", /Not logged in/);
+        assert.doesNotMatch(result.errorMessage ?? "", /stdin failed/);
+        const metrics = await requestMetrics(result, () => true);
+        assert.notEqual(metrics.errorCategory, "process");
+        assert.equal(metrics.cleanupComplete, true);
+    }
+    finally {
+        await rm(fake.directory, { recursive: true, force: true });
+    }
+});
+
+test("a Claude that closed its input and reported nothing fails on its exit", async () => {
+    const fake = await closedInputClaude([], 3);
+    try {
+        const result = await settledRequest(createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, toolContext, { reasoning: "medium" }));
+        assert.equal(result.stopReason, "error");
+        assert.match(result.errorMessage ?? "", /exited before a terminal event \(code 3, signal null/);
+        assert.match(result.errorMessage ?? "", /fake startup failure/);
+        assert.doesNotMatch(result.errorMessage ?? "", /stdin failed/);
+        assert.match(result.errorMessage ?? "", /closed its input before the prompt was written/);
     }
     finally {
         await rm(fake.directory, { recursive: true, force: true });

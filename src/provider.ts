@@ -579,7 +579,10 @@ interface ExitOutcome {
  */
 async function settleExit(settlement: ExitSettlement): Promise<ExitOutcome> {
   const { mapper, output, prepared, result, cleanup, failureAfterCleanup } = settlement;
-  const exit = `code ${String(result.code)}, signal ${String(result.signal)}`;
+  // A closed stdin is evidence, not the cause: the supervisor defers it so the
+  // exit and Claude's own output explain the failure, and it is named here.
+  const exit = `code ${String(result.code)}, signal ${String(result.signal)}` +
+    (result.stdinClosed ? "; Claude Code closed its input before the prompt was written" : "");
   const stderrDetail = (): string => {
     const excerpt = settlement.stderrExcerpt();
     return excerpt ? `: ${excerpt}` : "";

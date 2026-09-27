@@ -8,6 +8,8 @@ export interface ProcessResult {
   signal: NodeJS.Signals | null;
   terminationSignals?: readonly NodeJS.Signals[];
   error?: Error;
+  /** The child closed its end of stdin before a write to it completed. */
+  stdinClosed?: true;
 }
 
 export interface ProcessSupervisorOptions {
@@ -29,6 +31,12 @@ export interface ProcessSupervisor {
   wait(): Promise<ProcessResult>;
   terminate(): Promise<void>;
   dispose(): void;
+}
+
+const CLOSED_PIPE_CODES = new Set<string | undefined>(["EPIPE", "ECONNRESET", "ERR_STREAM_DESTROYED"]);
+
+function errorCode(error: unknown): string | undefined {
+  return error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : undefined;
 }
 
 type ProcessKiller = (pid: number, signal?: NodeJS.Signals | number) => true;
@@ -126,9 +134,23 @@ export function superviseProcess(child: ChildProcess, options: ProcessSupervisor
       code,
       signal,
       ...(terminationSignals.length > 0 ? { terminationSignals: [...terminationSignals] } : {}),
+      ...(stdinClosed ? { stdinClosed: true as const } : {}),
     });
   };
-  const onStdinError = (error: Error): void => fail(new Error(`Claude Code stdin failed: ${error.message}`));
+  // A child that closed its end of stdin is exiting or already gone, and a
+  // write into it fails with a broken pipe. Failing on that would publish the
+  // pipe as the cause and preempt what the child reported on its way out -- an
+  // error record on stdout, its exit status, its stderr -- so it is recorded for
+  // the exit to explain. A child that closed stdin and lingers still meets the
+  // idle and total deadlines; any other stdin error fails at once.
+  let stdinClosed = false;
+  const onStdinError = (error: Error): void => {
+    if (CLOSED_PIPE_CODES.has(errorCode(error))) {
+      stdinClosed = true;
+      return;
+    }
+    fail(new Error(`Claude Code stdin failed: ${error.message}`));
+  };
   const onStdoutError = (error: Error): void => fail(new Error(`Claude Code stdout failed: ${error.message}`));
   const onStderrError = (error: Error): void => fail(new Error(`Claude Code stderr failed: ${error.message}`));
 

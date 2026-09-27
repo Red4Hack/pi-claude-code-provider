@@ -41,19 +41,39 @@ test("supervisor reports only the first pipe failure", async () => {
     supervisor.dispose();
     assert.deepEqual(failures, ["Claude Code stdin failed: EPIPE"]);
 });
+test("a closed stdin is left for the exit to explain", async () => {
+    const child = spawn(process.execPath, ["-e", "setTimeout(() => process.exit(4), 100)"], { detached: process.platform !== "win32", stdio: ["pipe", "pipe", "pipe"] });
+    const failures = [];
+    const supervisor = superviseProcess(child, { idleTimeoutMs: 5_000, totalTimeoutMs: 10_000, onFailure(error) { failures.push(error.message); } });
+    try {
+        for (const code of ["EPIPE", "ECONNRESET", "ERR_STREAM_DESTROYED"]) {
+            child.stdin.emit("error", Object.assign(new Error(`write ${code}`), { code }));
+        }
+        const result = await withTimeout(supervisor.wait(), "child settlement");
+        assert.deepEqual(failures, []);
+        assert.equal(result.code, 4);
+        assert.equal(result.stdinClosed, true);
+    } finally {
+        supervisor.dispose();
+        await supervisor.terminate();
+    }
+});
 test("protocol activity cannot rearm the idle timer after settlement or disposal", async () => {
     const child = spawn(process.execPath, ["-e", "process.exit(0)"], { detached: process.platform !== "win32", stdio: ["pipe", "pipe", "pipe"] });
     const failures = [];
-    const supervisor = superviseProcess(child, { idleTimeoutMs: 100, totalTimeoutMs: 5_000, onFailure(error) { failures.push(error); } });
+    // The idle timer runs from spawn, and a loaded runner can take longer than a
+    // short deadline just to start Node, so only failures after settlement count.
+    const supervisor = superviseProcess(child, { idleTimeoutMs: 500, totalTimeoutMs: 10_000, onFailure(error) { failures.push(error); } });
     try {
         await withTimeout(supervisor.wait(), "child settlement");
+        const settledFailures = failures.length;
         supervisor.touch();
-        await new Promise((resolve) => setTimeout(resolve, 150));
-        assert.deepEqual(failures, []);
+        await new Promise((resolve) => setTimeout(resolve, 600));
+        assert.equal(failures.length, settledFailures);
         supervisor.dispose();
         supervisor.touch();
-        await new Promise((resolve) => setTimeout(resolve, 150));
-        assert.deepEqual(failures, []);
+        await new Promise((resolve) => setTimeout(resolve, 600));
+        assert.equal(failures.length, settledFailures);
     } finally {
         supervisor.dispose();
         await supervisor.terminate();
