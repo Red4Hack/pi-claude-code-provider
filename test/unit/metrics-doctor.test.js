@@ -421,7 +421,8 @@ test("the doctor names the provider copy Pi loaded", async () => {
     const loaded = await readProviderPackage();
     const manifest = JSON.parse(await readFile(new URL("../../package.json", import.meta.url), "utf8"));
     assert.deepEqual(loaded, { version: manifest.version, root: fileURLToPath(new URL("../..", import.meta.url)).replace(/[\\/]$/, "") });
-    assert.match(formatDoctorSummary({ ...doctorBase(), providerPackage: loaded }), new RegExp(`^Provider: pi-claude-code-provider ${manifest.version.replace(/\./g, "\\.")} at `, "m"));
+    const lines = formatDoctorSummary({ ...doctorBase(), providerPackage: loaded }).split("\n");
+    assert.ok(lines.some((line) => line.startsWith(`Provider: pi-claude-code-provider ${manifest.version} at `)));
     assert.doesNotMatch(formatDoctorSummary(doctorBase()), /^Provider:/m);
     // Unreadable manifests degrade to an unknown version instead of failing the doctor.
     const missing = await readProviderPackage(new URL("./missing-directory/package.json", import.meta.url));
