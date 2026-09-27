@@ -115,6 +115,7 @@ export function superviseProcess(child: ChildProcess, options: ProcessSupervisor
   const onStderrError = (error: Error): void => fail(new Error(`Claude Code stderr failed: ${error.message}`));
 
   const armIdle = (): void => {
+    if (settled || disposed) return;
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
       fail(new Error(`Claude Code produced no protocol activity for ${options.idleTimeoutMs}ms`));

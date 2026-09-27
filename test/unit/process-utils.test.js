@@ -41,6 +41,24 @@ test("supervisor reports only the first pipe failure", async () => {
     supervisor.dispose();
     assert.deepEqual(failures, ["Claude Code stdin failed: EPIPE"]);
 });
+test("protocol activity cannot rearm the idle timer after settlement or disposal", async () => {
+    const child = spawn(process.execPath, ["-e", "process.exit(0)"], { detached: process.platform !== "win32", stdio: ["pipe", "pipe", "pipe"] });
+    const failures = [];
+    const supervisor = superviseProcess(child, { idleTimeoutMs: 100, totalTimeoutMs: 5_000, onFailure(error) { failures.push(error); } });
+    try {
+        await withTimeout(supervisor.wait(), "child settlement");
+        supervisor.touch();
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        assert.deepEqual(failures, []);
+        supervisor.dispose();
+        supervisor.touch();
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        assert.deepEqual(failures, []);
+    } finally {
+        supervisor.dispose();
+        await supervisor.terminate();
+    }
+});
 test("supervisor rejects and quiesces when termination cannot establish process death", async () => {
     const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: process.platform !== "win32", stdio: ["pipe", "pipe", "pipe"] });
     const failures = [];

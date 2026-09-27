@@ -1,17 +1,19 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { access, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import * as piAi from "@earendil-works/pi-ai";
 import { createCodingTools } from "@earendil-works/pi-coding-agent";
-import { isExpectedToolHandoffExit, waitForReadyOrExit } from "../../src/provider.ts";
+import { containsPrivateTransportPath, isExpectedToolHandoffExit, waitForReadyOrExit } from "../../src/provider.ts";
 import { createTestClaudeStream as createClaudeStream, requestMetrics, settledRequest } from "../support/provider-request.js";
-import { superviseProcess, terminateProcessGroup } from "../../src/process-utils.ts";
+import { ProcessTerminationError, superviseProcess, terminateProcessGroup } from "../../src/process-utils.ts";
 import { SessionImageStore } from "../../src/session-image-store.ts";
 import { resolveSession } from "../../src/session-registry.ts";
 import { supervisorWithCleanupFailure } from "../support/process-fixture.js";
-import { withTimeout } from "../support/wait.js";
+import { waitForRemoval, withTimeout } from "../support/wait.js";
 import { getLastRequestMetrics, recordRequestMetrics } from "../../src/metrics.ts";
 import { createNodeFixture } from "../support/node-fixture.js";
 import { CAPTURED_CLAUDE_VERSION, PROVIDER_INIT_FIELDS, claudeFixtureBody, initRecord, streamRecoveryRecords, toolUseEvents } from "../support/claude-fixture.js";
@@ -974,6 +976,80 @@ process.stdin.on("end", () => {
         await rm(fake.directory, { recursive: true, force: true });
     }
 });
+
+test("private-path comparison follows native spelling and cwd rules recursively", () => {
+    const cases = [
+        { platform: "linux", directory: "/tmp/private", cwd: "/work/project", rejected: [
+            "/tmp/./private", "/tmp//private/image.png", "../../tmp/./private/image.png",
+            "/tmp/elsewhere/../private/image.png", "cat /tmp/private/image.png",
+        ], accepted: [
+            "README.md", "/tmp/./private-neighbor/image.png", "/tmp/./private/../public/image.png",
+            "/tmp/./pri\\vate/image.png",
+        ] },
+        { platform: "win32", directory: "C:\\Temp\\Private", cwd: "C:\\Work\\Project", rejected: [
+            "c:/temp/./PRIVATE", "C:\\Temp\\.\\Private\\image.png", "c:/temp//private/image.png",
+            "..\\..\\Temp\\.\\PRIVATE\\image.png", "C:\\Temp\\Other\\..\\Private\\image.png",
+            "cat c:/temp/private/image.png",
+        ], accepted: [
+            "README.md", "c:/temp/./private-neighbor/image.png", "C:\\Temp\\.\\Private\\..\\Public\\image.png",
+            "D:\\Temp\\Private\\image.png",
+        ] },
+    ];
+    for (const { platform, directory, cwd, rejected, accepted } of cases) {
+        for (const path of rejected) {
+            assert.equal(containsPrivateTransportPath({ outer: [{ path }] }, directory, cwd, platform), true, path);
+        }
+        for (const path of accepted) {
+            assert.equal(containsPrivateTransportPath({ outer: [{ path }] }, directory, cwd, platform), false, path);
+        }
+    }
+    assert.equal(containsPrivateTransportPath("/tmp/prívate/image.png", "/tmp/prívate", "/work", "linux"), true);
+});
+
+for (const sessionImage of [false, true]) {
+    test(`provider rejects equivalent paths into its private ${sessionImage ? "image store" : "request directory"}`, async () => {
+        const store = new SessionImageStore();
+        store.open();
+        const fake = await fakeClaude(`
+process.on("SIGTERM", () => process.exit(143));
+let input = "";
+process.stdin.on("data", (chunk) => { input += chunk; });
+process.stdin.on("end", () => {
+  const path = require("node:path");
+  const requestDirectory = path.dirname(process.argv[process.argv.indexOf("--system-prompt-file") + 1]);
+  const attachment = ${sessionImage} ? JSON.parse(input).message.content.at(-1).text.match(/@"([^"]+)"/)[1] : path.join(requestDirectory, "system-prompt.txt");
+  fs.writeFileSync(path.join(__dirname, "target"), attachment);
+  const privateDirectory = path.dirname(attachment);
+  const alternate = path.dirname(privateDirectory) + path.sep + "." + path.sep + path.basename(privateDirectory) + path.sep + path.basename(attachment);
+  process.stdout.write(JSON.stringify(${JSON.stringify(toolInit)}) + "\\n");
+  const records = ${JSON.stringify(toolUseEvents({ messageId: "msg_private_alias", toolUseId: "toolu_private_alias" }))};
+  records[1].event.content_block.input = { path: alternate };
+  for (const record of records) process.stdout.write(JSON.stringify(record) + "\\n");
+  setInterval(() => {}, 1000);
+});`);
+        const logical = { tools: [readTool], messages: [{ role: "user", timestamp: 1, content: sessionImage ? [
+            { type: "image", mimeType: "image/png", data: Buffer.from("private image bytes").toString("base64") },
+        ] : "hello" }] };
+        try {
+            const result = await settledRequest(createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" }, {
+                resolveSession: () => ({ cwd: fake.directory, imageStore: store }),
+            })(model, providerContext(logical)));
+            assert.equal(result.stopReason, "error");
+            assert.match(result.errorMessage, /provider-private transport state/);
+            const metrics = await requestMetrics(result);
+            assert.equal(metrics.errorCategory, "private_transport");
+            assert.equal(metrics.cleanupComplete, true);
+            const target = await readFile(join(fake.directory, "target"), "utf8");
+            if (sessionImage) assert.equal(await readFile(target, "utf8"), "private image bytes");
+            else await assert.rejects(access(target));
+            await store.close();
+            await assert.rejects(access(target));
+        } finally {
+            await store.close();
+            await rm(fake.directory, { recursive: true, force: true });
+        }
+    });
+}
 // These cases start the real MCP bridge. Restricted sandboxes can drop live
 // stdin to nested Node children, which makes readiness time out independently
 // of provider behavior; run this integration coverage outside the sandbox.
@@ -1557,7 +1633,7 @@ test("provider fails before streaming when Pi's async response handler rejects",
         await consume;
         const result = await settledRequest(stream);
         assert.equal(result.stopReason, "error");
-        assert.match(result.errorMessage ?? "", /after_provider_response handler failed: .*observer rejected/);
+        assert.equal(result.errorMessage, "Pi after_provider_response handler failed: observer rejected");
         assert.deepEqual(events, ["error"]);
         const metrics = await requestMetrics(result, (entry) => entry.errorCategory === "response_hook");
         assert.equal(metrics.stopReason, "error");
@@ -1566,6 +1642,186 @@ test("provider fails before streaming when Pi's async response handler rejects",
         await rm(fake.directory, { recursive: true, force: true });
     }
 });
+
+for (const childRemainsAlive of [false, true]) {
+    for (const cancellation of [false, true]) {
+        test(`stalled response observer settles on ${cancellation ? "abort" : "deadline"} with an ${childRemainsAlive ? "alive" : "exited"} child`, async () => {
+            const fake = await fakeClaude(textResponseBody + (childRemainsAlive ? "\nsetInterval(() => {}, 1000);" : ""));
+            const store = new SessionImageStore();
+            store.open();
+            const controller = new AbortController();
+            let releaseObserver;
+            let rejectObserver;
+            const observer = new Promise((resolve, reject) => { releaseObserver = resolve; rejectObserver = reject; });
+            let enterObserver;
+            const entered = new Promise((resolve) => { enterObserver = resolve; });
+            let closeChild;
+            const closed = new Promise((resolve) => { closeChild = resolve; });
+            let privateDirectory;
+            let imageDirectory;
+            let metricRecords = 0;
+            const unhandled = [];
+            const onUnhandled = (error) => unhandled.push(error);
+            process.on("unhandledRejection", onUnhandled);
+            try {
+                const stream = createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" }, {
+                    resolveSession: () => ({ cwd: fake.directory, imageStore: store }),
+                    recordRequestMetrics: () => { metricRecords += 1; },
+                    supervise(child, options) {
+                        privateDirectory = dirname(child.spawnargs[child.spawnargs.indexOf("--system-prompt-file") + 1]);
+                        child.once("close", closeChild);
+                        return superviseProcess(child, options);
+                    },
+                })(model, providerContext({ messages: [{ role: "user", timestamp: 1, content: [
+                    { type: "image", mimeType: "image/png", data: Buffer.from("observer lease bytes").toString("base64") },
+                ] }] }), {
+                    signal: controller.signal,
+                    timeoutMs: cancellation ? 5_000 : 1_000,
+                    async onResponse() {
+                        const images = (await readdir(tmpdir())).filter((name) => name.startsWith("pi-claude-code-provider-images-"));
+                        assert.equal(images.length, 1);
+                        imageDirectory = join(tmpdir(), images[0]);
+                        await store.close();
+                        enterObserver();
+                        await observer;
+                    },
+                });
+                const events = [];
+                const consumed = (async () => { for await (const event of stream) events.push(event.type); })();
+                await withTimeout(entered, "observer entry");
+                if (!childRemainsAlive) await withTimeout(closed, "child exit before observer settles");
+                if (cancellation) controller.abort();
+                // The observer stays unresolved until cleanup and metrics finish.
+                const result = await settledRequest(stream);
+                await consumed;
+                assert.equal(result.stopReason, cancellation ? "aborted" : "error");
+                assert.match(result.errorMessage, cancellation ? /aborted/ : /exceeded 1000ms/);
+                assert.deepEqual(events, ["error"]);
+                const metrics = await requestMetrics(result);
+                assert.equal(metrics.errorCategory, cancellation ? "aborted" : "process");
+                assert.equal(metrics.cleanupComplete, true);
+                await assert.rejects(access(privateDirectory));
+                await waitForRemoval(imageDirectory);
+                const before = { ...metrics };
+                if (cancellation) releaseObserver();
+                else rejectObserver(new Error("late observer failure"));
+                await new Promise((resolve) => setImmediate(resolve));
+                await new Promise((resolve) => setImmediate(resolve));
+                assert.deepEqual(events, ["error"]);
+                assert.deepEqual(await requestMetrics(result), before);
+                assert.equal(metricRecords, 1);
+                assert.deepEqual(unhandled, []);
+            } finally {
+                releaseObserver();
+                controller.abort();
+                process.off("unhandledRejection", onUnhandled);
+                await store.close();
+                await rm(fake.directory, { recursive: true, force: true });
+            }
+        });
+    }
+}
+
+test("a headless host stays alive to settle a stalled observer after Claude exits", async () => {
+    const fake = await fakeClaude(`
+const path = require("node:path");
+fs.writeFileSync(path.join(__dirname, "transport"), path.dirname(process.argv[process.argv.indexOf("--system-prompt-file") + 1]));
+${textResponseBody}`);
+    const probe = await createNodeFixture(`
+(async () => {
+  const { createClaudeStream } = await import(${JSON.stringify(new URL("../../src/provider.ts", import.meta.url).href)});
+  const stream = createClaudeStream(${JSON.stringify({ executable: fake.executable, version: "test", subscriptionType: "pro" })}, {
+    resolveSession: () => ({ cwd: ${JSON.stringify(fake.directory)} }),
+    recordRequestMetrics: (metrics) => process.stdout.write(JSON.stringify(metrics) + "\\n"),
+  })(${JSON.stringify(model)}, ${JSON.stringify(context)}, { timeoutMs: 1000, onResponse: () => new Promise(() => {}) });
+  await stream.result();
+})().catch((error) => { console.error(error); process.exitCode = 1; });`);
+    const child = spawn(process.execPath, ["--import", fileURLToPath(new URL("../support/register-pi-loader.js", import.meta.url)), probe.executable], {
+        detached: process.platform !== "win32",
+        stdio: ["ignore", "pipe", "pipe"],
+        // The probe is an ordinary headless host, without test-runner watchdogs.
+        env: { ...process.env, NODE_TEST_CONTEXT: "" },
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    const supervisor = superviseProcess(child, { idleTimeoutMs: 5_000, totalTimeoutMs: 10_000, onFailure() {} });
+    try {
+        const result = await withTimeout(supervisor.wait(), "headless host settlement");
+        assert.equal(result.code, 0, stderr);
+        assert.equal(result.signal, null, stderr);
+        assert.notEqual(stdout.trim(), "", "host exited before lifecycle metrics finalized");
+        const metrics = JSON.parse(stdout);
+        assert.equal(metrics.errorCategory, "process");
+        assert.equal(metrics.cleanupComplete, true);
+        await assert.rejects(access(await readFile(join(fake.directory, "transport"), "utf8")));
+    } finally {
+        await supervisor.terminate();
+        supervisor.dispose();
+        const transport = await readFile(join(fake.directory, "transport"), "utf8").catch(() => undefined);
+        await Promise.all([fake.directory, probe.directory, transport].filter(Boolean).map((directory) => rm(directory, { recursive: true, force: true })));
+    }
+});
+
+for (const uncertainLiveness of [false, true]) {
+    test(`process failure releases a stalled observer and ${uncertainLiveness ? "retains uncertain-live" : "cleans"} private state`, async () => {
+        const fake = await fakeClaude(textResponseBody + "\nsetInterval(() => {}, 1000);");
+        const store = new SessionImageStore();
+        store.open();
+        let releaseObserver;
+        const observer = new Promise((resolve) => { releaseObserver = resolve; });
+        let enterObserver;
+        const entered = new Promise((resolve) => { enterObserver = resolve; });
+        let child;
+        let privateDirectory;
+        let imageDirectory;
+        const supervise = uncertainLiveness
+            ? supervisorWithCleanupFailure(new ProcessTerminationError("synthetic unknown liveness"))
+            : superviseProcess;
+        try {
+            const stream = createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" }, {
+                resolveSession: () => ({ cwd: fake.directory, imageStore: store }),
+                supervise(running, options) {
+                    child = running;
+                    privateDirectory = dirname(child.spawnargs[child.spawnargs.indexOf("--system-prompt-file") + 1]);
+                    return supervise(running, options);
+                },
+            })(model, providerContext({ messages: [{ role: "user", timestamp: 1, content: [
+                { type: "image", mimeType: "image/png", data: Buffer.from("failure lease bytes").toString("base64") },
+            ] }] }), {
+                async onResponse() {
+                    const images = (await readdir(tmpdir())).filter((name) => name.startsWith("pi-claude-code-provider-images-"));
+                    assert.equal(images.length, 1);
+                    imageDirectory = join(tmpdir(), images[0]);
+                    await store.close();
+                    enterObserver();
+                    await observer;
+                },
+            });
+            await withTimeout(entered, "observer entry before pipe failure");
+            child.stdout.emit("error", new Error("synthetic pipe failure"));
+            const result = await settledRequest(stream);
+            assert.equal(result.stopReason, "error");
+            assert.match(result.errorMessage, /stdout failed: synthetic pipe failure/);
+            const metrics = await requestMetrics(result);
+            assert.equal(metrics.cleanupComplete, !uncertainLiveness);
+            if (uncertainLiveness) {
+                assert.match(result.errorMessage, /process liveness is unknown/);
+                await access(privateDirectory);
+                await access(imageDirectory);
+            } else {
+                await assert.rejects(access(privateDirectory));
+                await waitForRemoval(imageDirectory);
+            }
+        } finally {
+            releaseObserver();
+            await store.close();
+            // The fixture established actual death before simulating unknown liveness.
+            await Promise.all([fake.directory, privateDirectory, imageDirectory].filter(Boolean).map((directory) => rm(directory, { recursive: true, force: true })));
+        }
+    });
+}
 
 // A 200K-window model admits a system prompt of at most 200,000 estimated
 // tokens, which the byte estimator reaches at exactly 500,000 bytes.

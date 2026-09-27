@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- A stalled response observer no longer retains private request files or session image leases after cancellation, process failure, or the total deadline, including when Claude has already exited. The deadline still starts at Claude launch and now covers response processing.
+- Private-path checks reject equivalent paths into request and session image directories, including dot segments, relative paths, and Windows separator and case variations. The guard remains a heuristic rather than a filesystem sandbox.
 - An omitted MCP prefix on exactly `bash`, `read`, `edit`, or `write` no longer fails the turn when that lowercase Pi tool is active. Capitalized names and other bare tool names remain errors; arguments are unchanged ([#14](https://github.com/chem/pi-claude-code-provider/issues/14)).
 - Local checkouts now show their directory name in Pi's `[Extensions]` list instead of `extensions`. The single root `index.ts` preserves Git and npm labels on both Pi distributions and replaces the previous entry shim.
 - Provider tests wait for each request's own lifecycle metrics and isolate temporary state, preventing late cleanup from interfering with another test's assertions.

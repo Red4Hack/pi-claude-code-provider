@@ -88,7 +88,7 @@ Images remain available throughout the current Pi context. Each request allows u
 | `PI_CLAUDE_CODE_PROVIDER_PATH` | Override the `claude` executable path. |
 | `PI_CLAUDE_CODE_PROVIDER_METRICS_LOG` | Append content-free request and search metrics as JSONL. |
 | `PI_CLAUDE_CODE_PROVIDER_IDLE_TIMEOUT_MS` | Override the five-minute protocol-idle timeout for provider requests, in positive milliseconds. |
-| `PI_CLAUDE_CODE_PROVIDER_TOTAL_TIMEOUT_MS` | Override the 30-minute total timeout for provider requests, in positive milliseconds. |
+| `PI_CLAUDE_CODE_PROVIDER_TOTAL_TIMEOUT_MS` | Override the 30-minute timeout from Claude launch through response processing, including response observers, in positive milliseconds. |
 | `PI_CLAUDE_CODE_PROVIDER_MCP_READY_TIMEOUT_MS` | Override the five-second tool bridge readiness timeout, in positive milliseconds. |
 | `PI_CLAUDE_CODE_PROVIDER_THINKING_DISPLAY` | `summarized` (default), `omitted` (hide thinking text), or `off` (disable the display request if Claude Code rejects it). |
 | `PI_CLAUDE_CODE_PROVIDER_TRANSCRIPT_BREAKPOINT` | `on` (default) or `off`. Turn it off only if Claude Code rejects excess cache breakpoints; this disables the provider's prompt caching. |
@@ -102,6 +102,8 @@ Claude receives an allowlisted environment, including `CLAUDE_CONFIG_DIR` for a 
 Pi packages run with your permissions; review the source before installation. Claude runs in Pi's session working directory and can read some project files at startup. Its proposed file and shell actions run as visible Pi tools. The provider suppresses user and project Claude customizations, but administrator-managed settings, hooks, and MCP policy can still run. See [DESIGN.md](DESIGN.md#what-claude-code-adds-on-its-own) for startup behavior and [SECURITY.md](SECURITY.md) for vulnerability reporting.
 
 Tool-bearing side requests need a registered Pi session or a working-directory declaration in the system prompt. That declaration is caller-controlled; see [DESIGN.md](DESIGN.md#process-and-storage-lifecycle) for routing details.
+
+The provider rejects detected tool arguments aimed at its private request and image directories, including equivalent path spellings resolved against the request's working directory. This guard is a heuristic: it does not follow symlinks or interpret arbitrary shell expressions. Pi tools run with your permissions.
 
 ### Troubleshooting
 
