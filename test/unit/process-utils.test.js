@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import test from "node:test";
 import { withTimeout, waitFor } from "../support/wait.js";
-import { ProcessTerminationError, superviseProcess, terminateProcessGroup } from "../../src/process-utils.ts";
+import { ProcessTerminationError, forceTerminateProcessTreeSync, superviseProcess, terminateProcessGroup } from "../../src/process-utils.ts";
 import { nodeFixtureArgs } from "../support/node-fixture.js";
 
 async function assertProcessGone(pid) {
@@ -237,3 +237,73 @@ for (const inheritedPipes of [true, false]) {
         }
     });
 }
+
+test("supervisor reports a confirmed termination once", async () => {
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: process.platform !== "win32", stdio: ["pipe", "pipe", "pipe"] });
+    const outcomes = [];
+    const supervisor = superviseProcess(child, { idleTimeoutMs: 10_000, totalTimeoutMs: 10_000, onFailure() {}, onTermination: (outcome) => outcomes.push(outcome) });
+    try {
+        await supervisor.terminate();
+        await supervisor.terminate();
+        await supervisor.wait();
+        assert.deepEqual(outcomes, ["confirmed"]);
+    } finally {
+        supervisor.dispose();
+    }
+});
+
+test("supervisor reports unknown liveness from any termination path, and a throwing observer changes nothing", async () => {
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: process.platform !== "win32", stdio: ["pipe", "pipe", "pipe"] });
+    const outcomes = [];
+    const supervisor = superviseProcess(child, {
+        idleTimeoutMs: 10_000,
+        // The deadline starts this termination, not a caller.
+        totalTimeoutMs: 30,
+        onFailure() {},
+        terminate: async () => { throw new Error("synthetic terminator EPERM"); },
+        onTermination: (outcome) => {
+            outcomes.push(outcome);
+            throw new Error("observer failure");
+        },
+    });
+    try {
+        await assert.rejects(withTimeout(supervisor.wait(), "process settlement"), ProcessTerminationError);
+        await assert.rejects(supervisor.terminate(), ProcessTerminationError);
+        assert.deepEqual(outcomes, ["unknown"]);
+    } finally {
+        supervisor.dispose();
+        await terminateProcessGroup(child);
+    }
+});
+
+test("synchronous forced termination removes the owned group, descendants included", { skip: process.platform === "win32" }, async () => {
+    const body = `const {spawn}=require("node:child_process"); const grandchild=spawn(process.execPath,["-e","setInterval(()=>{},1000)"],{stdio:"ignore"}); process.stdout.write(String(grandchild.pid)+"\\n"); setInterval(()=>{},1000);`;
+    const child = spawn(process.execPath, ["-e", body], { detached: true, stdio: ["ignore", "pipe", "pipe"] });
+    const [line] = await once(child.stdout, "data");
+    const grandchild = Number(String(line).trim());
+    assert.equal(forceTerminateProcessTreeSync(child.pid, child), true);
+    await assertProcessGone(child.pid);
+    await assertProcessGone(grandchild);
+    // Already gone: ESRCH is still an established absence.
+    assert.equal(forceTerminateProcessTreeSync(child.pid, child), true);
+});
+
+test("synchronous forced termination reports unknown liveness when it cannot signal", () => {
+    const denied = () => { throw Object.assign(new Error("denied"), { code: "EPERM" }); };
+    assert.equal(forceTerminateProcessTreeSync(1234, undefined, { platform: "linux", kill: denied }), false);
+    assert.equal(forceTerminateProcessTreeSync(0, undefined, { platform: "linux", kill: () => true }), false);
+});
+
+test("synchronous forced termination on Windows trusts only taskkill's own outcome", () => {
+    const run = (status, child) => {
+        const calls = [];
+        const outcome = forceTerminateProcessTreeSync(4321, child, { platform: "win32", taskkill: (pid) => { calls.push(pid); return status; } });
+        return { outcome, calls };
+    };
+    assert.deepEqual(run(0), { outcome: true, calls: [4321] });
+    assert.deepEqual(run(128), { outcome: true, calls: [4321] });
+    assert.deepEqual(run(1), { outcome: false, calls: [4321] });
+    assert.deepEqual(run(null), { outcome: false, calls: [4321] });
+    // An exited leader cannot be traced to descendants, and its PID may be reused.
+    assert.deepEqual(run(0, { exitCode: 0, signalCode: null }), { outcome: true, calls: [] });
+});

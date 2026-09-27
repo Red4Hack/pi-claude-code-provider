@@ -8,7 +8,7 @@ import { MODEL_ALIASES, type ModelAliasVersions } from "./claude-models.ts";
 import type { VersionStatus } from "./compatibility.ts";
 import { NEUTRAL_BUN_CONFIG, hostRuntimeDescription, needsBunConfig } from "./host-runtime.ts";
 import { superviseProcess, terminateProcessGroup, type ProcessResult, type ProcessSupervisor } from "./process-utils.ts";
-import { createRuntimeDirectory, recordRuntimeChild, removeRuntimeDirectory, type RuntimeCleanupResult } from "./runtime-directories.ts";
+import { confirmRuntimeChildExit, createRuntimeDirectory, recordRuntimeChild, removeRuntimeDirectory, retainRuntimeDirectory, type RuntimeCleanupResult } from "./runtime-directories.ts";
 import type { ClaudeInstallation, RequestMetrics } from "./types.ts";
 import { WEB_SEARCH_ENV } from "./web-search.ts";
 
@@ -84,7 +84,7 @@ export async function probeBridge(
           failure ??= error.message;
         },
       });
-      await recordRuntimeChild(directory, child.pid as number);
+      await recordRuntimeChild(directory, child.pid as number, child);
       child.stdin?.end(
         `${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} })}\n` +
         `${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} })}\n`,
@@ -96,11 +96,14 @@ export async function probeBridge(
       supervisor?.dispose();
       try {
         await (supervisor ? supervisor.terminate() : terminateProcessGroup(child));
+        confirmRuntimeChildExit(directory);
       } catch (error) {
         terminationError = error;
         // The marker carries the child PID for stale recovery. Removing the
-        // directory now could discard state a surviving descendant still uses.
+        // directory now could discard state a surviving descendant still uses,
+        // and the exit reaper must keep it for the same reason.
         livenessUnknown = true;
+        retainRuntimeDirectory(directory);
       }
     }
     if (terminationError) return {

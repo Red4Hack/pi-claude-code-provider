@@ -1,4 +1,4 @@
-import { execFile, type ChildProcess } from "node:child_process";
+import { execFile, spawnSync, type ChildProcess } from "node:child_process";
 import { constants } from "node:fs";
 import { access } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
@@ -15,6 +15,13 @@ export interface ProcessSupervisorOptions {
   totalTimeoutMs: number;
   onFailure: (error: Error) => void;
   terminate?: (child: ChildProcess) => Promise<void>;
+  /**
+   * Called once when the memoized termination settles: `confirmed` when the owned
+   * tree is known to be gone, `unknown` when the terminator rejected. Every
+   * termination path funnels through it, so owners can record liveness without
+   * awaiting a termination some other path started.
+   */
+  onTermination?: (outcome: "confirmed" | "unknown") => void;
 }
 
 export interface ProcessSupervisor {
@@ -65,12 +72,23 @@ export function superviseProcess(child: ChildProcess, options: ProcessSupervisor
       return sent;
     });
 
+  const reportTermination = (outcome: "confirmed" | "unknown"): void => {
+    try {
+      options.onTermination?.(outcome);
+    } catch {
+      // Bookkeeping must never change a termination's own outcome.
+    }
+  };
+
   const terminate = (): Promise<void> => {
-    terminationPromise ??= (options.terminate ?? terminateOwnedProcess)(child).catch((cause: unknown) => {
+    terminationPromise ??= (options.terminate ?? terminateOwnedProcess)(child).then(() => {
+      reportTermination("confirmed");
+    }, (cause: unknown) => {
       // A leader can exit while descendants still own its process group or
       // inherited pipes. Only successful tree termination establishes cleanup;
       // an exit code cannot make a rejected terminator safe.
       const failure = cause instanceof ProcessTerminationError ? cause : new ProcessTerminationError(cause);
+      reportTermination("unknown");
       if (!settled) {
         settled = true;
         clearTimers();
@@ -205,6 +223,54 @@ export async function terminateProcessGroup(
       `Process group ${pid} did not terminate after SIGKILL ` +
       `(child exitCode=${String(child.exitCode)}, signalCode=${String(child.signalCode)})`,
     );
+  }
+}
+
+export interface ForceTerminateSyncDependencies {
+  platform?: NodeJS.Platform;
+  kill?: ProcessKiller;
+  /** Runs `taskkill /PID <pid> /T /F` and returns its exit status, or null if it did not complete. */
+  taskkill?: (pid: number) => number | null;
+}
+
+/**
+ * Synchronous last resort for a process `exit` listener, where nothing
+ * asynchronous runs again: force the owned tree down without waiting and report
+ * whether it is gone. `false` means its liveness is unknown, so the caller must
+ * keep the private state the tree may still use. On POSIX, SIGKILL to the group
+ * cannot be caught, and it also reaches descendants after the leader exited. On
+ * Windows a leader that already exited cannot be traced to its descendants,
+ * which the asynchronous path accepts too.
+ */
+export function forceTerminateProcessTreeSync(
+  pid: number,
+  child: ChildProcess | undefined,
+  dependencies: ForceTerminateSyncDependencies = {},
+): boolean {
+  if (!validPid(pid)) return false;
+  if ((dependencies.platform ?? process.platform) === "win32") {
+    if (child && (child.exitCode !== null || child.signalCode !== null)) return true;
+    const status = (dependencies.taskkill ?? runTaskkillSync)(pid);
+    // 128: the exact PID is already gone.
+    return status === 0 || status === 128;
+  }
+  try {
+    (dependencies.kill ?? process.kill)(-pid, "SIGKILL");
+    return true;
+  } catch (error) {
+    return isMissingProcess(error);
+  }
+}
+
+function runTaskkillSync(pid: number): number | null {
+  try {
+    return spawnSync(windowsTaskkillExecutable(), ["/PID", String(pid), "/T", "/F"], {
+      windowsHide: true,
+      timeout: 5_000,
+      stdio: "ignore",
+    }).status;
+  } catch {
+    return null;
   }
 }
 

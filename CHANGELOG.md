@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- Private request and session image directories are now removed when Pi, or a pi-subagents runner, exits while a request is in flight, such as quitting mid-turn or stopping a background subagent. Previously they stayed until a later start's stale recovery at least an hour later, and on Windows indefinitely. A Claude process still shutting down at that moment is force-killed; state whose process liveness is unknown is still retained.
 - Capture cleanup terminates the owned POSIX process group even after its leader closes, preventing surviving descendants from outliving temporary capture files.
 - A stalled response observer no longer retains private request files or session image leases after cancellation, process failure, or the total deadline, including when Claude has already exited. The deadline still starts at Claude launch and now covers response processing.
 - Private-path checks reject equivalent paths into request and session image directories, including dot segments, relative paths, and Windows separator and case variations. The guard remains a heuristic rather than a filesystem sandbox.
