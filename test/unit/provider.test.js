@@ -2113,7 +2113,9 @@ test("a Claude that closed its input and reported nothing fails on its exit", as
         assert.match(result.errorMessage ?? "", /exited before a terminal event \(code 3, signal null/);
         assert.match(result.errorMessage ?? "", /fake startup failure/);
         assert.doesNotMatch(result.errorMessage ?? "", /stdin failed/);
-        assert.match(result.errorMessage ?? "", /closed its input before the prompt was written/);
+        // Windows pipes accept the write even after the child closed its end, so
+        // only POSIX reports the closed input; the exit explains it either way.
+        if (process.platform !== "win32") assert.match(result.errorMessage ?? "", /closed its input before the prompt was written/);
     }
     finally {
         await rm(fake.directory, { recursive: true, force: true });
