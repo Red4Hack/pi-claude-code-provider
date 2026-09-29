@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -8,21 +8,15 @@ import { VERIFIED_VERSIONS } from "../../src/compatibility.ts";
 import { PAID_LAUNCH_BUDGET_ENV } from "../../src/paid-launch-budget.ts";
 import { closeLiveRpcProcess, consumeJsonl, superviseLiveProcess } from "../../scripts/lib/live-process.js";
 import { piCliEntry } from "../../scripts/lib/pi-installation.js";
-import { CAPTURED_CLAUDE_HELP_PATH, ELIGIBLE_CLAUDE_AUTH } from "../support/claude-fixture.js";
-import { nodeFixtureArgs, nodeFixtureSource } from "../support/node-fixture.js";
+import { claudeFixtureBody } from "../support/claude-fixture.js";
+import { createNodeFixture, nodeFixtureArgs } from "../support/node-fixture.js";
 import { spawn } from "node:child_process";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
 
 async function fakeClaude(directory, reply = "OK") {
-  const executable = join(directory, process.platform === "win32" ? "claude.cjs" : "claude");
   const init = { type: "system", subtype: "init", tools: [], mcp_servers: [], model: "claude-sonnet-5", permissionMode: "dontAsk", slash_commands: [], skills: [], plugins: [], apiKeySource: "none" };
-  // This fake CLI must not rely on buffered child stdout in restricted sandboxes.
-  await writeFile(executable, nodeFixtureSource(`
-if (process.argv.includes("--version")) process.stdout.write(${JSON.stringify(`${VERIFIED_VERSIONS.claudeCode}\n`)});
-else if (process.argv[2] === "auth" && process.argv[3] === "status") process.stdout.write(JSON.stringify(${JSON.stringify(ELIGIBLE_CLAUDE_AUTH)}));
-else if (process.argv.includes("--help")) process.stdout.write(require("node:fs").readFileSync(${JSON.stringify(CAPTURED_CLAUDE_HELP_PATH)}, "utf8"));
-else {
+  const { executable } = await createNodeFixture(claudeFixtureBody(`
   const systemPath = process.argv[process.argv.indexOf("--system-prompt-file") + 1];
   if (systemPath && require("node:fs").readFileSync(systemPath, "utf8").includes("AMBIENT_ISOLATION_MARKER")) {
     process.stderr.write("Ambient system prompt reached the fake provider");
@@ -33,9 +27,7 @@ else {
     process.stdout.write(JSON.stringify(${JSON.stringify(init)}) + "\\n");
     process.stdout.write(JSON.stringify({type:"result",is_error:false,result:${JSON.stringify(reply)}}) + "\\n");
   });
-}
-`), { mode: 0o700 });
-  await chmod(executable, 0o700);
+`, { preflight: true, version: VERIFIED_VERSIONS.claudeCode }), { directory });
   return executable;
 }
 

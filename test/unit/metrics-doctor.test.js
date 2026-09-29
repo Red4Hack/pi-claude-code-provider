@@ -7,6 +7,8 @@ import { platformStatus, versionStatus } from "../../src/compatibility.ts";
 import { writeDiagnosticReport } from "../../src/diagnostics.ts";
 import { bridgeArgv, formatBridgeArgv } from "../../src/claude-args.ts";
 import { formatDoctorSummary, probeBridge } from "../../src/doctor.ts";
+import { readProviderPackage } from "../../src/package-info.ts";
+import { fileURLToPath } from "node:url";
 import { EventEmitter } from "node:events";
 import { writeFileSync } from "node:fs";
 import { cleanupStaleRuntimeDirectories } from "../../src/runtime-directories.ts";
@@ -184,8 +186,23 @@ test("doctor identifies each working-directory source without logging the path",
 test("doctor summary puts one labeled fact on each line", () => {
     const lines = formatDoctorSummary({ ...doctorBase(), metrics, metricsLogError: "EACCES" }).split("\n");
     assert.equal(lines[0], "Platform linux/x64 (verified); Pi 1 (verified); Claude Code 2 (unverified; tested 1)");
-    assert.deepEqual(lines.slice(1).map((line) => line.slice(0, line.indexOf(":"))), ["Runtime", "Claude", "Models", "Last request", "Working directory source", "Metrics log error"]);
+    assert.deepEqual(lines.slice(1).map((line) => line.slice(0, line.indexOf(":"))), ["Runtime", "Claude", "Models", "Web search", "Last request", "Working directory source", "Metrics log error"]);
     assert.equal(lines[2], "Claude: /usr/bin/claude (pro subscription)");
+});
+
+test("doctor states the web-search registration outcome on its own line", () => {
+    const expected = new Map([
+        [undefined, "Web search: not registered yet (no session started)"],
+        ["enabled", "Web search: enabled"],
+        ["disabled", "Web search: disabled (PI_CLAUDE_CODE_PROVIDER_WEB_SEARCH=off)"],
+        ["invalid", 'Web search: not registered (PI_CLAUDE_CODE_PROVIDER_WEB_SEARCH must be "on" or "off")'],
+        ["occupied", "Web search: not registered (tool name already occupied)"],
+    ]);
+    for (const [webSearch, line] of expected) {
+        const lines = formatDoctorSummary({ ...doctorBase(), webSearch }).split("\n");
+        assert.equal(lines.filter((candidate) => candidate.startsWith("Web search:")).length, 1);
+        assert.ok(lines.includes(line), `${webSearch}: ${lines.join(" | ")}`);
+    }
 });
 
 test("doctor reports a served context window only once it stops matching the configured one", () => {
@@ -238,6 +255,23 @@ test("the diagnostic report records whether the transcript breakpoint is disable
     finally {
         if (original === undefined) delete process.env.PI_CLAUDE_CODE_PROVIDER_TRANSCRIPT_BREAKPOINT;
         else process.env.PI_CLAUDE_CODE_PROVIDER_TRANSCRIPT_BREAKPOINT = original;
+        if (path) await rm(dirname(path), { recursive: true, force: true });
+    }
+});
+
+test("the diagnostic report records the web-search switch and registration outcome", async () => {
+    const original = process.env.PI_CLAUDE_CODE_PROVIDER_WEB_SEARCH;
+    process.env.PI_CLAUDE_CODE_PROVIDER_WEB_SEARCH = "off";
+    let path;
+    try {
+        path = await writeDiagnosticReport({ ...doctorBase(), webSearch: "disabled" });
+        const report = JSON.parse(await readFile(path, "utf8"));
+        assert.equal(report.overrides.webSearch, "off");
+        assert.equal(report.webSearchRegistration, "disabled");
+    }
+    finally {
+        if (original === undefined) delete process.env.PI_CLAUDE_CODE_PROVIDER_WEB_SEARCH;
+        else process.env.PI_CLAUDE_CODE_PROVIDER_WEB_SEARCH = original;
         if (path) await rm(dirname(path), { recursive: true, force: true });
     }
 });
@@ -383,4 +417,29 @@ test("bridge argv diagnostics preserve argument boundaries", () => {
         bridgeProbe: { ok: false, argv, detail: "handshake failed" },
     });
     assert.ok(summary.includes(formatBridgeArgv(argv)));
+});
+
+test("the doctor names the provider copy Pi loaded", async () => {
+    // Read from this checkout's own manifest, the file an installed copy carries too.
+    const loaded = await readProviderPackage();
+    const manifest = JSON.parse(await readFile(new URL("../../package.json", import.meta.url), "utf8"));
+    assert.deepEqual(loaded, { version: manifest.version, root: fileURLToPath(new URL("../..", import.meta.url)).replace(/[\\/]$/, "") });
+    const lines = formatDoctorSummary({ ...doctorBase(), providerPackage: loaded }).split("\n");
+    assert.ok(lines.some((line) => line.startsWith(`Provider: pi-claude-code-provider ${manifest.version} at `)));
+    assert.doesNotMatch(formatDoctorSummary(doctorBase()), /^Provider:/m);
+    // Unreadable manifests degrade to an unknown version instead of failing the doctor.
+    const missing = await readProviderPackage(new URL("./missing-directory/package.json", import.meta.url));
+    assert.equal(missing.version, undefined);
+    assert.match(formatDoctorSummary({ ...doctorBase(), providerPackage: missing }), /Provider: pi-claude-code-provider \(version unreadable\) at /);
+});
+
+test("the diagnostic report records the loaded provider copy with its home redacted", async () => {
+    const path = await writeDiagnosticReport({ ...doctorBase(), providerPackage: { version: "9.9.9", root: join(homedir(), "pi", "pi-claude-code-provider") } });
+    try {
+        const report = JSON.parse(await readFile(path, "utf8"));
+        assert.deepEqual(report.provider, { version: "9.9.9", root: join("<HOME>", "pi", "pi-claude-code-provider") });
+    }
+    finally {
+        await rm(dirname(path), { recursive: true, force: true });
+    }
 });

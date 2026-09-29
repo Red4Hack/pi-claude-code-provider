@@ -9,8 +9,10 @@ import type { VersionStatus } from "./compatibility.ts";
 import { NEUTRAL_BUN_CONFIG, hostRuntimeDescription, needsBunConfig } from "./host-runtime.ts";
 import { superviseProcess, terminateProcessGroup, type ProcessResult, type ProcessSupervisor } from "./process-utils.ts";
 import { headText } from "./text.ts";
-import { createRuntimeDirectory, recordRuntimeChild, removeRuntimeDirectory, type RuntimeCleanupResult } from "./runtime-directories.ts";
+import { confirmRuntimeChildExit, createRuntimeDirectory, recordRuntimeChild, removeRuntimeDirectory, retainRuntimeDirectory, type RuntimeCleanupResult } from "./runtime-directories.ts";
+import type { ProviderPackage } from "./package-info.ts";
 import type { ClaudeInstallation, RequestMetrics } from "./types.ts";
+import { WEB_SEARCH_ENV } from "./web-search.ts";
 
 // Haiku 4.5 caches nothing below this, so a smaller request that reuses nothing
 // says nothing about caching; see DEVELOPING.md#prompt-caching.
@@ -84,7 +86,7 @@ export async function probeBridge(
           failure ??= error.message;
         },
       });
-      await recordRuntimeChild(directory, child.pid as number);
+      await recordRuntimeChild(directory, child.pid as number, child);
       child.stdin?.end(
         `${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} })}\n` +
         `${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} })}\n`,
@@ -96,11 +98,14 @@ export async function probeBridge(
       supervisor?.dispose();
       try {
         await (supervisor ? supervisor.terminate() : terminateProcessGroup(child));
+        confirmRuntimeChildExit(directory);
       } catch (error) {
         terminationError = error;
         // The marker carries the child PID for stale recovery. Removing the
-        // directory now could discard state a surviving descendant still uses.
+        // directory now could discard state a surviving descendant still uses,
+        // and the exit reaper must keep it for the same reason.
         livenessUnknown = true;
+        retainRuntimeDirectory(directory);
       }
     }
     if (terminationError) return {
@@ -135,17 +140,26 @@ export async function probeBridge(
   }
 }
 
+/**
+ * Outcome of the one web-search registration attempt a provider instance makes
+ * at its first session start. `invalid` means the switch held an unrecognized
+ * value, which leaves the tool unregistered.
+ */
+export type WebSearchStatus = "enabled" | "disabled" | "invalid" | "occupied";
+
 export interface DoctorSummaryInput {
   platformStatus: VersionStatus;
   piStatus: VersionStatus;
   claudeStatus: VersionStatus;
   installation: ClaudeInstallation;
+  providerPackage?: ProviderPackage;
   modelIds: readonly string[];
   modelVersions?: ModelAliasVersions;
   metrics?: RequestMetrics;
   metricsLogError?: string;
   runtimeCleanup: RuntimeCleanupResult;
   bridgeProbe?: BridgeProbeResult;
+  webSearch?: WebSearchStatus;
 }
 
 export function formatDoctorSummary(input: DoctorSummaryInput): string {
@@ -165,17 +179,21 @@ export function formatDoctorSummary(input: DoctorSummaryInput): string {
       ? `reported usage: ${metrics.inputTokens} input, ${metrics.cacheRead} cache read, ${metrics.cacheWrite} cache write${metrics.cacheHitPercent === undefined ? "" : `, ${metrics.cacheHitPercent}% cache hit`}`
       : "reported token usage unavailable";
   // One labeled fact per line: this is read in a notification, not parsed.
-  const lines = [
-    verification,
+  const lines = [verification];
+  if (input.providerPackage) {
+    lines.push(`Provider: pi-claude-code-provider ${input.providerPackage.version ?? "(version unreadable)"} at ${input.providerPackage.root}`);
+  }
+  lines.push(
     `Runtime: ${hostRuntimeDescription()}`,
     `Claude: ${input.installation.executable} (${input.installation.subscriptionType} subscription)`,
     `Models: ${input.modelIds.join(", ")}`,
-  ];
+  );
   const servedModels = formatServedModels(input);
   if (servedModels) lines.push(`Served models (Claude Code install): ${servedModels}`);
   if (input.bridgeProbe) {
     lines.push(`Bridge: ${input.bridgeProbe.ok ? "ok" : "BROKEN"} via ${formatBridgeArgv(input.bridgeProbe.argv)} (${input.bridgeProbe.detail})`);
   }
+  lines.push(`Web search: ${webSearchDescription(input.webSearch)}`);
   lines.push(metrics
     ? `Last request: ${metrics.requestedModel}/${metrics.effort}, ${metrics.messageCount} messages, ${metrics.estimatedInputTokens} estimated transport tokens, ${reportedUsage}, ${metrics.durationMs ?? 0}ms, ${metrics.stopReason ?? "unknown"}${metrics.errorCategory ? ` (${metrics.errorCategory})` : ""}${metrics.cleanupComplete ? "" : ", cleanup incomplete"}`
     : "Last request: no request metrics recorded yet");
@@ -205,6 +223,16 @@ export function formatDoctorSummary(input: DoctorSummaryInput): string {
   return lines.join("\n");
 }
 
+function webSearchDescription(status: WebSearchStatus | undefined): string {
+  switch (status) {
+    case "enabled": return "enabled";
+    case "disabled": return `disabled (${WEB_SEARCH_ENV}=off)`;
+    case "invalid": return `not registered (${WEB_SEARCH_ENV} must be "on" or "off")`;
+    case "occupied": return "not registered (tool name already occupied)";
+    default: return "not registered yet (no session started)";
+  }
+}
+
 /**
  * Claude Code's own reported context window, when it has stopped matching the one
  * this package advertises. Only a mismatch is reported, because a match is the
@@ -216,8 +244,10 @@ export function formatDoctorSummary(input: DoctorSummaryInput): string {
 function servedContextWindowNote(input: DoctorSummaryInput, metrics: RequestMetrics): string | undefined {
   const served = metrics.servedContextWindow;
   if (typeof served !== "number" || !Number.isFinite(served) || served <= 0) return undefined;
-  const configured = providerModels()
-    .find((model) => model.id === metrics.requestedModel)?.contextWindow;
+  // Pi 0.99 widened ProviderModelConfig to a union that includes image models
+  // without a context window; every model this provider registers carries one.
+  const match = providerModels().find((model) => model.id === metrics.requestedModel);
+  const configured = match && "contextWindow" in match ? match.contextWindow : undefined;
   if (configured === undefined || configured === served) return undefined;
   return `Context window: ${metrics.requestedModel} served ${served}, configured ${configured}; ` +
     "Pi compacts by the configured value";

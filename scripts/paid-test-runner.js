@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { inspectClaudeInstallation } from "../src/auth.ts";
 import { PAID_LAUNCH_BUDGET_ENV } from "../src/paid-launch-budget.ts";
 import { PI_BIN_ENV, describePiLaunch, piBinOverride } from "./lib/pi-installation.js";
-import { PAID_STAGES, RELEASE_ORDER } from "./lib/paid-stages.js";
+import { PAID_STAGES, RELEASE_ORDER, stageEnvironment } from "./lib/paid-stages.js";
 import {
   PAID_CONFIRMATION,
   PAID_CONFIRMATION_ENV,
@@ -84,8 +84,7 @@ try {
     const stageBudgetDirectory = join(directory, `stage-${stageIndex + 1}-budget`);
     await mkdir(stageBudgetDirectory);
     const before = await launchCount(metricsLog);
-    await run(stage.script, stage.args, {
-      ...process.env,
+    await run(stage.script, stage.args, stageEnvironment(process.env, {
       PI_CODING_AGENT_DIR: agentDirectory,
       PI_OFFLINE: "1",
       // Lanes are explicit: an ambient override must not silently redirect the
@@ -97,7 +96,7 @@ try {
       [PAID_LAUNCH_BUDGET_ENV.aggregateDirectory]: aggregateBudgetDirectory,
       [PAID_LAUNCH_BUDGET_ENV.aggregateCap]: String(totalCap),
       PI_CLAUDE_CODE_PROVIDER_METRICS_LOG: metricsLog,
-    });
+    }));
     const after = await launchCount(metricsLog);
     const stageObserved = after - before;
     const stageClaimed = await claimCount(stageBudgetDirectory);

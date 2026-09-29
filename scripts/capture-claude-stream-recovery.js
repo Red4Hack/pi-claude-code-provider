@@ -22,19 +22,18 @@
 //   npm run capture:claude-stream-recovery                 # every scenario
 //   npm run capture:claude-stream-recovery -- drop sse-error
 //   npm run capture:claude-stream-recovery -- --claude /path/to/claude --print drop
-import { spawn } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { claudeExecutable, buildClaudeEnvironment } from "../src/auth.ts";
+import { claudeExecutable } from "../src/auth.ts";
+import { captureEnvironment, captureTimeout, spawnCaptureChild, stopCaptureChild } from "./lib/claude-capture.js";
 import { providerArgs } from "../src/claude-args.ts";
 
 const CAPTURED = fileURLToPath(new URL("../test/support/captured/", import.meta.url));
 // A CLI that neither answers nor exits would otherwise hang the capture.
 const RUN_TIMEOUT_MS = 90_000;
-const EXIT_TIMEOUT_MS = 5000;
 // Long enough for Claude Code to have parsed what arrived before the socket dies.
 const CUT_DELAY_MS = 200;
 
@@ -54,7 +53,16 @@ const messageEnd = (reason) =>
   frame("message_delta", { type: "message_delta", delta: { stop_reason: reason, stop_sequence: null }, usage: { output_tokens: 2 } }) +
   frame("message_stop", { type: "message_stop" });
 
-const OVERLOADED = '{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}';
+// A safety classifier's stop, as the API reports it: a refusal stop reason with the
+// flagged category in stop_details.
+const refusalEnd = () =>
+  frame("message_delta", {
+    type: "message_delta",
+    delta: { stop_reason: "refusal", stop_sequence: null, stop_details: { type: "refusal", category: "cyber", explanation: null } },
+    usage: { output_tokens: 2 },
+  }) + frame("message_stop", { type: "message_stop" });
+
+const OVERLOADED ='{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}';
 const complete = (text) => messageStart("msg_done", "claude-sonnet-5") + textStart(0, text) + blockStop(0) + messageEnd("end_turn");
 
 /**
@@ -105,6 +113,20 @@ const SCENARIOS = {
   "context-window-exceeded": ({ attempt, model }) => ({
     sse: messageStart(`msg_${attempt}`, model) + textStart(0, attempt === 1 ? "cut off by the window" : "continued") + blockStop(0) +
       messageEnd(attempt === 1 ? "model_context_window_exceeded" : "end_turn"),
+  }),
+  // A safety classifier stops the response after some text. Claude Code may answer with
+  // a same-model retry of its own; the provider must report the refusal either way.
+  refusal: ({ attempt, model }) => ({
+    sse: messageStart(`msg_${attempt}`, model) + textStart(0, attempt === 1 ? "partial before the flag" : "answer after the flag") + blockStop(0) +
+      (attempt === 1 ? refusalEnd() : messageEnd("end_turn")),
+  }),
+  // Every attempt is flagged, so Claude Code ends with its final refusal records.
+  "refusal-twice": ({ attempt, model }) => ({
+    sse: messageStart(`msg_${attempt}`, model) + textStart(0, `flagged attempt ${attempt}`) + blockStop(0) + refusalEnd(),
+  }),
+  // A refusal before any content block.
+  "refusal-empty": ({ attempt, model }) => ({
+    sse: messageStart(`msg_${attempt}`, model) + (attempt === 1 ? refusalEnd() : textStart(0, "answer after the flag") + blockStop(0) + messageEnd("end_turn")),
   }),
   // A normal tool proposal, including the permission_denied and tool_result records
   // Claude Code emits before the stop reason in every handoff.
@@ -166,26 +188,11 @@ function scriptedServer(scenario) {
   });
 }
 
-/** Resolve once the child has exited, or after a bounded wait if it will not. */
-function closed(child) {
-  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
-  return new Promise((resolve) => {
-    const done = () => {
-      clearTimeout(timer);
-      resolve();
-    };
-    const timer = setTimeout(() => {
-      child.kill("SIGKILL");
-      child.once("exit", done);
-    }, EXIT_TIMEOUT_MS);
-    child.once("exit", done);
-  });
-}
-
 async function captureScenario(scenario, executable) {
   const directory = await mkdtemp(join(tmpdir(), "pi-claude-code-provider-recovery-"));
   const home = await mkdtemp(join(tmpdir(), "pi-claude-code-provider-recovery-home-"));
   const server = scriptedServer(scenario);
+  let captureProcess;
   try {
     await writeFile(join(directory, "system-prompt.txt"), "Inert capture prompt.");
     await writeFile(
@@ -203,32 +210,15 @@ async function captureScenario(scenario, executable) {
     };
     const { args, prompt } = providerArgs(prepared, "sonnet", "low");
     await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-    // The loopback base URL and dummy token are exactly what
-    // buildClaudeEnvironment refuses to forward. This capture overrides them
-    // after that call, where the override is visible, rather than through it.
-    const env = {
-      ...buildClaudeEnvironment({ HOME: home }),
-      ANTHROPIC_BASE_URL: `http://127.0.0.1:${server.address().port}`,
-      CLAUDE_CODE_OAUTH_TOKEN: "local-capture-dummy-oauth-token",
-    };
-    // An inherited proxy would send this capture off the loopback interface, and a
-    // relocated configuration directory would expose the account it must never read.
-    for (const name of ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "CLAUDE_CONFIG_DIR"]) delete env[name];
-    const child = spawn(executable, args, { cwd: directory, env, stdio: ["pipe", "pipe", "ignore"] });
-    let stdout = "";
-    child.stdout.on("data", (chunk) => (stdout += chunk));
-    child.stdin.end(`${JSON.stringify({ type: "user", message: { role: "user", content: prompt } })}\n`);
-    let timer;
-    await Promise.race([
-      new Promise((resolve) => child.once("exit", resolve)),
-      new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`${scenario}: Claude Code did not finish within ${RUN_TIMEOUT_MS}ms`)), RUN_TIMEOUT_MS);
-      }),
-    ]).finally(() => {
-      clearTimeout(timer);
-      child.kill();
+    captureProcess = spawnCaptureChild(executable, args, {
+      cwd: directory,
+      env: captureEnvironment(home, `http://127.0.0.1:${server.address().port}`),
+      stdio: ["pipe", "pipe", "ignore"],
     });
-    await closed(child);
+    let stdout = "";
+    captureProcess.child.stdout.on("data", (chunk) => (stdout += chunk));
+    captureProcess.child.stdin.end(`${JSON.stringify({ type: "user", message: { role: "user", content: prompt } })}\n`);
+    await captureTimeout(captureProcess.closed, `${scenario} recovery capture`, RUN_TIMEOUT_MS);
     const uuids = new Map();
     const records = stdout
       .split("\n")
@@ -239,9 +229,13 @@ async function captureScenario(scenario, executable) {
     if (typeof version !== "string") throw new Error(`${scenario}: Claude Code did not report its version in init`);
     return { records, version };
   } finally {
-    server.close();
-    await rm(directory, { recursive: true, force: true });
-    await rm(home, { recursive: true, force: true });
+    try { if (captureProcess) await stopCaptureChild(captureProcess, 100); }
+    finally {
+      server.closeAllConnections();
+      await new Promise((resolve) => server.close(resolve));
+      await rm(directory, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
   }
 }
 

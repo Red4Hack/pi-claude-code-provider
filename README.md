@@ -2,7 +2,7 @@
 
 A [Pi](https://pi.dev) package that creates a provider for Claude family models from a subscription-authenticated Claude Code installation by launching Anthropic's installed `claude` executable in documented non-interactive print mode. Pi remains fully in charge of the session: branching, compaction, and history behave like any other Pi provider, and every tool runs visibly in Pi — the Claude process can propose tool calls but never execute anything on its own. The goal is simple: the convenience of your Claude subscription in Pi, with the fewest possible surprises.
 
-This package never imitates private OAuth traffic, does not use the Agents SDK, and does not modify Claude's internal session files. It never reads Claude credentials or uses an Anthropic API key.
+This package never imitates private OAuth traffic, does not use the Agent SDK, and does not modify Claude's internal session files. It never reads Claude credentials or uses an Anthropic API key.
 
 This project was developed using frontier AI models under human guidance. Almost all of the docs and code were written by machines except for this introductory material. The project may be over-engineered in some respects; that's fine. If you enjoy this package, please star it on github.
 
@@ -31,6 +31,8 @@ pi install git:github.com/chem/pi-claude-code-provider
 
 Add `-l` for a project-local installation. Pi loads project packages only after the project is trusted; use `pi config` to enable or disable the extension.
 
+For a local checkout, use `pi install /absolute/path/to/pi-claude-code-provider`. The startup `[Extensions]` list shows `chem/pi-claude-code-provider` for Git and `pi-claude-code-provider` for npm or a local checkout with that directory name. A renamed checkout shows its directory name. These labels apply to npm and standalone Pi alike.
+
 ## Use
 
 Open `/model` and choose `sonnet`, `fable`, `opus`, or `haiku` under `pi-claude-code-provider`.
@@ -49,17 +51,19 @@ Fable availability and billing vary by subscription tier; see Anthropic's [Fable
 
 To see which model served a response, inspect `responseModel` in Pi's JSON output.
 
+Pi's active tools are advertised through MCP. If the model omits the MCP prefix on exactly `bash`, `read`, `edit`, or `write`, the provider accepts that name only when the same lowercase Pi tool is active. Bare capitalized names such as `Bash` and bare names of other tools remain errors. Arguments must still follow Pi's advertised schema; the provider does not translate Claude Code's built-in argument fields or timeout units.
+
 After installation or an upstream update, run:
 
 ```text
 /pi-claude-code-provider-doctor
 ```
 
-The doctor checks versions, model aliases, and the tool bridge without consuming subscription quota. It also reports recent prompt-cache reuse and context-window mismatches.
+The doctor checks versions, model aliases, and the tool bridge without consuming subscription quota. It names the provider version Pi actually loaded and its install directory, which exposes an older project-local or duplicate installation. It also reports recent prompt-cache reuse and context-window mismatches. Its last-request metrics describe the request whose process cleanup and lifecycle finished most recently; overlapping requests can finish out of start order, and a terminal response can appear before its metrics finalize.
 
 Run `/pi-claude-code-provider-doctor report` for a content-free diagnostic report. Inspect it before sharing it.
 
-The `pi_claude_code_provider_web_search` tool uses Claude's WebSearch and WebFetch. It always uses Sonnet at medium effort, regardless of the selected model, and has a three-minute limit. If unavailable, check Pi's tool filters and whether another extension owns the name.
+The `pi_claude_code_provider_web_search` tool uses Claude's WebSearch and WebFetch. It always uses Sonnet at medium effort, regardless of the selected model, and has a three-minute limit. Pi offers it to every model, including other providers' models, so each call consumes Claude subscription capacity. Its prompt guidance defers to any other web-search tool you have. To remove it entirely, set `PI_CLAUDE_CODE_PROVIDER_WEB_SEARCH=off`; for a single launch, `pi --exclude-tools pi_claude_code_provider_web_search` also works. If it is unexpectedly unavailable, run the doctor, which reports its state, then check that variable, Pi's tool filters, and whether another extension owns the name.
 
 ## Subscription usage
 
@@ -84,9 +88,10 @@ Images remain available throughout the current Pi context. Each request allows u
 | `PI_CLAUDE_CODE_PROVIDER_PATH` | Override the `claude` executable path. |
 | `PI_CLAUDE_CODE_PROVIDER_METRICS_LOG` | Append content-free request and search metrics as JSONL. |
 | `PI_CLAUDE_CODE_PROVIDER_IDLE_TIMEOUT_MS` | Override the five-minute protocol-idle timeout for provider requests, in positive milliseconds. |
-| `PI_CLAUDE_CODE_PROVIDER_TOTAL_TIMEOUT_MS` | Override the 30-minute total timeout for provider requests, in positive milliseconds. |
+| `PI_CLAUDE_CODE_PROVIDER_TOTAL_TIMEOUT_MS` | Override the 30-minute timeout from Claude launch through response processing, including response observers, in positive milliseconds. |
 | `PI_CLAUDE_CODE_PROVIDER_MCP_READY_TIMEOUT_MS` | Override the twenty-second tool bridge readiness timeout, in positive milliseconds. |
 | `PI_CLAUDE_CODE_PROVIDER_THINKING_DISPLAY` | `summarized` (default), `omitted` (hide thinking text), or `off` (disable the display request if Claude Code rejects it). |
+| `PI_CLAUDE_CODE_PROVIDER_WEB_SEARCH` | `on` (default) or `off`. `off` leaves `pi_claude_code_provider_web_search` unregistered, so no model sees the tool or its prompt guidance. Any other value also leaves it unregistered and shows a warning. Takes effect at the next Pi start or `/reload`. |
 | `PI_CLAUDE_CODE_PROVIDER_TRANSCRIPT_BREAKPOINT` | `on` (default) or `off`. Turn it off only if Claude Code rejects excess cache breakpoints; this disables the provider's prompt caching. |
 
 Metrics exclude prompts, messages, queries, output, credentials, stderr, and temporary paths. On POSIX, the log is mode 0600; Windows uses the selected location's ACL.
@@ -99,15 +104,19 @@ Pi packages run with your permissions; review the source before installation. Cl
 
 Tool-bearing side requests need a registered Pi session or a working-directory declaration in the system prompt. That declaration is caller-controlled; see [DESIGN.md](DESIGN.md#process-and-storage-lifecycle) for routing details.
 
+The provider rejects detected tool arguments aimed at its private request and image directories, including equivalent path spellings resolved against the request's working directory. It also recognizes the temporary directory's alias spellings, such as macOS's `/var/folders` for `/private/var/folders`. This guard is a heuristic: it does not follow other symlinks or interpret arbitrary shell expressions. Pi tools run with your permissions.
+
 ### Troubleshooting
 
 - **Provider missing or unavailable:** run `/pi-claude-code-provider-doctor`, correct the problem it reports, then run `/reload`.
+- **Windows reports Claude Code missing although `claude` works in your shell:** that `claude` is probably a `.cmd` or `.bat` shim, such as an npm install creates, which cannot run without a shell. Install the native Claude Code (`claude.exe`), or set `PI_CLAUDE_CODE_PROVIDER_PATH` to Claude Code's JavaScript entry point.
 - **Requests fail right after Claude Code updated:** run the doctor. If it reports your Claude Code version as unverified, install the tested version it names with `claude install <version>`. To avoid a repeat, set `"autoUpdatesChannel": "stable"` in Claude Code's settings, which waits about a week and skips releases with major regressions, or set `DISABLE_AUTOUPDATER` to `"1"` in their `env`. See [Claude Code's setup guide](https://code.claude.com/docs/en/setup).
 - **Authentication or subscription failure:** run `claude auth status` and sign in with an eligible subscription. For rate-limit or billing errors, check your subscription limits and usage-credit settings. Logins through `CLAUDE_CODE_OAUTH_TOKEN` are unsupported.
 - **Tools fail or requests report `mcp_startup`:** run the doctor to check the tool bridge handshake.
 - **A subscription limit ends the turn instead of retrying:** that is deliberate. A session or weekly window cannot reopen before its reset, so each retry would spend another Claude launch for the same failure. The message names the window and its reset; Pi's retry budget still applies to transient failures.
 - **Compaction fails or repeats:** the provider gives Claude the reasoning room Pi expects on top of a requested answer budget, so a summary is no longer truncated into a discarded compaction. A very small `compaction.reserveTokens` in Pi's settings still caps how long a summary may be; Pi's default is 16384.
 - **Leftover `claude` processes after Pi was killed:** the provider runs Claude in its own process group, so a Pi that dies abruptly can leave one behind. The next Pi session terminates such a group once it is older than an hour and the running process still proves it owns that request's private directory, and the doctor reports how many were reclaimed. On platforms where that proof is unavailable the process is left alone; stop it yourself.
+- **"The model refused to complete the request":** Fable, Opus 5.5, and Opus 5 run safety classifiers, most often triggered by cybersecurity and biology content, including context such as project files. Claude Code can re-run a flagged request on another model, but the provider turns that switch off because it cannot publish a response rewritten mid-stream, so the request ends with this error and Pi does not retry it. See Anthropic's [automatic model fallback](https://code.claude.com/docs/en/model-config#automatic-model-fallback).
 - **A request keeps failing:** run `/pi-claude-code-provider-doctor report` and inspect the report before sharing it. Include the exact error and steps to reproduce when [opening an issue](https://github.com/chem/pi-claude-code-provider/issues).
 
 ## Development and license

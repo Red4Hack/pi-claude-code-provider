@@ -5,8 +5,13 @@ import { basename, join } from "node:path";
 import test from "node:test";
 import {
   cleanupStaleRuntimeDirectories,
+  confirmRuntimeChildExit,
   createRuntimeDirectory,
+  privatePathSpellings,
+  reapRuntimeStateAtExit,
   recordRuntimeChild,
+  removeRuntimeDirectory,
+  retainRuntimeDirectory,
 } from "../../src/runtime-directories.ts";
 
 const HOUR = 60 * 60_000;
@@ -308,4 +313,184 @@ test("permission-denied group probes retain state until absence is established",
     groupExists = false;
     assert.deepEqual(await cleanupStaleRuntimeDirectories(options), { removed: 2, failures: 0, reaped: 0 });
   } finally { t.mock.restoreAll(); await rm(root, { recursive: true, force: true }); }
+});
+
+// The exit registry is process-global and the real reaper runs when this worker
+// exits, so every directory a reaper test registers is removed through
+// removeRuntimeDirectory, which also unregisters it: a fake child PID must never
+// reach a real SIGKILL.
+async function reaperFixture(t) {
+  const root = await mkdtemp(join(tmpdir(), "pi-runtime-reaper-test-"));
+  const created = [];
+  const create = async (kind) => {
+    const directory = await createRuntimeDirectory(kind, { temporaryRoot: root });
+    created.push(directory);
+    return directory;
+  };
+  t.after(async () => {
+    await Promise.all(created.map((directory) => removeRuntimeDirectory(directory)));
+    await rm(root, { recursive: true, force: true });
+  });
+  return { create };
+}
+
+async function exists(path) {
+  return access(path).then(() => true, () => false);
+}
+
+function recordingKill(outcomes = {}) {
+  const calls = [];
+  const kill = (pid, signal) => {
+    calls.push([pid, signal]);
+    const code = outcomes[pid];
+    if (code) throw Object.assign(new Error(code), { code });
+    return true;
+  };
+  return { calls, kill };
+}
+
+test("the exit reaper forces unconfirmed children down and removes owned state", async (t) => {
+  const { create } = await reaperFixture(t);
+  const unconfirmed = await create("provider_request");
+  await recordRuntimeChild(unconfirmed, 424_242);
+  const confirmed = await create("provider_request");
+  await recordRuntimeChild(confirmed, 434_343);
+  confirmRuntimeChildExit(confirmed);
+  const vanished = await create("web_search_request");
+  await recordRuntimeChild(vanished, 444_444);
+  const unlaunched = await create("provider_request");
+  const images = await create("provider_image_store");
+  const output = await create("web_search_output");
+  const { calls, kill } = recordingKill({ [-444_444]: "ESRCH" });
+
+  reapRuntimeStateAtExit({ platform: "linux", kill });
+
+  assert.deepEqual(calls.filter(([pid]) => [-424_242, -434_343, -444_444].includes(pid)), [[-424_242, "SIGKILL"], [-444_444, "SIGKILL"]]);
+  for (const directory of [unconfirmed, confirmed, vanished, unlaunched, images, output]) {
+    assert.equal(await exists(directory), false, basename(directory));
+  }
+  // Reclaimed entries leave the registry, so a second pass signals nothing of theirs.
+  const again = recordingKill();
+  reapRuntimeStateAtExit({ platform: "linux", kill: again.kill });
+  assert.deepEqual(again.calls.filter(([pid]) => pid === -424_242), []);
+});
+
+test("the exit reaper keeps state whose child may live, and image stores with it", async (t) => {
+  const { create } = await reaperFixture(t);
+  const denied = await create("provider_request");
+  await recordRuntimeChild(denied, 515_151);
+  const retained = await create("provider_request");
+  await recordRuntimeChild(retained, 525_252);
+  retainRuntimeDirectory(retained);
+  const images = await create("provider_image_store");
+  const output = await create("web_search_output");
+  const { calls, kill } = recordingKill({ [-515_151]: "EPERM" });
+
+  // A live member behind the EPERM; a zombie-only group would be reclaimed.
+  reapRuntimeStateAtExit({ platform: "linux", kill, groupMemberStates: (pgid) => (pgid === 515_151 ? ["S"] : []) });
+
+  assert.deepEqual(calls.filter(([pid]) => pid === -525_252), [], "a retained child is not signalled");
+  assert.equal(await exists(denied), true, "a child whose death is unknown keeps its request state");
+  assert.equal(await exists(retained), true, "liveness-unknown state is kept at exit too");
+  assert.equal(await exists(images), true, "a possibly live child protects image stores");
+  assert.equal(await exists(output), false, "state no child can use is still removed");
+});
+
+test("a retained image store is kept at exit", async (t) => {
+  const { create } = await reaperFixture(t);
+  const images = await create("provider_image_store");
+  retainRuntimeDirectory(images);
+  reapRuntimeStateAtExit({ platform: "linux", kill: recordingKill().kill });
+  assert.equal(await exists(images), true);
+});
+
+test("the Windows exit reaper uses the owned PID's tree and keeps state it cannot confirm", async (t) => {
+  const { create } = await reaperFixture(t);
+  const statuses = { 616_161: 0, 626_262: 128, 636_363: 1, 646_464: null };
+  const directories = {};
+  for (const pid of Object.keys(statuses).map(Number)) {
+    directories[pid] = await create("provider_request");
+    await recordRuntimeChild(directories[pid], pid);
+  }
+  const exited = await create("provider_request");
+  await recordRuntimeChild(exited, 656_565, { exitCode: 0, signalCode: null });
+  const taskkilled = [];
+
+  reapRuntimeStateAtExit({
+    platform: "win32",
+    taskkill: (pid) => {
+      taskkilled.push(pid);
+      return pid in statuses ? statuses[pid] : 0;
+    },
+  });
+
+  assert.deepEqual(taskkilled.filter((pid) => pid in statuses || pid === 656_565).sort(), [616_161, 626_262, 636_363, 646_464]);
+  assert.equal(await exists(directories[616_161]), false, "taskkill success");
+  assert.equal(await exists(directories[626_262]), false, "process already gone");
+  assert.equal(await exists(directories[636_363]), true, "taskkill failure keeps state");
+  assert.equal(await exists(directories[646_464]), true, "an incomplete taskkill keeps state");
+  assert.equal(await exists(exited), false, "an exited leader needs no taskkill");
+});
+
+test("only a completed removal ends registration, and a failing removal never throws", async (t) => {
+  const { create } = await reaperFixture(t);
+  const removed = await create("web_search_output");
+  await removeRuntimeDirectory(removed);
+  const stubborn = await create("web_search_output");
+  const attempted = [];
+  assert.doesNotThrow(() => reapRuntimeStateAtExit({
+    remove: (directory) => {
+      attempted.push(directory);
+      if (directory === stubborn) throw Object.assign(new Error("busy"), { code: "EBUSY" });
+    },
+  }));
+  assert.equal(attempted.includes(removed), false, "a directory already removed is no longer owned");
+  assert.equal(attempted.includes(stubborn), true);
+  // Still registered after the failure, so a later pass can reclaim it.
+  reapRuntimeStateAtExit({ platform: "linux", kill: recordingKill().kill });
+  assert.equal(await exists(stubborn), false);
+});
+
+test("one exit listener serves every evaluation of the module", async (t) => {
+  const { create } = await reaperFixture(t);
+  await create("web_search_output");
+  const installed = process.listenerCount("exit");
+  const second = await import(`../../src/runtime-directories.ts?evaluation=${Date.now()}`);
+  const root = await mkdtemp(join(tmpdir(), "pi-runtime-reaper-second-"));
+  try {
+    for (let index = 0; index < 5; index += 1) {
+      const directory = await second.createRuntimeDirectory("web_search_output", { temporaryRoot: root });
+      await create("web_search_output");
+      // The first evaluation's reaper sees the second evaluation's directories.
+      reapRuntimeStateAtExit({ platform: "linux", kill: recordingKill().kill });
+      assert.equal(await exists(directory), false);
+    }
+    assert.equal(process.listenerCount("exit"), installed);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("private directories are spelled through both the resolved and the aliased temporary root", () => {
+  // macOS: TMPDIR is under /var, a link into /private/var.
+  assert.deepEqual(
+    privatePathSpellings(["/private/var/folders/x/T/pi-claude-code-provider-request-A"], "/var/folders/x/T/", "/private/var/folders/x/T"),
+    ["/private/var/folders/x/T/pi-claude-code-provider-request-A", "/var/folders/x/T/pi-claude-code-provider-request-A"],
+  );
+  // Windows: TEMP can hold an 8.3 short name that realpath expands.
+  assert.deepEqual(
+    privatePathSpellings(
+      ["C:\\Users\\runneradmin\\AppData\\Local\\Temp\\pi-claude-code-provider-images-B"],
+      "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp",
+      "C:\\Users\\runneradmin\\AppData\\Local\\Temp\\",
+    ),
+    [
+      "C:\\Users\\runneradmin\\AppData\\Local\\Temp\\pi-claude-code-provider-images-B",
+      "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\pi-claude-code-provider-images-B",
+    ],
+  );
+  // No alias, a directory elsewhere, and a sibling that only shares a prefix.
+  assert.deepEqual(privatePathSpellings(["/tmp/a"], "/tmp", "/tmp"), ["/tmp/a"]);
+  assert.deepEqual(privatePathSpellings(["/elsewhere/a"], "/var/t", "/private/var/t"), ["/elsewhere/a"]);
+  assert.deepEqual(privatePathSpellings(["/private/var/tx/a"], "/var/t", "/private/var/t"), ["/private/var/tx/a"]);
 });

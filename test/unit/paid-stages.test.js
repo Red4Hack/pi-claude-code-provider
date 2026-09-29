@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
-import { MINIMUM_TOOL_BEARING_CAP, PAID_STAGES, RELEASE_ORDER, releaseCap } from "../../scripts/lib/paid-stages.js";
+import { MINIMUM_TOOL_BEARING_CAP, PAID_STAGES, PINNED_STAGE_SETTINGS, RELEASE_ORDER, releaseCap, stageEnvironment } from "../../scripts/lib/paid-stages.js";
+import { WEB_SEARCH_ENV, webSearchSetting } from "../../src/web-search.ts";
 
 const developing = fileURLToPath(new URL("../../DEVELOPING.md", import.meta.url));
 
@@ -37,4 +38,20 @@ test("documented launch caps match the runner and each other", async () => {
     // so the maintainer authorizes the number of launches that can really occur.
     assert.equal(documented.get("release"), releaseCap(), "documented release cap does not match the release order");
     assert.deepEqual(RELEASE_ORDER.filter((name) => name in PAID_STAGES), RELEASE_ORDER);
+});
+
+test("every stage runs with web search registered, whatever the maintainer's shell says", () => {
+    // The release suite verifies visible web search, so an ambient opt-out must
+    // not fail the gate; the pin also has to track the provider's own name.
+    assert.equal(PINNED_STAGE_SETTINGS[WEB_SEARCH_ENV], "on");
+    for (const ambient of ["off", "0", "bogus"]) {
+        const environment = stageEnvironment({ [WEB_SEARCH_ENV]: ambient, KEEP: "ambient" }, { STAGE: "value", [WEB_SEARCH_ENV]: "off" });
+        assert.equal(webSearchSetting(environment), "on");
+        assert.equal(environment.KEEP, "ambient");
+        assert.equal(environment.STAGE, "value");
+    }
+});
+
+test("stage values override ambient values", () => {
+    assert.equal(stageEnvironment({ PI_OFFLINE: "0" }, { PI_OFFLINE: "1" }).PI_OFFLINE, "1");
 });

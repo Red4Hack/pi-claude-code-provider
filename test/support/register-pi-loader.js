@@ -1,3 +1,4 @@
+import "./test-environment.js";
 import { register } from "node:module";
 import { pathToFileURL } from "node:url";
 import { locatePiPackages, packageEntry } from "../../scripts/lib/pi-installation.js";

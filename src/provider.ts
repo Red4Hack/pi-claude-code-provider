@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
-import { access, stat } from "node:fs/promises";
-import { isAbsolute } from "node:path";
+import { access, realpath, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { isAbsolute, posix, win32 } from "node:path";
 import type {
   Api,
   AssistantMessageEventStream,
@@ -20,7 +21,7 @@ import { recordRequestMetrics } from "./metrics.ts";
 import { createOutput } from "./output.ts";
 import { claimPaidTestLaunch } from "./paid-launch-budget.ts";
 import { ProcessTerminationError, superviseProcess, type ProcessResult } from "./process-utils.ts";
-import { removeRuntimeDirectory } from "./runtime-directories.ts";
+import { privatePathSpellings, removeRuntimeDirectory } from "./runtime-directories.ts";
 import type { ImageStoreLease } from "./session-image-store.ts";
 import type { ResolvedSession, SessionRequest } from "./session-registry.ts";
 import { ClaudeEventMapper, type ClaudeTerminationCause } from "./stream-events.ts";
@@ -88,6 +89,8 @@ function recoverProviderContext(context: TranscriptContext): Context {
 }
 
 export interface ClaudeStreamDependencies {
+  /** Internal recorder seam; called once after this request's lifecycle settles. */
+  recordRequestMetrics?: typeof recordRequestMetrics;
   cleanupDirectory?: CleanupDirectory;
   claimLaunch?: ClaimLaunch;
   supervise?: typeof superviseProcess;
@@ -104,6 +107,7 @@ export function createClaudeStream(
   installation: ClaudeInstallation,
   dependencies: ClaudeStreamDependencies = {},
 ) {
+  const recordMetrics = dependencies.recordRequestMetrics ?? recordRequestMetrics;
   const cleanupDirectory = dependencies.cleanupDirectory ?? removeRuntimeDirectory;
   const claimLaunch = dependencies.claimLaunch ?? claimPaidTestLaunch;
   const supervise = dependencies.supervise ?? superviseProcess;
@@ -125,10 +129,10 @@ export function createClaudeStream(
     // Leased with the session, not after preparation: a request that borrowed a
     // store from another live session would otherwise fail across the awaits in
     // between if that session shut down, even carrying no images at all. close()
-    // waits on outstanding leases, so the directory survives for whoever holds
-    // one. A request that goes on to fail briefly holds a lease it never used,
-    // which is correct: the store must stay open for anything still able to
-    // write to it. The failure is carried rather than thrown, because this
+    // defers reclamation to outstanding leases, so the directory survives for
+    // whoever holds one. A request that goes on to fail briefly holds a lease
+    // it never used, which is correct: the store must stay open for anything
+    // still able to write to it. The failure is carried rather than thrown, because this
     // prologue must return a stream, not raise.
     let imageLease: ImageStoreLease | undefined;
     let leaseFailure: unknown;
@@ -156,6 +160,7 @@ export function createClaudeStream(
       let errorCategory: string | undefined;
       let processLivenessUnknown = false;
       let finalized = false;
+      let processingGate: ResponseProcessingGate | undefined;
       const metrics: RequestMetrics = {
         schemaVersion: 5,
         timestamp: new Date(startedAt).toISOString(),
@@ -207,12 +212,13 @@ export function createClaudeStream(
         const observe = options?.onResponse;
         if (!observe) return;
         const response: ProviderResponse = { status: 200, headers: {} };
-        try {
-          await observe(response, model);
-        } catch (error) {
+        const observation = Promise.resolve().then(() => observe(response, model)).catch((error: unknown) => {
           errorCategory ??= "response_hook";
           throw new ClaudeCodeError("response_hook", `Pi after_provider_response handler failed: ${errorText(error)}`);
-        }
+        });
+        // Initialization is consumed only after launch installs this gate. The
+        // observer's own rejection stays observed even if cancellation wins.
+        await processingGate!.wait(observation);
       };
 
       const stopForToolUse = (): void => {
@@ -239,6 +245,7 @@ export function createClaudeStream(
       const finalizeLifecycle = async (): Promise<void> => {
         if (finalized) return;
         finalized = true;
+        processingGate?.dispose();
         // Terminal stream publication belongs to the protocol boundary below;
         // this idempotent finalizer owns only request resources and metrics.
         claude?.dispose();
@@ -270,7 +277,7 @@ export function createClaudeStream(
         );
         metrics.exitCode = exitCode;
         metrics.exitSignal = exitSignal;
-        recordRequestMetrics(metrics);
+        recordMetrics(metrics);
       };
 
       try {
@@ -299,6 +306,14 @@ export function createClaudeStream(
         validateSystemPromptBudget(model, systemPromptTokens, options?.maxTokens, effort ?? "default");
         prepared = await prepareRequest(effectiveContext, imageLease);
         metrics.cleanupComplete = false;
+        // Both spellings of the temporary root, for the private-path guard and
+        // diagnostic redaction; see privatePathSpellings.
+        const lexicalTempRoot = tmpdir();
+        const privateDirectories = privatePathSpellings(
+          [prepared.directory, ...(prepared.imageStoreDirectory ? [prepared.imageStoreDirectory] : [])],
+          lexicalTempRoot,
+          await realpath(lexicalTempRoot).catch(() => lexicalTempRoot),
+        );
         metrics.lastPhase = "prepared";
         metrics.imageCount = prepared.imageCount;
         metrics.transcriptBytes = prepared.transcriptBytes;
@@ -346,7 +361,7 @@ export function createClaudeStream(
           onLengthStop: stopForLength,
           onRateLimitNotice,
           onResponseAnnouncement: announceResponse,
-          privatePaths: [prepared.directory, ...(prepared.imageStoreDirectory ? [prepared.imageStoreDirectory] : [])],
+          privatePaths: privateDirectories,
         });
 
         // Phase 2 — claim the launch, spawn Claude, and record exact ownership.
@@ -354,6 +369,11 @@ export function createClaudeStream(
         // request fails here without launching Claude or its MCP child, and the
         // catch path still removes the prepared private directory.
         await claimClaudeLaunch(options?.signal, claimLaunch);
+        processingGate = createResponseProcessingGate(totalTimeoutMs, (error) => {
+          errorCategory ??= "process";
+          mapper?.fail(error.message);
+          claude?.terminateInBackground();
+        });
         const running = spawnClaudeProcess({
           installation,
           args,
@@ -362,7 +382,7 @@ export function createClaudeStream(
             ...(prepared.catalogPath ? { PI_CLAUDE_TOOL_CATALOG: prepared.catalogPath } : {}),
           },
           directory: prepared.directory,
-          privatePaths: prepared.imageStoreDirectory ? [prepared.imageStoreDirectory] : [],
+          privatePaths: privateDirectories,
           cwd,
           stdin: "pipe",
           idleTimeoutMs,
@@ -374,12 +394,14 @@ export function createClaudeStream(
             if (error instanceof ProcessTerminationError) errorCategory = "process_cleanup";
             else if (vanished) errorCategory = "working_directory";
             else errorCategory ??= error instanceof ClaudeCodeError ? error.code : "process";
+            processingGate?.stop(vanished ?? error);
             mapper?.fail((vanished ?? error).message, options?.signal?.aborted === true);
           },
           onAbort() {
             terminationCause = "caller_abort";
             errorCategory = "aborted";
             metrics.terminationExpected = true;
+            processingGate?.stop(new ClaudeCodeError("aborted", "Claude Code request was aborted"));
             mapper?.fail("Claude Code request was aborted", true);
           },
           onBackgroundTerminationFailure() {
@@ -390,7 +412,6 @@ export function createClaudeStream(
         });
         claude = running;
         metrics.lastPhase = "spawned";
-        await running.recordOwnership();
 
         // Phase 3 — consume and validate Claude's ordered JSONL protocol.
         const { child } = running;
@@ -398,6 +419,7 @@ export function createClaudeStream(
         const failProtocol = (error: unknown): void => {
           if (mapper?.isTerminal) return;
           errorCategory ??= error instanceof ClaudeCodeError ? error.code : "protocol";
+          processingGate?.stop(error);
           mapper?.fail(errorText(error));
           running.terminateInBackground();
         };
@@ -439,6 +461,10 @@ export function createClaudeStream(
         child.stdout?.on("end", finishStdout);
         child.stdout?.once("close", finishStdout);
         if (!child.stdout) finishStdout();
+        // Only after stdout has a consumer: when a child exits, Node resumes any
+        // unconsumed stdio stream and discards what it buffered, so awaiting the
+        // marker write first could lose a fast-exiting Claude's whole output.
+        await running.recordOwnership();
 
         if (prepared.readyPath) {
           const currentMapper = mapper;
@@ -462,10 +488,11 @@ export function createClaudeStream(
         }
 
         const result = await running.supervisor.wait();
-        await stdoutDone;
         exitCode = result.code;
         exitSignal = result.signal;
         metrics.lastPhase = "process_exited";
+        await processingGate.wait(stdoutDone);
+        processingGate.dispose();
         await running.terminate();
 
         // Phase 4 — validate the exit and private state before publishing success.
@@ -473,6 +500,8 @@ export function createClaudeStream(
           mapper,
           output,
           prepared,
+          cwd,
+          privateDirectories,
           result,
           handoff: toolUse ? "tool" : lengthStop ? "length" : undefined,
           stderrExcerpt: () => running.stderrExcerpt(),
@@ -513,7 +542,9 @@ export function createClaudeStream(
             // A consumer may already have observed this terminal (notably on
             // abort), so the append is best-effort; finalized metrics are the
             // authoritative cleanup-status record.
-            output.errorMessage = output.errorMessage ? `${output.errorMessage}; ${failure}` : failure;
+            if (output.errorMessage !== failure) {
+              output.errorMessage = output.errorMessage ? `${output.errorMessage}; ${failure}` : failure;
+            }
           }
           else mapper.fail(failure, options?.signal?.aborted === true);
         }
@@ -532,10 +563,45 @@ export function createClaudeStream(
   };
 }
 
+interface ResponseProcessingGate {
+  wait<T>(pending: Promise<T>): Promise<T>;
+  stop(error: unknown): void;
+  dispose(): void;
+}
+
+/** The launch deadline also bounds ordered processing after the child's exit. */
+function createResponseProcessingGate(timeoutMs: number, onTimeout: (error: Error) => void): ResponseProcessingGate {
+  let rejectFailure: (error: unknown) => void;
+  const failure = new Promise<never>((_resolve, reject) => { rejectFailure = reject; });
+  // A process failure can arrive before the first observer or stdout wait.
+  void failure.catch(() => {});
+  let stopped = false;
+  const stop = (error: unknown): void => {
+    if (stopped) return;
+    stopped = true;
+    clearTimeout(timer);
+    rejectFailure(error);
+  };
+  const timer = setTimeout(() => {
+    const error = new Error(`Claude Code request exceeded ${timeoutMs}ms while processing its response`);
+    stop(error);
+    onTimeout(error);
+  }, timeoutMs);
+  // Keep a headless host alive after Claude exits until processing settles.
+  return {
+    wait: <T>(pending: Promise<T>) => Promise.race([pending, failure]),
+    stop,
+    dispose: () => { clearTimeout(timer); },
+  };
+}
+
 interface ExitSettlement {
   mapper: ClaudeEventMapper;
   output: MutableOutput;
   prepared: { directory: string; imageStoreDirectory?: string; violationPath?: string };
+  cwd: string;
+  /** Every spelling of the request and image directories. */
+  privateDirectories: readonly string[];
   result: ProcessResult;
   handoff: "tool" | "length" | undefined;
   stderrExcerpt: () => string;
@@ -558,7 +624,10 @@ interface ExitOutcome {
  */
 async function settleExit(settlement: ExitSettlement): Promise<ExitOutcome> {
   const { mapper, output, prepared, result, cleanup, failureAfterCleanup } = settlement;
-  const exit = `code ${String(result.code)}, signal ${String(result.signal)}`;
+  // A closed stdin is evidence, not the cause: the supervisor defers it so the
+  // exit and Claude's own output explain the failure, and it is named here.
+  const exit = `code ${String(result.code)}, signal ${String(result.signal)}` +
+    (result.stdinClosed ? "; Claude Code closed its input before the prompt was written" : "");
   const stderrDetail = (): string => {
     const excerpt = settlement.stderrExcerpt();
     return excerpt ? `: ${excerpt}` : "";
@@ -587,7 +656,7 @@ async function settleExit(settlement: ExitSettlement): Promise<ExitOutcome> {
     if (prepared.violationPath && (await pathExists(prepared.violationPath))) {
       return fail("mcp_execution", true, "Security invariant violated: Claude Code attempted to execute a Pi proposal tool internally");
     }
-    if (containsPrivateTransportToolArgument(output, [prepared.directory, ...(prepared.imageStoreDirectory ? [prepared.imageStoreDirectory] : [])])) {
+    if (containsPrivateTransportToolArgument(output, settlement.privateDirectories, settlement.cwd)) {
       return fail("private_transport", true, "Claude Code proposed a Pi tool call against provider-private transport state");
     }
     return settleHandoff("tool handoff", isExpectedToolHandoffExit(result), () => mapper.completeToolUse());
@@ -895,20 +964,39 @@ async function pathExists(path: string): Promise<boolean> {
   }
 }
 
-function containsPrivateTransportToolArgument(output: MutableOutput, directories: readonly string[]): boolean {
-  // Normalize the needles once: tool arguments can carry hundreds of kilobytes
-  // of model-authored text, and this scan runs over every one of them.
-  const normalizedDirectories = directories.map((directory) => directory.normalize("NFC"));
+function containsPrivateTransportToolArgument(output: MutableOutput, directories: readonly string[], cwd: string): boolean {
   return output.content.some(
-    (block) => block.type === "toolCall" && normalizedDirectories.some((directory) => containsPrivateTransportPath(block.arguments, directory)),
+    (block) => block.type === "toolCall" && directories.some((directory) => containsPrivateTransportPath(block.arguments, directory, cwd)),
   );
 }
 
-function containsPrivateTransportPath(value: unknown, directory: string): boolean {
-  if (typeof value === "string") return value.normalize("NFC").includes(directory);
-  if (Array.isArray(value)) return value.some((item) => containsPrivateTransportPath(item, directory));
+/** Internal test seam for native path rules, including Windows on a POSIX host. */
+export function containsPrivateTransportPath(
+  value: unknown,
+  directory: string,
+  cwd: string,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  if (typeof value === "string") {
+    const paths = platform === "win32" ? win32 : posix;
+    const spelling = (path: string): string => {
+      const normalized = path.normalize("NFC");
+      // macOS volumes are case-insensitive by default; folding there can only add
+      // matches on a case-sensitive one, which is the safe side for this guard.
+      if (platform === "win32") return normalized.replace(/\\/g, "/").toLowerCase();
+      return platform === "darwin" ? normalized.toLowerCase() : normalized;
+    };
+    // Literal references also catch paths embedded in commands. Complete
+    // values additionally get native path resolution; this does not interpret
+    // shell expressions or follow symlinks.
+    if (spelling(value).includes(spelling(directory))) return true;
+    const target = spelling(paths.resolve(cwd, value));
+    const root = spelling(paths.resolve(directory)).replace(/\/+$/, "");
+    return target === root || target.startsWith(`${root}/`);
+  }
+  if (Array.isArray(value)) return value.some((item) => containsPrivateTransportPath(item, directory, cwd, platform));
   if (!value || typeof value !== "object") return false;
-  return Object.values(value as Record<string, unknown>).some((item) => containsPrivateTransportPath(item, directory));
+  return Object.values(value as Record<string, unknown>).some((item) => containsPrivateTransportPath(item, directory, cwd, platform));
 }
 
 async function applyPayloadHook(model: Model<Api>, context: Context, options?: SimpleStreamOptions): Promise<Context> {

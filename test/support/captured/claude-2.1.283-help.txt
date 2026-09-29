@@ -61,6 +61,12 @@ Options:
   --brief                               Enable SendUserMessage tool for
                                         agent-to-user communication
   --chrome                              Enable Claude in Chrome integration
+  --client-data-url <url>               URL for a signed configuration document.
+                                        Claude Code exits if it cannot load it
+                                        or it does not cover the selected model.
+                                        Setting CLAUDE_CODE_CLIENT_DATA_URL
+                                        instead keeps the URL out of the process
+                                        list
   --cloud [description|session_id|url]  Create a cloud session with the given
                                         description, or attach to an existing
                                         one by session ID or claude.ai/code URL

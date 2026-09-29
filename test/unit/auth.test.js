@@ -3,7 +3,7 @@ import { chmod, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { REQUIRED_HEADLESS_FLAGS, buildClaudeEnvironment, inspectClaudeInstallation, parseAuthStatus, validateClaudeCapabilities } from "../../src/auth.ts";
+import { REQUIRED_HEADLESS_FLAGS, buildClaudeEnvironment, inspectClaudeInstallation, parseAuthStatus, validateClaudeCapabilities, windowsCommandShim } from "../../src/auth.ts";
 import { MINIMUM_VERSIONS, meetsMinimumVersion } from "../../src/compatibility.ts";
 import { validateProcessTerminationCapability, windowsTaskkillExecutable } from "../../src/process-utils.ts";
 import { CAPTURED_CLAUDE_VERSION, CLAUDE_HEADLESS_HELP, ELIGIBLE_CLAUDE_AUTH, ELIGIBLE_CLAUDE_AUTH_JSON } from "../support/claude-fixture.js";
@@ -170,6 +170,48 @@ else process.stdout.write(${JSON.stringify(CLAUDE_HEADLESS_HELP)});
         const installation = await inspectClaudeInstallation();
         assert.equal(installation.executable, await realpath(claude));
         assert.equal(installation.subscriptionType, "pro");
+    }
+    finally {
+        if (original.path === undefined) delete process.env.PATH; else process.env.PATH = original.path;
+        if (original.pathExt === undefined) delete process.env.PATHEXT; else process.env.PATHEXT = original.pathExt;
+        if (original.override === undefined) delete process.env.PI_CLAUDE_CODE_PROVIDER_PATH; else process.env.PI_CLAUDE_CODE_PROVIDER_PATH = original.override;
+        await rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    }
+});
+
+test("recognizes Windows command shims only on Windows", () => {
+    for (const path of ["C:\\npm\\claude.cmd", "C:\\npm\\claude.CMD", "claude.bat"]) {
+        assert.equal(windowsCommandShim(path, "win32"), true, path);
+        assert.equal(windowsCommandShim(path, "linux"), false, path);
+        assert.equal(windowsCommandShim(path, "darwin"), false, path);
+    }
+    for (const path of ["C:\\claude.exe", "C:\\cli.cjs", "claude", "C:\\cmd\\claude.exe"]) {
+        assert.equal(windowsCommandShim(path, "win32"), false, path);
+    }
+});
+
+test("names a Windows command shim instead of failing to spawn it", { skip: process.platform !== "win32" }, async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-claude-code-provider-auth-shim-"));
+    const shim = join(directory, "claude.cmd");
+    await writeFile(shim, "@echo off\r\n");
+    const original = { path: process.env.PATH, pathExt: process.env.PATHEXT, override: process.env.PI_CLAUDE_CODE_PROVIDER_PATH };
+    try {
+        process.env.PI_CLAUDE_CODE_PROVIDER_PATH = shim;
+        await assert.rejects(inspectClaudeInstallation(), (error) => {
+            assert.equal(error.code, "executable_unsupported");
+            assert.match(error.message, /Windows command shim/);
+            assert.doesNotMatch(error.message, /EINVAL/);
+            return true;
+        });
+        // Found only as a shim on PATH: the not-found message says what it found.
+        delete process.env.PI_CLAUDE_CODE_PROVIDER_PATH;
+        process.env.PATH = directory;
+        process.env.PATHEXT = ".COM;.EXE;.BAT;.CMD";
+        await assert.rejects(inspectClaudeInstallation(), (error) => {
+            assert.equal(error.code, "executable_missing");
+            assert.match(error.message, /was not found on PATH.*Found .*claude\.cmd is a Windows command shim/);
+            return true;
+        });
     }
     finally {
         if (original.path === undefined) delete process.env.PATH; else process.env.PATH = original.path;

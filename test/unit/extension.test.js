@@ -1,18 +1,18 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { access, chmod, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, readdir, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
+import { waitFor, waitForRemoval } from "../support/wait.js";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { normalizeContext } from "@earendil-works/pi-ai";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, DefaultPackageManager, SettingsManager, formatSize } from "@earendil-works/pi-coding-agent";
-import initializePiClaudeCodeProvider from "../../extensions/index.ts";
-import implementation from "../../extensions/pi-claude-code-provider.ts";
+import initializePiClaudeCodeProvider from "../../index.ts";
 import { VERIFIED_VERSIONS, platformStatus } from "../../src/compatibility.ts";
-import { CAPTURED_CLAUDE_HELP_PATH, ELIGIBLE_CLAUDE_AUTH } from "../support/claude-fixture.js";
-import { nodeFixtureSource } from "../support/node-fixture.js";
+import { claudeFixtureBody } from "../support/claude-fixture.js";
+import { createNodeFixture } from "../support/node-fixture.js";
 import { sessionRegistry } from "../../src/session-registry.ts";
 
 // Pi folds `systemPrompt` and `tools` into transcript system messages before a
@@ -67,9 +67,7 @@ function sessionContext(cwd, ui) {
     return { cwd, ui, sessionManager: { getSessionId: () => sessionId } };
 }
 
-async function createFakeClaude(searchResult = "ok", { searchDelayMs = 0, rateLimitInfo, reportCwd = false, providerTools = [], holdProviderUntilInput = false } = {}) {
-    const directory = await mkdtemp(join(tmpdir(), "pi-claude-code-provider-extension-"));
-    const executable = join(directory, process.platform === "win32" ? "claude.cjs" : "claude");
+async function createFakeClaude(searchResult = "ok", { searchDelayMs = 0, rateLimitInfo, reportCwd = false, providerTools = [] } = {}) {
     const rateLimitEvents = Array.isArray(rateLimitInfo) ? rateLimitInfo : rateLimitInfo ? [rateLimitInfo] : [];
     const init = { type: "system", subtype: "init", tools: ["WebFetch", "WebSearch"], mcp_servers: [], model: "claude-sonnet-5", permissionMode: "dontAsk", slash_commands: [], skills: [], plugins: [], apiKeySource: "none" };
     const providerInit = {
@@ -77,31 +75,20 @@ async function createFakeClaude(searchResult = "ok", { searchDelayMs = 0, rateLi
         tools: providerTools.map((name) => `mcp__pi__${name}`),
         mcp_servers: providerTools.length ? [{ name: "pi", status: "connected" }] : [],
     };
-    // Keep fake Claude JSONL visible in sandboxes that lose buffered Node child stdout.
-    await writeFile(executable, nodeFixtureSource(`
-if (process.argv.includes("--version")) process.stdout.write(${JSON.stringify(`${VERIFIED_VERSIONS.claudeCode}\n`)});
-else if (process.argv[2] === "auth" && process.argv[3] === "status") process.stdout.write(JSON.stringify(${JSON.stringify(ELIGIBLE_CLAUDE_AUTH)}));
-else if (process.argv.includes("--help")) process.stdout.write(require("node:fs").readFileSync(${JSON.stringify(CAPTURED_CLAUDE_HELP_PATH)}, "utf8"));
-else {
-  const mcpIndex = process.argv.indexOf("--mcp-config");
-  if (mcpIndex >= 0) {
-    const ready = JSON.parse(process.argv[mcpIndex + 1]).mcpServers?.pi?.env?.PI_CLAUDE_TOOL_READY;
-    if (ready) require("node:fs").writeFileSync(ready, "ready\\n", { flag: "wx" });
-  }
+    return createNodeFixture(claudeFixtureBody(`
   const providerMode = process.argv.includes("--system-prompt-file");
   const send = () => {
     process.stdout.write(JSON.stringify(providerMode ? ${JSON.stringify(providerInit)} : ${JSON.stringify(init)}) + "\\n");
     for (const rateLimitInfo of ${JSON.stringify(rateLimitEvents)}) process.stdout.write(JSON.stringify({type:"rate_limit_event",rate_limit_info:rateLimitInfo}) + "\\n");
     process.stdout.write(JSON.stringify({type:"result",is_error:false,result:${reportCwd ? "providerMode ? process.cwd() : " : ""}${JSON.stringify(searchResult)}}) + "\\n");
   };
-  if (providerMode && ${holdProviderUntilInput}) {
+  // Like Claude Code, a provider request consumes its stdin before answering.
+  // Answering and exiting first raced the provider's write into an EPIPE.
+  if (providerMode) {
     process.stdin.resume();
-    process.stdin.on("end", send);
+    process.stdin.on("end", () => setTimeout(send, ${searchDelayMs}));
   } else setTimeout(send, ${searchDelayMs});
-}
-`), { mode: 0o700 });
-    await chmod(executable, 0o700);
-    return { directory, executable };
+`, { preflight: true, writeReady: true, version: VERIFIED_VERSIONS.claudeCode }), { prefix: "pi-claude-code-provider-extension-" });
 }
 
 test("platform acknowledgement hides only the startup advisory and leaves doctor truthful", async (t) => {
@@ -139,7 +126,7 @@ test("platform acknowledgement hides only the startup advisory and leaves doctor
 test("sole-directory compatibility flag is required for a markerless tool-bearing side Agent", async () => {
     const parent = await mkdtemp(join(tmpdir(), "provider-extension-parent-"));
     const child = await mkdtemp(join(tmpdir(), "provider-extension-child-"));
-    const { directory, executable } = await createFakeClaude("ok", { reportCwd: true, providerTools: ["read"], holdProviderUntilInput: true });
+    const { directory, executable } = await createFakeClaude("ok", { reportCwd: true, providerTools: ["read"] });
     const oldPath = process.env.PI_CLAUDE_CODE_PROVIDER_PATH;
     const oldBorrow = process.env.PI_CLAUDE_CODE_PROVIDER_BORROW_SOLE_DIRECTORY;
     process.env.PI_CLAUDE_CODE_PROVIDER_PATH = executable;
@@ -568,6 +555,97 @@ test("an exhausted subscription window reaches Pi as a stop, not as a retryable 
     }
 });
 
+async function withWebSearchSetting(value, body) {
+    const { directory, executable } = await createFakeClaude();
+    const originalPath = process.env.PI_CLAUDE_CODE_PROVIDER_PATH;
+    const originalSetting = process.env.PI_CLAUDE_CODE_PROVIDER_WEB_SEARCH;
+    process.env.PI_CLAUDE_CODE_PROVIDER_PATH = executable;
+    if (value === undefined) delete process.env.PI_CLAUDE_CODE_PROVIDER_WEB_SEARCH;
+    else process.env.PI_CLAUDE_CODE_PROVIDER_WEB_SEARCH = value;
+    try {
+        await body();
+    } finally {
+        if (originalPath === undefined) delete process.env.PI_CLAUDE_CODE_PROVIDER_PATH;
+        else process.env.PI_CLAUDE_CODE_PROVIDER_PATH = originalPath;
+        if (originalSetting === undefined) delete process.env.PI_CLAUDE_CODE_PROVIDER_WEB_SEARCH;
+        else process.env.PI_CLAUDE_CODE_PROVIDER_WEB_SEARCH = originalSetting;
+        await rm(directory, { recursive: true, force: true });
+    }
+}
+
+async function startAndRunDoctor(pi) {
+    const notices = [];
+    const ctx = sessionContext(tmpdir(), { notify(message, level) { notices.push({ message, level }); } });
+    pi.handlers.get("session_start")[0]({}, ctx);
+    const startupNotices = [...notices];
+    await pi.commands.get("pi-claude-code-provider-doctor").handler("", ctx);
+    const doctor = notices.slice(startupNotices.length).map(({ message }) => message).join("\n");
+    await pi.handlers.get("session_shutdown")[0]({}, {});
+    return { startupNotices, doctor };
+}
+
+test("web search is registered by default with guidance that defers to other search tools", async () => {
+    await withWebSearchSetting(undefined, async () => {
+        const pi = fakePi();
+        await piClaudeCodeProvider(pi.api);
+        const beforeSession = [];
+        await pi.commands.get("pi-claude-code-provider-doctor").handler("", sessionContext(tmpdir(), {
+            notify(message) { beforeSession.push(message); },
+        }));
+        assert.match(beforeSession.join("\n"), /^Web search: not registered yet \(no session started\)$/m);
+        const { doctor } = await startAndRunDoctor(pi);
+        const search = pi.tools.get("pi_claude_code_provider_web_search");
+        assert.ok(search);
+        assert.deepEqual(search.promptGuidelines, [
+            "Use pi_claude_code_provider_web_search for current external information or online sources only when no other web-search tool is available or the user asks for it.",
+        ]);
+        assert.match(doctor, /^Web search: enabled$/m);
+    });
+});
+
+test("web search switched off registers no tool and says nothing, while the provider stays available", async () => {
+    await withWebSearchSetting("off", async () => {
+        const pi = fakePi();
+        await piClaudeCodeProvider(pi.api);
+        const { startupNotices, doctor } = await startAndRunDoctor(pi);
+        assert.equal(pi.tools.has("pi_claude_code_provider_web_search"), false);
+        assert.ok(pi.providers.has("pi-claude-code-provider"));
+        assert.equal(startupNotices.some(({ message }) => message.includes("pi_claude_code_provider_web_search")), false);
+        assert.match(doctor, /^Web search: disabled \(PI_CLAUDE_CODE_PROVIDER_WEB_SEARCH=off\)$/m);
+    });
+});
+
+test("web search switched off does not warn about an occupied name", async () => {
+    await withWebSearchSetting("off", async () => {
+        const existingSearch = { name: "pi_claude_code_provider_web_search", owner: "other-extension" };
+        const pi = fakePi([existingSearch]);
+        await piClaudeCodeProvider(pi.api);
+        const { startupNotices } = await startAndRunDoctor(pi);
+        assert.equal(pi.tools.get("pi_claude_code_provider_web_search"), existingSearch);
+        assert.equal(startupNotices.some(({ message }) => message.includes("already occupied")), false);
+    });
+});
+
+test("an unrecognized web-search switch leaves the tool unregistered with one warning", async () => {
+    await withWebSearchSetting("0", async () => {
+        const pi = fakePi();
+        await piClaudeCodeProvider(pi.api);
+        const { startupNotices, doctor } = await startAndRunDoctor(pi);
+        assert.equal(pi.tools.has("pi_claude_code_provider_web_search"), false);
+        assert.ok(pi.providers.has("pi-claude-code-provider"));
+        const warnings = startupNotices.filter(({ message }) => message.includes("PI_CLAUDE_CODE_PROVIDER_WEB_SEARCH"));
+        assert.equal(warnings.length, 1);
+        assert.equal(warnings[0].level, "warning");
+        assert.match(warnings[0].message, /^\[pi-claude-code-provider\] pi_claude_code_provider_web_search was not registered: PI_CLAUDE_CODE_PROVIDER_WEB_SEARCH must be "on" or "off"$/);
+        assert.match(doctor, /^Web search: not registered \(PI_CLAUDE_CODE_PROVIDER_WEB_SEARCH must be "on" or "off"\)$/m);
+        // Registration is attempted once per instance, so a later session does not repeat it.
+        const later = [];
+        pi.handlers.get("session_start")[0]({}, sessionContext(tmpdir(), { notify(message, level) { later.push({ message, level }); } }));
+        assert.equal(later.some(({ message }) => message.includes("PI_CLAUDE_CODE_PROVIDER_WEB_SEARCH")), false);
+        await pi.handlers.get("session_shutdown")[0]({}, {});
+    });
+});
+
 test("provider requests run Claude in the current Pi session's directory, never the host process cwd", async () => {
     const { directory, executable } = await createFakeClaude("ok", { reportCwd: true });
     const sessionB = await mkdtemp(join(tmpdir(), "pi-claude-code-provider-session-b-"));
@@ -788,9 +866,7 @@ test("session shutdown does not wait for a request Pi has not cancelled yet", as
             .then((result) => { settled = true; return result; });
         // Wait for the image to be stored, so a lease is certainly held and there is
         // a directory whose retention can be observed.
-        for (let attempt = 0; attempt < 300 && (await imageDirectories()).length === before.length; attempt += 1) {
-            await new Promise((resolve) => setTimeout(resolve, 10));
-        }
+        await waitFor(async () => (await imageDirectories()).length > before.length, "image-store acquisition");
         const opened = (await imageDirectories()).filter((name) => !before.includes(name));
         assert.equal(opened.length, 1, "the request never opened the session image store");
         retained = join(tmpdir(), opened[0]);
@@ -804,9 +880,7 @@ test("session shutdown does not wait for a request Pi has not cancelled yet", as
         // Nothing else can: session_shutdown has already run, and on Windows there
         // is no stale-state pass to fall back on. release() does not await the
         // removal, so poll for it.
-        for (let attempt = 0; attempt < 300 && (await imageDirectories()).includes(opened[0]); attempt += 1) {
-            await new Promise((resolve) => setTimeout(resolve, 10));
-        }
+        await waitForRemoval(retained);
         await assert.rejects(access(retained), "the session image directory was never reclaimed");
     }
     finally {
@@ -886,15 +960,14 @@ test("a Pi without Pi-AI's compat entrypoint still gets the provider", async () 
     }
 });
 
-test("Pi resolves the package to its index entry, which re-exports the implementation", async () => {
+test("Pi resolves the package to its sole root entry", async () => {
     // An index entry keeps Pi's startup extension label to the bare package name.
     const packageRoot = fileURLToPath(new URL("../..", import.meta.url));
     const agentDir = await mkdtemp(join(tmpdir(), "pi-claude-code-provider-agent-"));
     try {
         const packageManager = new DefaultPackageManager({ cwd: packageRoot, agentDir, settingsManager: SettingsManager.inMemory() });
         const resolved = await packageManager.resolveExtensionSources([packageRoot], { temporary: true });
-        assert.deepEqual(resolved.extensions.map((extension) => extension.path), [join(packageRoot, "extensions", "index.ts")]);
-        assert.equal(initializePiClaudeCodeProvider, implementation);
+        assert.deepEqual(resolved.extensions.map((extension) => extension.path), [join(packageRoot, "index.ts")]);
     } finally {
         await rm(agentDir, { recursive: true, force: true });
     }

@@ -10,7 +10,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { ClaudeEventMapper as EventMapper, argumentPreviewDue } from "../../src/stream-events.ts";
 import { createOutput } from "../../src/output.ts";
-import { PROVIDER_INIT_FIELDS, initRecord as claudeInitRecord, streamRecoveryRecords } from "../support/claude-fixture.js";
+import { PROVIDER_INIT_FIELDS, initRecord as claudeInitRecord, streamRecoveryRecords, toolUseEvents } from "../support/claude-fixture.js";
 
 function makeMapper(stream, output, expectedTools, toolNames, onToolUse, onRateLimitNotice, onResponseAnnouncement) {
     return new EventMapper({ stream, output, expectedTools, toolNames, onToolUse, onRateLimitNotice, onResponseAnnouncement });
@@ -32,6 +32,93 @@ const model = {
 function initRecord(tools = [], mcpServers = []) {
     return claudeInitRecord(PROVIDER_INIT_FIELDS, { tools, mcp_servers: mcpServers });
 }
+
+function initializedToolMapper(toolNames) {
+    const stream = createAssistantMessageEventStream();
+    const output = createOutput(model);
+    const tools = [...toolNames.keys()];
+    const mapper = makeMapper(stream, output, new Set(tools), toolNames, () => {});
+    mapper.accept(initRecord(tools, tools.length ? [{ name: "pi", status: "connected" }] : []));
+    return { stream, output, mapper };
+}
+
+const defaultToolArguments = {
+    bash: { command: "printf hello", timeout: 2 },
+    read: { path: "README.md", offset: 1, limit: 3 },
+    edit: { path: "example.txt", edits: [{ oldText: "before", newText: "after" }] },
+    write: { path: "example.txt", content: "hello" },
+};
+for (const [piName, args] of Object.entries(defaultToolArguments)) {
+    for (const name of [piName, `mcp__pi__${piName}`]) {
+        test(`maps active ${name} to Pi ${piName} without changing the call`, async () => {
+            const { stream, output, mapper } = initializedToolMapper(new Map([[`mcp__pi__${piName}`, piName]]));
+            const events = [];
+            const consume = (async () => {
+                for await (const event of stream) events.push(structuredClone(event));
+            })();
+            for (const record of toolUseEvents({ messageId: "msg_name", toolUseId: "toolu_name", name, partialJson: JSON.stringify(args) })) {
+                mapper.accept(record);
+            }
+            assert.equal(mapper.completeToolUse(), true);
+            await consume;
+            const expected = { type: "toolCall", id: "toolu_name", name: piName, arguments: args };
+            assert.equal((await stream.result()).stopReason, "toolUse");
+            assert.deepEqual(output.content, [expected]);
+            assert.deepEqual(events.map((event) => event.type), ["start", "toolcall_start", "toolcall_delta", "toolcall_end", "done"]);
+            for (const event of events.filter((event) => event.type.startsWith("toolcall_"))) {
+                assert.equal(event.partial.content[event.contentIndex].name, piName);
+                assert.equal(event.partial.content[event.contentIndex].id, "toolu_name");
+            }
+            assert.deepEqual(events.find((event) => event.type === "toolcall_end").toolCall, expected);
+        });
+    }
+}
+
+test("bare default-name recovery does not convert Claude Code arguments", async () => {
+    const { mapper, stream } = initializedToolMapper(new Map([["mcp__pi__edit", "edit"]]));
+    const args = { file_path: "example.txt", old_string: "before", new_string: "after", replace_all: true };
+    for (const record of toolUseEvents({ messageId: "msg_args", toolUseId: "toolu_args", name: "edit" })) {
+        if (record.event.type === "content_block_start") record.event.content_block.input = args;
+        mapper.accept(record);
+    }
+    mapper.completeToolUse();
+    assert.deepEqual((await stream.result()).content[0].arguments, args);
+});
+
+test("bare recovery excludes case variants, arbitrary tools, aliases, and foreign namespaces", () => {
+    const names = new Map(["bash", "read", "edit", "write", "grep", "find", "ls", "powershell", "custom", "Bash", "Read", "Edit", "Write"].map((name) => [`mcp__pi__${name}`, name]));
+    names.set("mcp__pi__tool_1234567890abcdef", "odd tool/name");
+    const rejected = [
+        ...["bash", "read", "edit", "write"].flatMap((name) => [name[0].toUpperCase() + name.slice(1), name.toUpperCase(), name[0] + name.slice(1).toUpperCase(), ` ${name}`, `${name} `]),
+        "grep", "find", "ls", "powershell", "custom", "odd tool/name", "tool_1234567890abcdef", "mcp__other__bash", "mcp__pi__BASH", "", null,
+    ];
+    for (const name of rejected) {
+        const { mapper } = initializedToolMapper(names);
+        mapper.accept({ type: "stream_event", event: { type: "message_start", message: { id: "msg_rejected", usage: {} } } });
+        assert.throws(() => mapper.accept({ type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "toolu_rejected", name, input: {} } } }),
+            (error) => error.code === "tool_unknown", String(name));
+    }
+});
+
+test("bare defaults require their same active lowercase mapping", () => {
+    for (const piName of ["bash", "read", "edit", "write"]) {
+        for (const names of [new Map(), new Map([[`mcp__pi__${piName}`, "different"]])]) {
+            const { mapper } = initializedToolMapper(names);
+            mapper.accept({ type: "stream_event", event: { type: "message_start", message: { id: "msg_inactive", usage: {} } } });
+            assert.throws(() => mapper.accept({ type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "toolu_inactive", name: piName, input: {} } } }),
+                (error) => error.code === "tool_unknown");
+        }
+    }
+});
+
+test("exact advertised custom and capitalized names retain their mapping", async () => {
+    for (const [transportName, piName] of [["mcp__pi__Bash", "Bash"], ["mcp__pi__custom", "custom"], ["mcp__pi__tool_1234567890abcdef", "odd tool/name"]]) {
+        const { mapper, stream } = initializedToolMapper(new Map([[transportName, piName], ["mcp__pi__bash", "bash"]]));
+        for (const record of toolUseEvents({ messageId: "msg_exact", toolUseId: "toolu_exact", name: transportName })) mapper.accept(record);
+        mapper.completeToolUse();
+        assert.equal((await stream.result()).content[0].name, piName);
+    }
+});
 
 test("maps text, thinking, tool arguments, usage, and tool termination", async () => {
     const stream = createAssistantMessageEventStream();
@@ -517,9 +604,11 @@ test("rejects malformed results and accepts future stop reasons", () => {
         () => make().accept({ type: "result", is_error: false, result: { forged: true } }),
         /non-string result field/,
     );
-    for (const stopReason of ["future_reason", "model_context_window_exceeded", "pause_turn", "refusal"]) {
+    for (const stopReason of ["future_reason", "model_context_window_exceeded", "pause_turn"]) {
         assert.doesNotThrow(() => make().accept({ type: "stream_event", event: { type: "message_delta", delta: { stop_reason: stopReason } } }));
     }
+    // A refusal is the one stop reason that ends the response as a failure.
+    assert.throws(() => make().accept({ type: "stream_event", event: { type: "message_delta", delta: { stop_reason: "refusal" } } }), /refused to complete the request/);
     const duplicate = make();
     duplicate.accept({ type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } } });
     assert.throws(() => duplicate.accept({ type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } } }), /Duplicate content block/);
@@ -529,9 +618,13 @@ test("preserves result errors and accepts future result stop reasons", async () 
     const successStream = createAssistantMessageEventStream();
     const successMapper = makeMapper(successStream, createOutput(model), new Set(), new Map(), () => { });
     init(successMapper);
-    successMapper.accept({ type: "result", is_error: false, result: "declined", stop_reason: "refusal" });
+    successMapper.accept({ type: "result", is_error: false, result: "paused", stop_reason: "pause_turn" });
     successMapper.completeResult();
     assert.equal((await successStream.result()).stopReason, "stop");
+    // Claude Code reports an unrecovered refusal as a success result with a refusal stop.
+    const refusedMapper = makeMapper(createAssistantMessageEventStream(), createOutput(model), new Set(), new Map(), () => { });
+    init(refusedMapper);
+    assert.throws(() => refusedMapper.accept({ type: "result", is_error: false, result: "declined", stop_reason: "refusal" }), /refused to complete the request/);
 
     const errorStream = createAssistantMessageEventStream();
     const errorMapper = makeMapper(errorStream, createOutput(model), new Set(), new Map(), () => { });
@@ -887,6 +980,128 @@ test("reports a prompt too long for the window as an overflow Pi compacts", asyn
     // Repeating the same oversized request cannot succeed.
     assert.equal(isRetryableAssistantError(message), false, message.errorMessage);
 });
+// A safety classifier's refusal, whatever Claude Code does next. Repeating the turn
+// would be refused again, so none of these may reach Pi's retry.
+const REFUSED = [
+    ["refusal", "a refusal Claude Code retries once on the same model"],
+    ["refusal-twice", "a refusal Claude Code could not recover from"],
+    ["refusal-empty", "a refusal before any content"],
+];
+for (const [scenario, shape] of REFUSED) {
+    test(`reports a final, non-retryable refusal: ${shape}`, async () => {
+        const { message, events, rejected } = await replayCapture(scenario);
+        assert.equal(message.stopReason, "error");
+        assert.equal(rejected?.code, "refusal");
+        assert.equal(message.errorMessage, "The model refused to complete the request (safety classifier category: cyber, model claude-sonnet-5)");
+        assert.equal(isRetryableAssistantError(message), false, message.errorMessage);
+        assert.equal(events.filter((event) => event.type === "done" || event.type === "error").length, 1);
+        const started = events.filter((event) => /^(text|thinking|toolcall)_start$/.test(event.type)).map((event) => event.contentIndex);
+        assert.deepEqual(started, [...new Set(started)]);
+    });
+}
+test("reports a refusal Claude Code re-runs on a fallback model as a final refusal", async () => {
+    // Claude Code 2.1.283 emitted this sequence for a flagged Fable 5.1 response that it
+    // re-ran on Opus 4.8, before switchModelsOnFlag was pinned off. The loopback capture
+    // reaches that branch only through non-public Claude Code switches, so the sequence is
+    // written out here instead of captured. A managed policy can still re-enable it.
+    const stream = createAssistantMessageEventStream();
+    const output = createOutput(model);
+    const mapper = makeMapper(stream, output, new Set(), new Map(), () => { });
+    init(mapper);
+    const records = [
+        { type: "stream_event", event: { type: "message_start", message: { id: "msg_1", model: "claude-fable-5-1", usage: {} } } },
+        { type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } } },
+        { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "partial before the flag" } } },
+        { type: "stream_event", event: { type: "content_block_stop", index: 0 } },
+        {
+            type: "system", subtype: "model_refusal_fallback", trigger: "refusal", direction: "retry", scope: "session",
+            original_model: "claude-fable-5-1", fallback_model: "claude-opus-4-8", request_id: null,
+            api_refusal_category: "cyber", api_refusal_explanation: null,
+            content: "Fable 5.1's safeguards flagged this message. Switched to Opus 4.8. Learn more: https://support.claude.com/en/articles/15363606",
+        },
+        { type: "stream_event", event: { type: "message_delta", delta: { stop_reason: "refusal", stop_sequence: null }, usage: {} } },
+        { type: "stream_event", event: { type: "message_stop" } },
+        { type: "stream_event", event: { type: "message_start", message: { id: "msg_2", model: "claude-opus-4-8", usage: {} } } },
+    ];
+    let rejected;
+    for (const record of records) {
+        try {
+            mapper.accept(record);
+        }
+        catch (error) {
+            rejected = error;
+            mapper.fail(error.message);
+            break;
+        }
+    }
+    const message = await stream.result();
+    assert.equal(rejected?.code, "refusal");
+    // Claude Code's own notice is never repeated: its text is not validated.
+    assert.equal(message.errorMessage, "The model refused to complete the request (safety classifier category: cyber, model claude-fable-5-1)");
+    assert.equal(isRetryableAssistantError(message), false);
+});
+test("repeats only validated tokens in a refusal", () => {
+    const mapper = makeMapper(createAssistantMessageEventStream(), createOutput(model), new Set(), new Map(), () => { });
+    init(mapper);
+    mapper.accept({ type: "stream_event", event: { type: "message_start", message: { id: "msg_1", model: "claude-opus-5-5", usage: {} } } });
+    // Free text is never repeated, and neither is a plain token Pi would read as a
+    // transient error: either would turn the refusal back into a retry.
+    assert.throws(
+        () => mapper.accept({ type: "system", subtype: "model_refusal_no_fallback", original_model: "claude opus", api_refusal_category: "overloaded 529 retry" }),
+        (error) => error.code === "refusal" && error.message === "The model refused to complete the request (model claude-opus-5-5)",
+    );
+    for (const [category, servedModel, expected] of [
+        ["overloaded", "claude-opus-5-5", "The model refused to complete the request (model claude-opus-5-5)"],
+        ["cyber", "claude-opus-500", "The model refused to complete the request (safety classifier category: cyber)"],
+        ["server_error", "timeout", "The model refused to complete the request"],
+    ]) {
+        const fresh = makeMapper(createAssistantMessageEventStream(), createOutput(model), new Set(), new Map(), () => { });
+        init(fresh);
+        assert.throws(
+            () => fresh.accept({ type: "system", subtype: "model_refusal_no_fallback", original_model: servedModel, api_refusal_category: category }),
+            (error) => {
+                assert.equal(error.message, expected);
+                assert.equal(isRetryableAssistantError({ stopReason: "error", errorMessage: error.message }), false);
+                return true;
+            },
+        );
+    }
+});
+test("ignores a refusal from Claude Code's next internal turn after a tool handoff", async () => {
+    // The provider is already terminating Claude; the complete proposal stands.
+    const { stream, mapper } = readyToolMapper();
+    mapper.accept({ type: "system", subtype: "model_refusal_no_fallback", original_model: "claude-fable-5-1", api_refusal_category: "cyber" });
+    mapper.accept({ type: "assistant", message: { id: "synthetic", model: "<synthetic>", stop_reason: "refusal", content: [] } });
+    assert.equal(mapper.completeToolUse(), true);
+    assert.equal((await stream.result()).stopReason, "toolUse");
+});
+test("treats a fallback-model switch after the response starts as a retryable interruption", async () => {
+    const fallback = { type: "system", subtype: "model_fallback", trigger: "overloaded", original_model: "claude-opus-5-5", fallback_model: "claude-sonnet-5" };
+    // Before the response starts, the switch is an ordinary pre-stream retry.
+    const early = makeMapper(createAssistantMessageEventStream(), createOutput(model), new Set(), new Map(), () => { });
+    init(early);
+    assert.doesNotThrow(() => early.accept(fallback));
+    const mapper = makeMapper(createAssistantMessageEventStream(), createOutput(model), new Set(), new Map(), () => { });
+    init(mapper);
+    mapper.accept({ type: "stream_event", event: { type: "message_start", message: { id: "msg_1", model: "claude-opus-5-5", usage: {} } } });
+    assert.throws(() => mapper.accept(fallback), (error) => {
+        assert.equal(error.code, "stream_interrupted");
+        assert.equal(isRetryableAssistantError({ stopReason: "error", errorMessage: error.message }), true, error.message);
+        return true;
+    });
+});
+test("treats an unrecognized second message_start as a retryable interruption", () => {
+    // Every observed case was Claude Code starting another model request on its own.
+    const mapper = makeMapper(createAssistantMessageEventStream(), createOutput(model), new Set(), new Map(), () => { });
+    init(mapper);
+    mapper.accept({ type: "stream_event", event: { type: "message_start", message: { id: "msg_1", model: "claude-sonnet-5", usage: {} } } });
+    assert.throws(() => mapper.accept({ type: "stream_event", event: { type: "message_start", message: { id: "msg_2", model: "claude-sonnet-5", usage: {} } } }), (error) => {
+        assert.equal(error.code, "stream_interrupted");
+        assert.match(error.message, /started another model request/);
+        assert.equal(isRetryableAssistantError({ stopReason: "error", errorMessage: error.message }), true, error.message);
+        return true;
+    });
+});
 test("accepts the output-limit handoff acknowledgement and fails closed on near misses", async () => {
     const lengthTermination = (overrides = {}) => exactToolTerminationResult({ stop_reason: "max_tokens", ...overrides });
     const accepted = readyToolMapper("max_tokens");
@@ -914,7 +1129,7 @@ test("accepts the output-limit handoff acknowledgement and fails closed on near 
 test("replays every captured scenario through Pi's own frame encoder and reducer", async () => {
     // Pi's assistant events are append-only. Rewriting published content to reuse a
     // recovered stream, as the rejected external fix did, makes these throw.
-    for (const [scenario] of [...INTERRUPTED, ["http529"], ["post-stop"], ["tool-ok"], ["max-tokens"], ["context-window-exceeded"], ["prompt-too-long"]]) {
+    for (const [scenario] of [...INTERRUPTED, ...REFUSED, ["http529"], ["post-stop"], ["tool-ok"], ["max-tokens"], ["context-window-exceeded"], ["prompt-too-long"]]) {
         const { events, liveFrames } = await replayCapture(scenario);
         assert.equal(liveFrames.length > 0, true, `${scenario} produced no frames`);
         assert.doesNotThrow(() => reduceAssistantMessageFrames(liveFrames), `${scenario} (live)`);

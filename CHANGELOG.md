@@ -23,6 +23,40 @@
 - The pre-launch token estimate is calibrated rather than assumed. Measured against a real session transcript by comparing this transport's serialized bytes with Claude's own reported prompt counters over the same messages, dense agent history tokenizes at 2.12 bytes per token; the previous 3-byte ratio, described as conservative, under-counted such a transcript by about a fifth, so the guard did not bound what it claimed to. The ratio is now 2.4 bytes per token with the existing 10% margin.
 - Protocol activity postpones the idle deadline through a timestamp read by one long-lived timer, instead of clearing and recreating a timer for every record.
 
+## [0.6.0] - 2026-09-27
+
+### Added
+
+- The doctor and diagnostic report name the provider version Pi actually loaded and its install directory, so an older project-local or duplicate installation is visible.
+- `PI_CLAUDE_CODE_PROVIDER_WEB_SEARCH=off` leaves `pi_claude_code_provider_web_search` unregistered, so users with their own search tools or other providers' models no longer have Claude-backed search, or its prompt guidance, added to every session. The default stays `on`; an unrecognized value also leaves the tool unregistered, with a warning. The doctor and diagnostic report show the web-search state ([#15](https://github.com/chem/pi-claude-code-provider/issues/15)).
+
+### Fixed
+
+- A request whose response a safety classifier flags no longer fails with "Claude emitted duplicate message_start". Claude Code re-ran such requests on a fallback model, such as Opus 4.8 for a flagged Fable 5.1 or Opus 5.5 response, which the provider cannot publish ([#5](https://github.com/chem/pi-claude-code-provider/pull/5)).
+- Refusals now fail as "The model refused to complete the request", naming the category and model when Claude Code reports them. Pi no longer retries them. Previously they were reported as retryable stream interruptions, so Pi re-sent a refused request up to three times.
+- A second response that Claude Code starts on its own, through a recovery the provider does not specifically recognize, now fails as a retryable interruption instead of a protocol error that lost the turn. A mid-response switch by a managed fallback-model chain is recognized the same way.
+- Private request and session image directories are now removed when Pi, or a pi-subagents runner, exits while a request is in flight, such as quitting mid-turn or stopping a background subagent. Previously they stayed until a later start's stale recovery at least an hour later, and on Windows indefinitely. A Claude process still shutting down at that moment is force-killed; state whose process liveness is unknown is still retained.
+- On macOS, a Claude process that exits on its own just before the provider stops it, as after an output limit, no longer fails the request as a process-cleanup failure with retained private state.
+- On Windows, a Claude Code descendant exiting while the provider stops the process tree no longer fails the request as "process liveness is unknown" with retained private state that Windows never reclaims.
+- On Windows, a `.cmd` or `.bat` Claude Code shim now gets a clear error naming the fix instead of "not found on PATH" or `spawn EINVAL`.
+- The private-path guard now also recognizes the temporary directory's alias spellings, such as macOS's `/var/folders` for `/private/var/folders` and Windows 8.3 short names, and ignores case on macOS.
+- When Claude Code closes its input and exits before the prompt is written, such as after a failed login, requests now report Claude's own error or exit details instead of "Claude Code stdin failed: write EPIPE".
+- A Claude process that exits right after starting no longer loses its output: the provider and web search now read stdout before recording process ownership, instead of after, when Node could already have discarded it. A fast failure previously surfaced as "omitted initialization" instead of Claude's own error.
+- Capture cleanup terminates the owned POSIX process group even after its leader closes, preventing surviving descendants from outliving temporary capture files.
+- A stalled response observer no longer retains private request files or session image leases after cancellation, process failure, or the total deadline, including when Claude has already exited. The deadline still starts at Claude launch and now covers response processing.
+- Private-path checks reject equivalent paths into request and session image directories, including dot segments, relative paths, and Windows separator and case variations. The guard remains a heuristic rather than a filesystem sandbox.
+- An omitted MCP prefix on exactly `bash`, `read`, `edit`, or `write` no longer fails the turn when that lowercase Pi tool is active. Capitalized names and other bare tool names remain errors; arguments are unchanged ([#14](https://github.com/chem/pi-claude-code-provider/issues/14)).
+- Local checkouts now show their directory name in Pi's `[Extensions]` list instead of `extensions`. The single root `index.ts` preserves Git and npm labels on both Pi distributions and replaces the previous entry shim.
+- Provider tests wait for each request's own lifecycle metrics and isolate temporary state, preventing late cleanup from interfering with another test's assertions.
+
+### Changed
+
+- The pinned Claude Code settings now include `switchModelsOnFlag: false`, so a safety-classifier flag ends with the refusal instead of re-running the request on another model. Managed settings can still override it.
+- Claude Code 2.1.283 is now the validated baseline; the minimum supported version remains 2.1.281. The quota-free stream-recovery captures are re-pinned to 2.1.283 and add refusal scenarios.
+- The web-search tool's prompt guidance now tells models to use it only when no other web-search tool is available or the user asks for it, and its summary notes that it uses Claude subscription capacity.
+- Claude Code's built-in telemetry plugin is explicitly disabled alongside the existing traffic-disable environment setting.
+- Quota-free surface capture now reports startup plugins and pre-init records and verifies all Sonnet/Opus effort levels in the API request.
+
 ## [0.5.0] - 2026-09-24
 
 ### Changed

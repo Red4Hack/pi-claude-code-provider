@@ -28,7 +28,7 @@ register(new URL("./pi-loader-hooks.js", import.meta.url), {
 
 await assert.rejects(import("@earendil-works/pi-ai/compat"), "the subpath must be unresolvable for this to prove anything");
 
-const { default: piClaudeCodeProvider } = await import("../../extensions/index.ts");
+const { default: piClaudeCodeProvider } = await import("../../index.ts");
 const providers = new Map();
 await piClaudeCodeProvider({
   registerCommand() {},

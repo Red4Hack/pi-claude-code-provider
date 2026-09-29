@@ -1,4 +1,4 @@
-import { execFile, type ChildProcess } from "node:child_process";
+import { execFile, spawnSync, type ChildProcess } from "node:child_process";
 import { constants } from "node:fs";
 import { access } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
@@ -9,6 +9,8 @@ export interface ProcessResult {
   signal: NodeJS.Signals | null;
   terminationSignals?: readonly NodeJS.Signals[];
   error?: Error;
+  /** The child closed its end of stdin before a write to it completed. */
+  stdinClosed?: true;
 }
 
 export interface ProcessSupervisorOptions {
@@ -16,6 +18,13 @@ export interface ProcessSupervisorOptions {
   totalTimeoutMs: number;
   onFailure: (error: Error) => void;
   terminate?: (child: ChildProcess) => Promise<void>;
+  /**
+   * Called once when the memoized termination settles: `confirmed` when the owned
+   * tree is known to be gone, `unknown` when the terminator rejected. Every
+   * termination path funnels through it, so owners can record liveness without
+   * awaiting a termination some other path started.
+   */
+  onTermination?: (outcome: "confirmed" | "unknown") => void;
 }
 
 export interface ProcessSupervisor {
@@ -23,6 +32,12 @@ export interface ProcessSupervisor {
   wait(): Promise<ProcessResult>;
   terminate(): Promise<void>;
   dispose(): void;
+}
+
+const CLOSED_PIPE_CODES = new Set<string | undefined>(["EPIPE", "ECONNRESET", "ERR_STREAM_DESTROYED"]);
+
+function errorCode(error: unknown): string | undefined {
+  return error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : undefined;
 }
 
 type ProcessKiller = (pid: number, signal?: NodeJS.Signals | number) => true;
@@ -67,12 +82,23 @@ export function superviseProcess(child: ChildProcess, options: ProcessSupervisor
       return sent;
     });
 
+  const reportTermination = (outcome: "confirmed" | "unknown"): void => {
+    try {
+      options.onTermination?.(outcome);
+    } catch {
+      // Bookkeeping must never change a termination's own outcome.
+    }
+  };
+
   const terminate = (): Promise<void> => {
-    terminationPromise ??= (options.terminate ?? terminateOwnedProcess)(child).catch((cause: unknown) => {
+    terminationPromise ??= (options.terminate ?? terminateOwnedProcess)(child).then(() => {
+      reportTermination("confirmed");
+    }, (cause: unknown) => {
       // A leader can exit while descendants still own its process group or
       // inherited pipes. Only successful tree termination establishes cleanup;
       // an exit code cannot make a rejected terminator safe.
       const failure = cause instanceof ProcessTerminationError ? cause : new ProcessTerminationError(cause);
+      reportTermination("unknown");
       if (!settled) {
         settled = true;
         clearTimers();
@@ -110,9 +136,23 @@ export function superviseProcess(child: ChildProcess, options: ProcessSupervisor
       code,
       signal,
       ...(terminationSignals.length > 0 ? { terminationSignals: [...terminationSignals] } : {}),
+      ...(stdinClosed ? { stdinClosed: true as const } : {}),
     });
   };
-  const onStdinError = (error: Error): void => fail(new Error(`Claude Code stdin failed: ${error.message}`));
+  // A child that closed its end of stdin is exiting or already gone, and a
+  // write into it fails with a broken pipe. Failing on that would publish the
+  // pipe as the cause and preempt what the child reported on its way out -- an
+  // error record on stdout, its exit status, its stderr -- so it is recorded for
+  // the exit to explain. A child that closed stdin and lingers still meets the
+  // idle and total deadlines; any other stdin error fails at once.
+  let stdinClosed = false;
+  const onStdinError = (error: Error): void => {
+    if (CLOSED_PIPE_CODES.has(errorCode(error))) {
+      stdinClosed = true;
+      return;
+    }
+    fail(new Error(`Claude Code stdin failed: ${error.message}`));
+  };
   const onStdoutError = (error: Error): void => fail(new Error(`Claude Code stdout failed: ${error.message}`));
   const onStderrError = (error: Error): void => fail(new Error(`Claude Code stderr failed: ${error.message}`));
 
@@ -120,6 +160,7 @@ export function superviseProcess(child: ChildProcess, options: ProcessSupervisor
   // timestamp and one long-lived timer that re-arms for the remaining time.
   // Clearing and recreating a timer per record was pure overhead on a fast stream.
   const armIdle = (milliseconds: number): void => {
+    if (settled || disposed) return;
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = setTimeout(onIdleDeadline, milliseconds);
     idleTimer.unref();
@@ -187,6 +228,7 @@ export async function terminateProcessGroup(
   child: ChildProcess,
   graceMs = 500,
   killProcess: ProcessKiller = process.kill,
+  groupMemberStates: GroupMemberStates = processGroupMemberStatesSync,
 ): Promise<void> {
   const pid = child.pid;
   if (!pid) return;
@@ -203,7 +245,12 @@ export async function terminateProcessGroup(
       await terminateDirectChild(child, graceMs);
       return;
     }
-    throw processGroupCleanupError(pid, "SIGTERM", child, error);
+    // Claude can exit on its own just before it is stopped, an output-limit
+    // handoff most of all, and until Node reaps it macOS refuses to signal a
+    // group of zombies. They are already dead: wait for the reap to show ESRCH.
+    if (!isPermissionDenied(error) || !groupHoldsOnlyZombies(pid, groupMemberStates)) {
+      throw processGroupCleanupError(pid, "SIGTERM", child, error);
+    }
   }
 
   if (await waitForProcessGroupExit(pid, graceMs, killProcess)) return;
@@ -211,13 +258,97 @@ export async function terminateProcessGroup(
     killProcess(-pid, "SIGKILL");
   } catch (error) {
     if (isMissingProcess(error)) return;
-    throw processGroupCleanupError(pid, "SIGKILL", child, error);
+    if (!isPermissionDenied(error) || !groupHoldsOnlyZombies(pid, groupMemberStates)) {
+      throw processGroupCleanupError(pid, "SIGKILL", child, error);
+    }
   }
   if (!(await waitForProcessGroupExit(pid, graceMs, killProcess))) {
     throw new Error(
       `Process group ${pid} did not terminate after SIGKILL ` +
       `(child exitCode=${String(child.exitCode)}, signalCode=${String(child.signalCode)})`,
     );
+  }
+}
+
+export interface ForceTerminateSyncDependencies {
+  platform?: NodeJS.Platform;
+  kill?: ProcessKiller;
+  /** Runs `taskkill /PID <pid> /T /F` and returns its exit status, or null if it did not complete. */
+  taskkill?: (pid: number) => number | null;
+  /** POSIX: `ps` state codes of a process group's members, or undefined if unavailable. */
+  groupMemberStates?: GroupMemberStates;
+}
+
+/**
+ * Synchronous last resort for a process `exit` listener, where nothing
+ * asynchronous runs again: force the owned tree down without waiting and report
+ * whether it is gone. `false` means its liveness is unknown, so the caller must
+ * keep the private state the tree may still use. On POSIX, SIGKILL to the group
+ * cannot be caught, and it also reaches descendants after the leader exited. On
+ * Windows a leader that already exited cannot be traced to its descendants,
+ * which the asynchronous path accepts too.
+ */
+export function forceTerminateProcessTreeSync(
+  pid: number,
+  child: ChildProcess | undefined,
+  dependencies: ForceTerminateSyncDependencies = {},
+): boolean {
+  if (!validPid(pid)) return false;
+  if ((dependencies.platform ?? process.platform) === "win32") {
+    if (child && (child.exitCode !== null || child.signalCode !== null)) return true;
+    const status = (dependencies.taskkill ?? runTaskkillSync)(pid);
+    // 128: the exact PID is already gone.
+    return status === 0 || status === 128;
+  }
+  try {
+    (dependencies.kill ?? process.kill)(-pid, "SIGKILL");
+    return true;
+  } catch (error) {
+    if (isMissingProcess(error)) return true;
+    // macOS refuses to signal a group whose members are all zombies, which is
+    // exactly the state at exit: the abort's SIGTERM already ended Claude and the
+    // exiting host will never reap it. A zombie can touch nothing, so only a
+    // listed live member keeps the state; an unreadable listing is unknown.
+    if (!isPermissionDenied(error)) return false;
+    return groupHoldsOnlyZombies(pid, dependencies.groupMemberStates ?? processGroupMemberStatesSync);
+  }
+}
+
+type GroupMemberStates = (pgid: number) => string[] | undefined;
+
+/**
+ * macOS answers a group signal with EPERM when every member is an unreaped
+ * zombie. Zombies cannot run or touch files, so such a group is as good as gone;
+ * a live member, or a listing that cannot be read, is not.
+ */
+function groupHoldsOnlyZombies(pgid: number, groupMemberStates: GroupMemberStates): boolean {
+  const states = groupMemberStates(pgid);
+  return states !== undefined && states.every((state) => state.startsWith("Z"));
+}
+
+/** `ps` state codes of the group's members, or undefined if they cannot be listed. */
+function processGroupMemberStatesSync(pgid: number): string[] | undefined {
+  try {
+    const listing = spawnSync("ps", ["-A", "-o", "pgid=,stat="], { encoding: "utf8", timeout: 5_000 });
+    if (listing.status !== 0 || typeof listing.stdout !== "string") return undefined;
+    return listing.stdout.split("\n").flatMap((line) => {
+      const match = /^\s*(\d+)\s+(\S+)/.exec(line);
+      return match && Number(match[1]) === pgid ? [match[2]!] : [];
+    });
+  } catch {
+    return undefined;
+  }
+}
+
+function runTaskkillSync(pid: number): number | null {
+  try {
+    return spawnSync(windowsTaskkillExecutable(), ["/PID", String(pid), "/T", "/F"], {
+      windowsHide: true,
+      timeout: 5_000,
+      stdio: "ignore",
+    }).status;
+  } catch {
+    return null;
   }
 }
 
@@ -259,7 +390,8 @@ async function terminateWindowsProcessTree(child: ChildProcess, pid: number, gra
 
   await waitForChildClose(child, graceMs);
   if (taskkillFailure) {
-    if (isTaskkillMissingProcess(taskkillFailure) && (child.exitCode !== null || child.signalCode !== null)) return;
+    const leaderExited = child.exitCode !== null || child.signalCode !== null;
+    if (leaderExited && (isTaskkillMissingProcess(taskkillFailure) || taskkillFailureNamesOnlyExitedProcesses(taskkillFailure, pid))) return;
     if (child.exitCode === null && child.signalCode === null) {
       // This retained ChildProcess handle still identifies only our direct child.
       // Best effort reduces leakage, but tree-cleanup failure remains an error.
@@ -328,6 +460,36 @@ async function waitForChildClose(child: ChildProcess, timeoutMs: number): Promis
       resolve();
     });
   });
+}
+
+/**
+ * `taskkill /T` walks the tree and fails on a descendant that was already
+ * exiting ("could not be terminated ... no running instance of the task"). Its
+ * wording is localized, but the PIDs it names are not: once our own child has
+ * closed, a failure whose named processes are all gone left nothing running.
+ * Nothing is signalled again, because the closed child's PID may be reused.
+ * A named process that still exists, or a message naming none, stays unknown.
+ */
+export function taskkillFailureNamesOnlyExitedProcesses(
+  error: unknown,
+  rootPid: number,
+  processExists: (pid: number) => boolean = windowsProcessExists,
+): boolean {
+  // Node puts "Command failed: <command line>" first and taskkill's own output
+  // after it; the command line carries unrelated digits, such as System32.
+  const output = errorText(error).split("\n").slice(1).join("\n");
+  const named = [...new Set([...output.matchAll(/\d+/g)].map((match) => Number(match[0])))]
+    .filter((pid) => validPid(pid) && pid !== rootPid);
+  return named.length > 0 && named.every((pid) => !processExists(pid));
+}
+
+function windowsProcessExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return !isMissingProcess(error);
+  }
 }
 
 function isTaskkillMissingProcess(error: unknown): boolean {

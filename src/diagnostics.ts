@@ -8,9 +8,11 @@ import type { VersionStatus } from "./compatibility.ts";
 import { ClaudeCodeError } from "./errors.ts";
 import { TRANSCRIPT_BREAKPOINT_ENV } from "./claude-args.ts";
 import { hostRuntimeDescription } from "./host-runtime.ts";
-import type { BridgeProbeResult } from "./doctor.ts";
+import type { BridgeProbeResult, WebSearchStatus } from "./doctor.ts";
+import type { ProviderPackage } from "./package-info.ts";
 import type { RuntimeCleanupResult } from "./runtime-directories.ts";
 import type { ClaudeInstallation, RequestMetrics, SearchMetrics } from "./types.ts";
+import { webSearchSetting } from "./web-search.ts";
 
 const execFileAsync = promisify(execFile);
 const MAX_REPORT_BYTES = 64 * 1024;
@@ -20,6 +22,7 @@ export interface DiagnosticReportInput {
   piStatus: VersionStatus;
   claudeStatus?: VersionStatus;
   installation?: ClaudeInstallation;
+  providerPackage?: ProviderPackage;
   modelVersions?: ModelAliasVersions;
   preflightError?: unknown;
   metrics?: RequestMetrics;
@@ -27,6 +30,7 @@ export interface DiagnosticReportInput {
   metricsLogError?: string;
   runtimeCleanup: RuntimeCleanupResult;
   bridgeProbe?: BridgeProbeResult;
+  webSearch?: WebSearchStatus;
 }
 
 /** Write a bounded, content-free report to a new private temp directory. */
@@ -67,7 +71,15 @@ export async function writeDiagnosticReport(input: DiagnosticReportInput): Promi
       claudeExecutable: Boolean(process.env.PI_CLAUDE_CODE_PROVIDER_PATH?.trim()),
       metricsLog: Boolean(process.env.PI_CLAUDE_CODE_PROVIDER_METRICS_LOG?.trim()),
       transcriptBreakpointDisabled: process.env[TRANSCRIPT_BREAKPOINT_ENV]?.trim() === "off",
+      webSearch: webSearchSetting(),
     },
+    // Which copy of this package Pi loaded, with the home directory redacted.
+    provider: input.providerPackage
+      ? {
+          version: input.providerPackage.version,
+          root: sanitize(input.providerPackage.root, lexicalTempRoot, physicalTempRoot),
+        }
+      : undefined,
     installation: input.installation
       ? {
           executable: sanitize(input.installation.executable, lexicalTempRoot, physicalTempRoot),
@@ -87,6 +99,7 @@ export async function writeDiagnosticReport(input: DiagnosticReportInput): Promi
         }
       : undefined,
     lastRequest: input.metrics,
+    webSearchRegistration: input.webSearch,
     lastWebSearch: input.searchMetrics,
     metricsLogError: input.metricsLogError,
     runtimeCleanup: input.runtimeCleanup,

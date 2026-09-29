@@ -76,6 +76,8 @@ test("pins cache-stable Claude settings", () => {
         disableAllHooks: true,
         autoMemoryEnabled: false,
         totalTokensReminder: "off",
+        // A safety-classifier flag must end as a refusal, not re-run on another model.
+        switchModelsOnFlag: false,
         enabledPlugins: { "agents-md@builtin": false, "telemetry@builtin": false },
     });
 });

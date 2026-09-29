@@ -10,7 +10,7 @@ import { documentationPolicyErrors } from "./lib/documentation-policy.js";
 import { importedSpecifiers, repositoryFiles, unreferencedImportBindings } from "./lib/source-policy.js";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
-const sourceRoots = ["extensions", "src", "test", "scripts"];
+const sourceRoots = ["index.ts", "index.js", "src", "test", "scripts"];
 const allowedPeers = new Set(PI_PEERS);
 
 function run(command, args, options = {}) {
@@ -52,7 +52,7 @@ const pinnedPi = `@earendil-works/pi-coding-agent@${VERIFIED_VERSIONS.pi}`;
 if (!workflow.includes(pinnedPi))
   throw new Error(`.github/workflows/ci.yml must install ${pinnedPi}`);
 const runtimeJavaScript = files.filter(
-  (path) => (path.startsWith(join(root, "extensions")) || path.startsWith(join(root, "src"))) && path.endsWith(".js"),
+  (path) => (path === join(root, "index.js") || path.startsWith(join(root, "src"))) && path.endsWith(".js"),
 );
 if (runtimeJavaScript.length)
   throw new Error(`Runtime JavaScript remains: ${runtimeJavaScript.map((path) => relative(root, path)).join(", ")}`);

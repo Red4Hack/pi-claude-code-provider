@@ -4,7 +4,7 @@ import { buildClaudeEnvironment, claudeLaunch } from "./auth.ts";
 import { stderrExcerpt } from "./claude-protocol.ts";
 import { appendCleanupFailure, ClaudeCodeError, errorCode, errorText } from "./errors.ts";
 import { ProcessTerminationError, type ProcessSupervisor, type superviseProcess } from "./process-utils.ts";
-import { recordRuntimeChild } from "./runtime-directories.ts";
+import { confirmRuntimeChildExit, recordRuntimeChild, retainRuntimeDirectory } from "./runtime-directories.ts";
 import { tailText } from "./text.ts";
 import type { ClaudeInstallation } from "./types.ts";
 
@@ -87,6 +87,12 @@ export function spawnClaudeProcess(options: ClaudeProcessOptions): ClaudeProcess
     idleTimeoutMs: options.idleTimeoutMs,
     totalTimeoutMs: options.totalTimeoutMs,
     onFailure: (error) => options.onFailure(vanishedExecutable(error, options.installation.executable) ?? error),
+    // Whichever path terminates the tree, the exit reaper learns its outcome:
+    // a confirmed tree needs no signal at exit, an unknown one keeps its state.
+    onTermination: (outcome) => {
+      if (outcome === "confirmed") confirmRuntimeChildExit(options.directory);
+      else retainRuntimeDirectory(options.directory);
+    },
   });
   let terminationFailure: unknown;
   const terminate = async (): Promise<void> => {
@@ -120,7 +126,7 @@ export function spawnClaudeProcess(options: ClaudeProcessOptions): ClaudeProcess
     // A child that failed to spawn has no PID and nothing to own; its spawn error
     // reaches onFailure, which already names the cause.
     recordOwnership: async () => {
-      if (child.pid !== undefined) await recordRuntimeChild(options.directory, child.pid);
+      if (child.pid !== undefined) await recordRuntimeChild(options.directory, child.pid, child);
     },
     stderrExcerpt: () => stderrExcerpt(stderr, [options.directory, ...(options.privatePaths ?? [])]),
     terminate,

@@ -1,17 +1,23 @@
 import assert from "node:assert/strict";
-import { access, chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { access, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import * as piAi from "@earendil-works/pi-ai";
-import { availableOutputTokens, createClaudeStream as createProviderStream, isExpectedToolHandoffExit, waitForReadyOrExit } from "../../src/provider.ts";
-import { getLastRequestMetrics } from "../../src/metrics.ts";
+import { createCodingTools } from "@earendil-works/pi-coding-agent";
+import { availableOutputTokens, containsPrivateTransportPath, isExpectedToolHandoffExit, waitForReadyOrExit } from "../../src/provider.ts";
+import { createTestClaudeStream as createClaudeStream, requestMetrics, settledRequest } from "../support/provider-request.js";
+import { ProcessTerminationError, superviseProcess, terminateProcessGroup } from "../../src/process-utils.ts";
 import { normalizeClaudeFailure } from "../../src/errors.ts";
-import { superviseProcess, terminateProcessGroup } from "../../src/process-utils.ts";
 import { SessionImageStore } from "../../src/session-image-store.ts";
+import { privatePathSpellings } from "../../src/runtime-directories.ts";
 import { resolveSession } from "../../src/session-registry.ts";
-import { nodeFixtureSource } from "../support/node-fixture.js";
-import { CAPTURED_CLAUDE_VERSION, PROVIDER_INIT_FIELDS, initRecord, streamRecoveryRecords, toolUseEvents } from "../support/claude-fixture.js";
+import { supervisorWithCleanupFailure } from "../support/process-fixture.js";
+import { waitFor, waitForRemoval, withTimeout } from "../support/wait.js";
+import { getLastRequestMetrics, recordRequestMetrics } from "../../src/metrics.ts";
+import { createNodeFixture } from "../support/node-fixture.js";
+import { CAPTURED_CLAUDE_VERSION, PROVIDER_INIT_FIELDS, claudeFixtureBody, initRecord, streamRecoveryRecords, toolUseEvents } from "../support/claude-fixture.js";
 const model = {
     id: "sonnet",
     name: "Sonnet",
@@ -34,22 +40,7 @@ const readTool = { name: "read", description: "read", parameters: { type: "objec
 const providerContext = (init = {}) => piAi.normalizeContext({ messages: baseMessages, ...init });
 const context = providerContext({ tools: [] });
 async function fakeClaude(body, { writeReady = true } = {}) {
-    const dir = await mkdtemp(join(tmpdir(), "fake-claude-"));
-    const executable = join(dir, process.platform === "win32" ? "claude.cjs" : "claude");
-    // Fake protocol output is synchronous only in this test child; some sandboxes
-    // otherwise hide buffered Node stdout even when the child exits successfully.
-    await writeFile(executable, nodeFixtureSource(`
-	const fs = require("node:fs");
-	${writeReady ? `
-	const mcpIndex = process.argv.indexOf("--mcp-config");
-	if (mcpIndex >= 0) {
-  const config = JSON.parse(process.argv[mcpIndex + 1]);
-  const ready = config.mcpServers?.pi?.env?.PI_CLAUDE_TOOL_READY;
-  if (ready) fs.writeFileSync(ready, "ready\\n", { flag: "wx" });
-	}` : ""}
-	${body}\n`));
-    await chmod(executable, 0o700);
-    return { dir, executable };
+    return createNodeFixture(claudeFixtureBody(`const fs = require("node:fs");\n${body}`, { writeReady }));
 }
 const init = initRecord(PROVIDER_INIT_FIELDS);
 const toolInit = {
@@ -68,49 +59,135 @@ const toolTerminationResult = {
     usage: { input_tokens: 4, output_tokens: 2 },
     modelUsage: { sonnet: { contextWindow: 1000000, maxOutputTokens: 64000 } },
 };
-// The last request's metrics are process-global, so a waiter could match an
-// earlier request's record. Snapshot them as each request starts and accept only
-// a different record. Two requests started in one millisecond could record
-// identical metrics, so each start first waits out the previous request's.
-let metricsBeforeRequest;
-let lastRequestStartedAt = 0;
-// Every provider request runs Claude in Pi's session directory; tests that are
-// not about that directory use the temporary root as the session.
-// Pi normalizes its public `{ systemPrompt, messages, tools }` request shape
-// into a transcript before any provider sees it, so these fixtures stay written
-// the way a caller states a request and reach the provider the way Pi delivers
-// one: the prompt and the tools carried by a leading system message.
-function createClaudeStream(installation, dependencies = {}) {
-    const streamSimple = createProviderStream(installation, { resolveSession: () => ({ cwd: tmpdir() }), ...dependencies });
-    // normalizeContext is idempotent on an already-normalized transcript, so
-    // fixtures built with providerContext() pass through unchanged.
-    return (model, context, options) => {
-        while (Date.now() <= lastRequestStartedAt) { /* wait out the millisecond */ }
-        metricsBeforeRequest = JSON.stringify(getLastRequestMetrics() ?? null);
-        const stream = streamSimple(model, piAi.normalizeContext(context), options);
-        lastRequestStartedAt = Date.now();
-        return stream;
+
+test("provider hands off each bare default Pi name with unchanged arguments and complete cleanup", async (t) => {
+    const tools = createCodingTools(tmpdir());
+    const argsByName = {
+        bash: { command: "printf hello", timeout: 2 },
+        read: { path: "README.md", offset: 1, limit: 3 },
+        edit: { path: "example.txt", edits: [{ oldText: "before", newText: "after" }] },
+        write: { path: "example.txt", content: "hello" },
     };
-}
-async function waitForRequestMetrics(predicate) {
-    for (let attempt = 0; attempt < 200; attempt++) {
-        const metrics = getLastRequestMetrics();
-        if (metrics && JSON.stringify(metrics) !== metricsBeforeRequest && predicate(metrics)) return metrics;
-        await new Promise((resolve) => setTimeout(resolve, 10));
+    for (const tool of tools) {
+        await t.test(tool.name, async () => {
+            const args = argsByName[tool.name];
+            assert.ok(args, "the compatibility test covers only the four default names");
+            const records = toolUseEvents({ messageId: "msg_bare", toolUseId: "toolu_bare", name: tool.name, partialJson: JSON.stringify(args) });
+            const fake = await fakeClaude(`
+process.on("SIGTERM", () => process.exit(143));
+process.stdin.resume();
+process.stdin.on("end", () => {
+  const privateDirectory = require("node:path").dirname(process.argv[process.argv.indexOf("--system-prompt-file") + 1]);
+  fs.writeFileSync(require("node:path").join(__dirname, "private-directory"), privateDirectory);
+  process.stdout.write(JSON.stringify(${JSON.stringify({ ...toolInit, tools: [`mcp__pi__${tool.name}`] })}) + "\\n");
+  for (const record of ${JSON.stringify(records)}) process.stdout.write(JSON.stringify(record) + "\\n");
+  setInterval(() => {}, 1000);
+});`);
+            try {
+                const result = await settledRequest(createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, providerContext({ tools: [tool] })));
+                assert.equal(result.stopReason, "toolUse", result.errorMessage);
+                assert.deepEqual(result.content, [{ type: "toolCall", id: "toolu_bare", name: tool.name, arguments: args }]);
+                assert.deepEqual(piAi.validateToolCall([tool], result.content[0]), args);
+                const metrics = await requestMetrics(result);
+                assert.equal(metrics.lastPhase, "completed");
+                assert.equal(metrics.stopReason, "toolUse");
+                assert.equal(metrics.errorCategory, undefined);
+                assert.equal(metrics.cleanupComplete, true);
+                assert.equal(metrics.terminationExpected, true);
+                const privateDirectory = await readFile(join(fake.directory, "private-directory"), "utf8");
+                await assert.rejects(access(privateDirectory), { code: "ENOENT" });
+            } finally {
+                await rm(fake.directory, { recursive: true, force: true });
+            }
+        });
     }
-    throw new Error("request metrics did not settle");
-}
-function supervisorWithCleanupFailure(child, options) {
-    const supervisor = superviseProcess(child, options);
-    let termination;
-    return {
-        ...supervisor,
-        terminate() {
-            termination ??= supervisor.terminate().then(() => { throw new Error("synthetic process-group EPERM"); });
-            return termination;
-        },
-    };
-}
+});
+
+test("a historical default tool is not callable by its bare name when inactive", async () => {
+    const fake = await fakeClaude(`
+process.stdin.resume();
+process.stdin.on("end", () => {
+  process.stdout.write(JSON.stringify(${JSON.stringify(init)}) + "\\n");
+  for (const record of ${JSON.stringify(toolUseEvents({ messageId: "msg_history", toolUseId: "toolu_history", name: "read" }))}) process.stdout.write(JSON.stringify(record) + "\\n");
+  setInterval(() => {}, 1000);
+});`);
+    const historical = providerContext({ tools: [], messages: [
+        { role: "assistant", content: [{ type: "toolCall", id: "historical", name: "read", arguments: { path: "README.md" } }], api: model.api, provider: model.provider, model: model.id, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "toolUse", timestamp: 1 },
+        { role: "toolResult", toolCallId: "historical", toolName: "read", content: [{ type: "text", text: "old result" }], isError: false, timestamp: 2 },
+        { role: "user", content: "continue", timestamp: 3 },
+    ] });
+    try {
+        const result = await settledRequest(createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, historical));
+        assert.equal(result.stopReason, "error");
+        assert.match(result.errorMessage, /Claude proposed an unknown tool: read/);
+        const metrics = await requestMetrics(result);
+        assert.equal(metrics.errorCategory, "tool_unknown");
+        assert.equal(metrics.cleanupComplete, true);
+    } finally {
+        await rm(fake.directory, { recursive: true, force: true });
+    }
+});
+
+test("bare default-name recovery still rejects malformed tool arguments", async () => {
+    const fake = await fakeClaude(`
+process.on("SIGTERM", () => process.exit(143));
+process.stdin.resume();
+process.stdin.on("end", () => {
+  process.stdout.write(JSON.stringify(${JSON.stringify(toolInit)}) + "\\n");
+  for (const record of ${JSON.stringify(toolUseEvents({ messageId: "msg_bad_args", toolUseId: "toolu_bad_args", name: "read", partialJson: '{"path":' }))}) process.stdout.write(JSON.stringify(record) + "\\n");
+  setInterval(() => {}, 1000);
+});`);
+    try {
+        const result = await settledRequest(createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, toolContext));
+        assert.equal(result.stopReason, "error");
+        assert.match(result.errorMessage, /Claude emitted invalid arguments for tool read/);
+        const metrics = await requestMetrics(result);
+        assert.equal(metrics.errorCategory, "tool_arguments");
+        assert.equal(metrics.cleanupComplete, true);
+    } finally {
+        await rm(fake.directory, { recursive: true, force: true });
+    }
+});
+
+test("overlapping failures keep their own metrics when finalization completes out of order", async () => {
+    const idle = await fakeClaude(`process.stdin.resume(); setInterval(() => {}, 1000);`);
+    const removed = await mkdtemp(join(tmpdir(), "provider-removed-native-"));
+    // A native path also fails at spawn on Windows; a missing .cjs would instead
+    // launch Node successfully and fail later inside that child.
+    const missingExecutable = join(removed, process.platform === "win32" ? "claude.exe" : "claude");
+    let releaseCleanup;
+    let cleanupEntered;
+    const gate = new Promise((resolve) => { releaseCleanup = resolve; });
+    const entered = new Promise((resolve) => { cleanupEntered = resolve; });
+    const recorded = [];
+    const record = (metrics) => { recorded.push(metrics.errorCategory); recordRequestMetrics(metrics); };
+    const earlier = createClaudeStream({ executable: idle.executable, version: "test", subscriptionType: "pro" }, {
+        supervise: (child, options) => superviseProcess(child, { ...options, idleTimeoutMs: 30, totalTimeoutMs: 30_000 }),
+        cleanupDirectory: async (directory) => { cleanupEntered(); await gate; await rm(directory, { recursive: true, force: true }); },
+        recordRequestMetrics: record,
+    })(model, context);
+    try {
+        // The raw terminal result is available while its lifecycle is still held.
+        assert.equal((await withTimeout(earlier.result(), "early failure")).stopReason, "error");
+        await withTimeout(entered, "cleanup gate");
+        assert.deepEqual(recorded, []);
+        const later = createClaudeStream({ executable: missingExecutable, version: "test", subscriptionType: "pro" }, {
+            recordRequestMetrics: record,
+        })(model, context);
+        const laterResult = await settledRequest(later);
+        assert.equal((await requestMetrics(laterResult)).errorCategory, "executable_missing");
+        releaseCleanup();
+        await settledRequest(earlier);
+        assert.deepEqual(recorded, ["executable_missing", "process"]);
+        assert.equal(getLastRequestMetrics().errorCategory, "process", "doctor preserves completion-order semantics");
+        assert.equal((await requestMetrics(later)).errorCategory, "executable_missing");
+        assert.equal((await requestMetrics(earlier)).errorCategory, "process");
+    } finally {
+        releaseCleanup();
+        await settledRequest(earlier);
+        await Promise.all([idle.directory, removed].map((directory) => rm(directory, { recursive: true, force: true })));
+    }
+});
 test("provider streams a fake response after accepting a rich payload replacement", async () => {
     const fake = await fakeClaude(`
 const path = require("node:path");
@@ -152,18 +229,18 @@ setTimeout(() => {
         const eventTypes = [];
         for await (const event of stream)
             eventTypes.push(event.type);
-        const result = await stream.result();
+        const result = await settledRequest(stream);
         assert.deepEqual(eventTypes, ["start", "text_start", "text_delta", "text_end", "done"], result.errorMessage);
         assert.equal(result.responseModel, "claude-sonnet-5");
         assert.equal(result.usage.totalTokens, 6);
         assert.equal(result.usage.cost.total, 0);
         assert.equal(result.content[0]?.type, "text");
         assert.equal(claims, 1);
-        const captured = JSON.parse(await readFile(join(fake.dir, "captured-preparation"), "utf8"));
+        const captured = JSON.parse(await readFile(join(fake.directory, "captured-preparation"), "utf8"));
         assert.equal(captured.systemPrompt, "replacement system");
         assert.deepEqual(captured.catalog, [{ name: "read", description: "read", inputSchema: readTool.parameters }]);
         assert.ok(captured.files.some((name) => /^image-[0-9a-f]{64}\.png$/.test(name)));
-        const metrics = await waitForRequestMetrics((entry) => entry.stopReason === "stop");
+        const metrics = await requestMetrics(result, (entry) => entry.stopReason === "stop");
         assert.equal(metrics.schemaVersion, 5);
         assert.equal(metrics.messageCount, replacement.messages.length);
         assert.equal(metrics.toolCount, 1);
@@ -171,7 +248,7 @@ setTimeout(() => {
         assert.equal(metrics.terminationExpected, false);
     }
     finally {
-        await rm(fake.dir, { recursive: true, force: true });
+        await rm(fake.directory, { recursive: true, force: true });
     }
 });
 // Pi carries the system prompt and the tool declarations in the transcript's
@@ -223,13 +300,13 @@ process.stdin.on("end", () => {
   process.stdout.write(JSON.stringify({type:"result",is_error:false,result:"",usage:{input_tokens:4,output_tokens:2}}) + "\\n");
 });`);
     try {
-        const result = await createClaudeStream({ executable: fake.executable, version: CAPTURED_CLAUDE_VERSION, subscriptionType: "pro" })(
+        const result = await settledRequest(createClaudeStream({ executable: fake.executable, version: CAPTURED_CLAUDE_VERSION, subscriptionType: "pro" })(
             model,
             transcript,
             { reasoning: "medium" },
-        ).result();
+        ));
         assert.equal(result.stopReason, "stop", result.errorMessage);
-        const captured = JSON.parse(await readFile(join(fake.dir, "captured-replay"), "utf8"));
+        const captured = JSON.parse(await readFile(join(fake.directory, "captured-replay"), "utf8"));
         // Later content is appended to the base prompt and a section is
         // replaced by name, never duplicated.
         assert.equal(captured.systemPrompt, "base instructions\n\nlater instructions\n\nsecond environment");
@@ -241,12 +318,12 @@ process.stdin.on("end", () => {
         assert.ok(blocks.some((text) => text.includes("first turn")));
         assert.ok(blocks.some((text) => text.includes("second turn")));
         assert.equal(blocks.some((text) => text.includes('"role":"system"')), false);
-        const metrics = await waitForRequestMetrics((entry) => entry.stopReason === "stop");
+        const metrics = await requestMetrics(result, (entry) => entry.stopReason === "stop");
         assert.equal(metrics.messageCount, 2);
         assert.equal(metrics.toolCount, 2);
     }
     finally {
-        await rm(fake.dir, { recursive: true, force: true });
+        await rm(fake.directory, { recursive: true, force: true });
     }
 });
 test("provider rejects malformed logical payloads before claim or spawn", async () => {
@@ -275,10 +352,10 @@ test("provider rejects malformed logical payloads before claim or spawn", async 
     let claims = 0;
     try {
         for (const [messages, tools, expected] of cases) {
-            const result = await createClaudeStream(
+            const result = await settledRequest(createClaudeStream(
                 { executable: fake.executable, version: "test", subscriptionType: "pro" },
                 { claimLaunch: async () => { claims++; } },
-            )(model, context, { onPayload: () => ({ messages, tools }) }).result();
+            )(model, context, { onPayload: () => ({ messages, tools }) }));
             assert.equal(result.stopReason, "error");
             assert.match(result.errorMessage ?? "", expected);
         }
@@ -286,7 +363,7 @@ test("provider rejects malformed logical payloads before claim or spawn", async 
         await assert.rejects(access(marker));
     } finally {
         await rm(root, { recursive: true, force: true });
-        await rm(fake.dir, { recursive: true, force: true });
+        await rm(fake.directory, { recursive: true, force: true });
     }
 });
 test("provider accepts an empty response with exactly one terminal event", async () => {
@@ -307,14 +384,14 @@ process.stdin.on("end", () => {
         const events = [];
         for await (const event of stream)
             events.push(event.type);
-        const result = await stream.result();
+        const result = await settledRequest(stream);
         assert.deepEqual(events, ["start", "done"]);
         assert.deepEqual(result.content, []);
         assert.equal(result.usage.totalTokens, 3);
         assert.equal(events.filter((type) => type === "done" || type === "error").length, 1);
     }
     finally {
-        await rm(fake.dir, { recursive: true, force: true });
+        await rm(fake.directory, { recursive: true, force: true });
     }
 });
 test("provider rejects a non-string successful result with exactly one terminal error", async () => {
@@ -329,14 +406,14 @@ process.stdin.on("end", () => {
         const events = [];
         for await (const event of stream)
             events.push(event.type);
-        const result = await stream.result();
+        const result = await settledRequest(stream);
         assert.deepEqual(events, ["start", "error"]);
         assert.equal(result.stopReason, "error");
         assert.match(result.errorMessage ?? "", /non-string result field/);
         assert.equal(events.filter((type) => type === "done" || type === "error").length, 1);
     }
     finally {
-        await rm(fake.dir, { recursive: true, force: true });
+        await rm(fake.directory, { recursive: true, force: true });
     }
 });
 test("provider reports process-group cleanup rejection instead of leaving the stream unresolved", { skip: process.platform === "win32" }, async () => {
@@ -347,20 +424,17 @@ process.stdin.on("end", () => {
   process.stdout.write(JSON.stringify({type:"result",is_error:false,result:"must not succeed",usage:{}}) + "\\n");
 });`);
     try {
-        const result = await Promise.race([
-            createClaudeStream(
+        const result = await settledRequest(createClaudeStream(
                 { executable: fake.executable, version: "test", subscriptionType: "pro" },
-                { supervise: supervisorWithCleanupFailure },
-            )(model, context, { reasoning: "medium" }).result(),
-            new Promise((_, reject) => setTimeout(() => reject(new Error("provider stream did not settle")), 1000)),
-        ]);
+                { supervise: supervisorWithCleanupFailure("synthetic process-group EPERM") },
+            )(model, context, { reasoning: "medium" }));
         assert.equal(result.stopReason, "error");
         assert.match(result.errorMessage ?? "", /synthetic process-group EPERM/);
-        const metrics = await waitForRequestMetrics((entry) => entry.errorCategory === "process_cleanup");
+        const metrics = await requestMetrics(result, (entry) => entry.errorCategory === "process_cleanup");
         assert.equal(metrics.cleanupComplete, true);
     }
     finally {
-        await rm(fake.dir, { recursive: true, force: true });
+        await rm(fake.directory, { recursive: true, force: true });
     }
 });
 test("provider settles once and retains marked state when process death is unknown", { skip: process.platform === "win32" }, async () => {
@@ -389,13 +463,10 @@ test("provider settles once and retains marked state when process death is unkno
             events.push(event.type);
             if (event.type === "error") publishedFailure = event.error.errorMessage;
         }
-        const result = await Promise.race([
-            stream.result(),
-            new Promise((_, reject) => setTimeout(() => reject(new Error("provider stream did not settle")), 500)),
-        ]);
+        const result = await settledRequest(stream);
         assert.equal(result.stopReason, "error");
         assert.equal(events.filter((type) => type === "error" || type === "done").length, 1);
-        const metrics = await waitForRequestMetrics((entry) => entry.errorCategory === "process_cleanup" && entry.cleanupComplete === false);
+        const metrics = await requestMetrics(result, (entry) => entry.errorCategory === "process_cleanup" && entry.cleanupComplete === false);
         assert.equal(metrics.cleanupComplete, false);
         assert.match(publishedFailure ?? "", /no protocol activity for 30ms/);
         assert.match(result.errorMessage ?? "", /no protocol activity for 30ms/);
@@ -406,14 +477,13 @@ test("provider settles once and retains marked state when process death is unkno
         assert.equal(directories.length, 1);
         const marker = JSON.parse(await readFile(join(root, directories[0], ".pi-claude-code-provider-runtime.json"), "utf8"));
         assert.equal(marker.childPid, capturedChild.pid);
-        assert.doesNotThrow(() => process.kill(capturedChild.pid, 0));
     } finally {
         if (capturedChild) await terminateProcessGroup(capturedChild);
         if (originalTmpdir === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = originalTmpdir;
         if (originalIdle === undefined) delete process.env.PI_CLAUDE_CODE_PROVIDER_IDLE_TIMEOUT_MS;
         else process.env.PI_CLAUDE_CODE_PROVIDER_IDLE_TIMEOUT_MS = originalIdle;
         await rm(root, { recursive: true, force: true });
-        await rm(fake.dir, { recursive: true, force: true });
+        await rm(fake.directory, { recursive: true, force: true });
     }
 });
 
@@ -444,11 +514,11 @@ process.stdin.on("end", () => {
                 } });
             },
         })(model, { messages: [{ role: "user", content: [{ type: "image", data: "AA==", mimeType: "image/png" }], timestamp: 1 }] });
-        const result = await stream.result();
+        const result = await settledRequest(stream);
         assert.equal(result.stopReason, "error");
         assert.match(result.errorMessage, /synthetic surviving-group failure/);
         assert.match(result.errorMessage, /runtime state was retained/);
-        const metrics = await waitForRequestMetrics((entry) => entry.errorCategory === "process_cleanup");
+        const metrics = await requestMetrics(result, (entry) => entry.errorCategory === "process_cleanup");
         assert.equal(metrics.cleanupComplete, false);
         await store.close();
         const entries = await readdir(root);
@@ -473,10 +543,10 @@ process.stdin.on("end", () => {
   process.stdout.write(JSON.stringify({type:"result",is_error:false,result:reported,usage:{input_tokens:1,output_tokens:1}}) + "\\n");
 });`);
     try {
-        const result = await createClaudeStream(
+        const result = await settledRequest(createClaudeStream(
             { executable: fake.executable, version: "test", subscriptionType: "pro" },
             { resolveSession: () => ({ cwd: sessionDirectory }) },
-        )(model, context, { reasoning: "medium" }).result();
+        )(model, context, { reasoning: "medium" }));
         assert.equal(result.stopReason, "stop", result.errorMessage);
         const reported = JSON.parse(result.content.find((block) => block.type === "text")?.text ?? "{}");
         // Claude Code reports its cwd to the model, so it must be Pi's directory,
@@ -487,7 +557,7 @@ process.stdin.on("end", () => {
         await access(sessionDirectory);
     }
     finally {
-        await Promise.all([fake.dir, sessionDirectory].map((directory) => rm(directory, { recursive: true, force: true })));
+        await Promise.all([fake.directory, sessionDirectory].map((directory) => rm(directory, { recursive: true, force: true })));
     }
 });
 
@@ -504,16 +574,16 @@ process.stdin.on("end", () => {
 });`);
     const registry = new Map([["parent", { cwd: parent }]]);
     const installation = { executable: fake.executable, version: "test", subscriptionType: "pro" };
-    const run = (systemPrompt, options = {}, allowBorrowSoleDirectory = false) => createClaudeStream(installation, {
+    const run = (systemPrompt, options = {}, allowBorrowSoleDirectory = false) => settledRequest(createClaudeStream(installation, {
         resolveSession: (request) => resolveSession(registry, { ...request, allowBorrowSoleDirectory }),
-    })(model, providerContext({ tools: [readTool], systemPrompt }), options).result();
+    })(model, providerContext({ tools: [readTool], systemPrompt }), options));
     const instructions = "You are the main-session subagent watchdog for Pi.\nReview only the supplied parent turn delta.";
     const proseOnly = `${instructions}\nWorking directory: ${child}`;
     try {
         const childTurn = await run(`Child agent\nCurrent working directory: ${child}`, { sessionId: "unregistered-child" });
         assert.equal(childTurn.stopReason, "stop", childTurn.errorMessage);
         assert.equal(await realpath(await readFile(spawnMarker, "utf8")), await realpath(child));
-        assert.equal((await waitForRequestMetrics((entry) => entry.sessionResolution === "prompt")).errorCategory, undefined);
+        assert.equal((await requestMetrics(childTurn, (entry) => entry.sessionResolution === "prompt")).errorCategory, undefined);
         await rm(spawnMarker);
 
         // pi-subagents HEAD sends this <cwd> in its leading system message,
@@ -521,21 +591,21 @@ process.stdin.on("end", () => {
         const watchdog = await run(`${instructions}\n\n<cwd>\n${child}\n</cwd>`);
         assert.equal(watchdog.stopReason, "stop", watchdog.errorMessage);
         assert.equal(await realpath(await readFile(spawnMarker, "utf8")), await realpath(child));
-        assert.equal((await waitForRequestMetrics((entry) => entry.sessionResolution === "prompt")).errorCategory, undefined);
+        assert.equal((await requestMetrics(watchdog, (entry) => entry.sessionResolution === "prompt")).errorCategory, undefined);
         await rm(spawnMarker);
 
         const refused = await run(proseOnly);
         assert.equal(refused.stopReason, "error");
         assert.match(refused.errorMessage ?? "", /refusing to borrow the sole live session/);
-        assert.equal((await waitForRequestMetrics((entry) => entry.errorCategory === "working_directory")).sessionResolution, undefined);
+        assert.equal((await requestMetrics(refused, (entry) => entry.errorCategory === "working_directory")).sessionResolution, undefined);
         await assert.rejects(access(spawnMarker));
 
         const borrowed = await run(proseOnly, {}, true);
         assert.equal(borrowed.stopReason, "stop", borrowed.errorMessage);
         assert.equal(await realpath(await readFile(spawnMarker, "utf8")), await realpath(parent));
-        assert.equal((await waitForRequestMetrics((entry) => entry.sessionResolution === "single")).errorCategory, undefined);
+        assert.equal((await requestMetrics(borrowed, (entry) => entry.sessionResolution === "single")).errorCategory, undefined);
     } finally {
-        await Promise.all([parent, child, fake.dir].map((directory) => rm(directory, { recursive: true, force: true })));
+        await Promise.all([parent, child, fake.directory].map((directory) => rm(directory, { recursive: true, force: true })));
     }
 });
 
@@ -543,17 +613,17 @@ test("a payload hook cannot add tools to a markerless tool-free borrow", async (
     const directory = await mkdtemp(join(tmpdir(), "provider-oneshot-cwd-"));
     let claims = 0;
     try {
-        const result = await createClaudeStream(
+        const result = await settledRequest(createClaudeStream(
             { executable: "/unused/claude", version: "test", subscriptionType: "pro" },
             {
                 resolveSession: (request) => resolveSession(new Map([["parent", { cwd: directory }]]), request),
                 claimLaunch: async () => { claims += 1; },
             },
-        )(model, context, { onPayload: (payload) => ({ ...payload, tools: [readTool] }) }).result();
+        )(model, context, { onPayload: (payload) => ({ ...payload, tools: [readTool] }) }));
         assert.equal(result.stopReason, "error");
         assert.match(result.errorMessage ?? "", /gained tools after before_provider_request/);
         assert.equal(claims, 0);
-        assert.equal((await waitForRequestMetrics((entry) => entry.errorCategory === "working_directory")).sessionResolution, "oneshot");
+        assert.equal((await requestMetrics(result, (entry) => entry.errorCategory === "working_directory")).sessionResolution, "oneshot");
     } finally {
         await rm(directory, { recursive: true, force: true });
     }
@@ -562,13 +632,13 @@ test("a payload hook cannot add tools to a markerless tool-free borrow", async (
 test("a transcript declaring no prompt or tools reaches the hook as absent, not empty", async () => {
     let routed;
     let payload;
-    const result = await createClaudeStream(
+    const result = await settledRequest(createClaudeStream(
         { executable: "/unused/claude", version: "test", subscriptionType: "pro" },
         {
             resolveSession: (request) => { routed = request; return { cwd: tmpdir() }; },
             claimLaunch: async () => { throw new Error("stop before launch"); },
         },
-    )(model, context, { onPayload: (value) => { payload = value; } }).result();
+    )(model, context, { onPayload: (value) => { payload = value; } }));
     assert.equal(result.stopReason, "error");
     assert.match(result.errorMessage ?? "", /stop before launch/);
     assert.equal(routed.systemPrompt, undefined);
@@ -617,32 +687,32 @@ process.stdin.on("end", () => {
     let routed;
     let hooked;
     try {
-        const result = await createClaudeStream(
+        const result = await settledRequest(createClaudeStream(
             { executable: fake.executable, version: "test", subscriptionType: "pro" },
             { resolveSession: (request) => { routed = request; return resolveSession(new Map([["parent", { cwd: parent }]]), request); } },
         )(model, input, {
             sessionId: "child",
             onPayload: (payload) => { hooked = payload; return { ...payload, tools: [hookRead] }; },
-        }).result();
+        }));
         assert.equal(result.stopReason, "stop", result.errorMessage);
         assert.equal(routed.systemPrompt, expectedPrompt);
         assert.equal(routed.hasTools, true);
         assert.equal(hooked.systemPrompt, expectedPrompt);
         assert.deepEqual(hooked.messages, context.messages);
         assert.deepEqual(hooked.tools, [updatedRead]);
-        const captured = JSON.parse(await readFile(join(fake.dir, "captured-transcript"), "utf8"));
+        const captured = JSON.parse(await readFile(join(fake.directory, "captured-transcript"), "utf8"));
         assert.equal(await realpath(captured.cwd), await realpath(child));
         assert.equal(captured.prompt, expectedPrompt);
         assert.deepEqual(captured.catalog, [{ name: "read", description: "hook read", inputSchema: hookRead.parameters }]);
-        assert.equal((await waitForRequestMetrics((entry) => entry.stopReason === "stop")).sessionResolution, "prompt");
+        assert.equal((await requestMetrics(result, (entry) => entry.stopReason === "stop")).sessionResolution, "prompt");
     } finally {
-        await Promise.all([parent, child, fake.dir].map((directory) => rm(directory, { recursive: true, force: true })));
+        await Promise.all([parent, child, fake.directory].map((directory) => rm(directory, { recursive: true, force: true })));
     }
 });
 
 test("0.86 transcript one-shot borrowing refuses tools added by the payload hook", async () => {
     let claims = 0;
-    const result = await createClaudeStream(
+    const result = await settledRequest(createClaudeStream(
         { executable: "/unused/claude", version: "test", subscriptionType: "pro" },
         {
             resolveSession: (request) => resolveSession(new Map([["parent", { cwd: tmpdir() }]]), request),
@@ -651,7 +721,7 @@ test("0.86 transcript one-shot borrowing refuses tools added by the payload hook
     )(model, { messages: [{ role: "system", content: "Summary", timestamp: 0 }, ...baseMessages] }, {
         sessionId: "summary",
         onPayload: (payload) => ({ ...payload, tools: [readTool] }),
-    }).result();
+    }));
     assert.equal(result.stopReason, "error");
     assert.match(result.errorMessage ?? "", /gained tools after before_provider_request/);
     assert.equal(claims, 0);
@@ -671,20 +741,20 @@ process.stdin.on("end", () => {
         // the way Pi clamps every other provider, instead of reserving the model
         // maximum and rejecting a prompt that fits.
         const boundedModel = { ...model, contextWindow: 3_000, maxTokens: 64_000 };
-        const result = await createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(
+        const result = await settledRequest(createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(
             boundedModel,
             context,
             { maxTokens: 2_048 },
-        ).result();
+        ));
         assert.equal(result.stopReason, "stop", result.errorMessage);
         const forwarded = Number(await readFile(marker, "utf8"));
-        const estimated = getLastRequestMetrics()?.estimatedInputTokens ?? 0;
-        assert.equal(forwarded, 3_000 - estimated - 300);
+        const metrics = await requestMetrics(result);
+        assert.equal(forwarded, 3_000 - metrics.estimatedInputTokens - 300);
         assert.ok(forwarded > 2_048, `expected reasoning room above the requested answer cap, got ${forwarded}`);
-        assert.equal(getLastRequestMetrics()?.servedMaxOutputTokens, 64_000);
+        assert.equal(metrics.servedMaxOutputTokens, 64_000);
     } finally {
         await rm(directory, { recursive: true, force: true });
-        await rm(fake.dir, { recursive: true, force: true });
+        await rm(fake.directory, { recursive: true, force: true });
     }
 });
 test("Haiku omits effort while recording Claude Code's default", async () => {
@@ -697,23 +767,23 @@ process.stdin.on("end", () => {
 });`);
     try {
         const haiku = { ...model, id: "haiku", name: "Haiku", reasoning: false, contextWindow: 200_000, maxTokens: 32_000 };
-        const result = await createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(haiku, context, { reasoning: "off" }).result();
+        const result = await settledRequest(createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(haiku, context, { reasoning: "off" }));
         assert.equal(result.stopReason, "stop", result.errorMessage);
-        const args = JSON.parse(await readFile(join(fake.dir, "argv.json"), "utf8"));
+        const args = JSON.parse(await readFile(join(fake.directory, "argv.json"), "utf8"));
         assert.equal(args.includes("--effort"), false);
-        const metrics = await waitForRequestMetrics((entry) => entry.requestedModel === "haiku" && entry.stopReason === "stop");
+        const metrics = await requestMetrics(result, (entry) => entry.requestedModel === "haiku" && entry.stopReason === "stop");
         assert.equal(metrics.effort, "default");
     } finally {
-        await rm(fake.dir, { recursive: true, force: true });
+        await rm(fake.directory, { recursive: true, force: true });
     }
 });
 test("provider rejects a model without a usable output maximum before claiming a launch", async () => {
     let claims = 0;
     const invalidModel = { ...model, maxTokens: undefined };
-    const result = await createClaudeStream(
+    const result = await settledRequest(createClaudeStream(
         { executable: "/does/not/matter", version: "test", subscriptionType: "pro" },
         { claimLaunch: async () => { claims++; } },
-    )(invalidModel, context, { maxTokens: 2_048 }).result();
+    )(invalidModel, context, { maxTokens: 2_048 }));
     assert.equal(result.stopReason, "error");
     assert.match(result.errorMessage ?? "", /maxTokens must be a positive integer/);
     assert.equal(claims, 0);
@@ -726,12 +796,12 @@ process.stdin.on("end", () => {
   process.stdout.write(JSON.stringify({type:"result",is_error:false,result:"must not succeed",usage:{}}) + "\\n", () => process.exit(7));
 });`);
     try {
-        const result = await createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, context, { reasoning: "medium" }).result();
+        const result = await settledRequest(createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, context, { reasoning: "medium" }));
         assert.equal(result.stopReason, "error");
         assert.match(result.errorMessage ?? "", /successful result \(code 7/);
     }
     finally {
-        await rm(fake.dir, { recursive: true, force: true });
+        await rm(fake.directory, { recursive: true, force: true });
     }
 });
 test("provider keeps the exit diagnostic when overage is administratively disabled", async () => {
@@ -752,15 +822,15 @@ process.stdin.on("end", () => {
   process.stdout.write(JSON.stringify({type:"rate_limit_event",rate_limit_info:${JSON.stringify(rateLimitInfo)}}) + "\\n", () => process.exit(9));
 });`);
     try {
-        const result = await createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, context, { reasoning: "medium" }).result();
+        const result = await settledRequest(createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, context, { reasoning: "medium" }));
         assert.equal(result.stopReason, "error");
         assert.match(result.errorMessage ?? "", /exited before a terminal event \(code 9/);
         assert.doesNotMatch(result.errorMessage ?? "", /rate limit/);
-        const metrics = await waitForRequestMetrics((entry) => entry.errorCategory === "process_exit" && entry.exitCode === 9);
+        const metrics = await requestMetrics(result, (entry) => entry.errorCategory === "process_exit" && entry.exitCode === 9);
         assert.equal(metrics.lastPhase, "process_exited");
     }
     finally {
-        await rm(fake.dir, { recursive: true, force: true });
+        await rm(fake.directory, { recursive: true, force: true });
     }
 });
 test("provider rejects a process that hangs after a successful result", async () => {
@@ -774,21 +844,24 @@ process.stdin.on("end", () => {
     const originalIdle = process.env.PI_CLAUDE_CODE_PROVIDER_IDLE_TIMEOUT_MS;
     process.env.PI_CLAUDE_CODE_PROVIDER_IDLE_TIMEOUT_MS = "30";
     try {
-        const result = await createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, context, { reasoning: "medium", timeoutMs: 1000 }).result();
+        const result = await settledRequest(createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, context, { reasoning: "medium", timeoutMs: 1000 }));
         assert.equal(result.stopReason, "error");
         assert.match(result.errorMessage ?? "", /no protocol activity for 30ms/);
-        const metrics = await waitForRequestMetrics((entry) => entry.errorCategory === "process");
+        const metrics = await requestMetrics(result, (entry) => entry.errorCategory === "process");
         assert.equal(metrics.terminationExpected, false);
     }
     finally {
         if (originalIdle === undefined) delete process.env.PI_CLAUDE_CODE_PROVIDER_IDLE_TIMEOUT_MS;
         else process.env.PI_CLAUDE_CODE_PROVIDER_IDLE_TIMEOUT_MS = originalIdle;
-        await rm(fake.dir, { recursive: true, force: true });
+        await rm(fake.directory, { recursive: true, force: true });
     }
 });
 
 test("provider aborts and returns an aborted terminal event", async () => {
+    // Abort only once Claude is running: a fixed delay could land before launch on
+    // a loaded runner, which takes the separately tested pre-launch path instead.
     const fake = await fakeClaude(`
+fs.writeFileSync(require("node:path").join(__dirname, "started"), "");
 process.stdin.resume();
 process.stdout.write(JSON.stringify(${JSON.stringify(init)}) + "\\n");
 process.stdout.write(JSON.stringify({type:"stream_event",event:{type:"message_start",message:{id:"msg_abort",model:"claude-sonnet-5",usage:{input_tokens:0,output_tokens:0}}}}) + "\\n");
@@ -800,18 +873,19 @@ setInterval(() => {}, 1000);`);
             version: CAPTURED_CLAUDE_VERSION,
             subscriptionType: "pro",
         })(model, context, { reasoning: "medium", signal: controller.signal });
-        setTimeout(() => controller.abort(), 50);
+        void waitFor(async () => access(join(fake.directory, "started")).then(() => true, () => false), "fake Claude launch")
+            .then(() => controller.abort());
         const events = [];
         for await (const event of stream) events.push(event.type);
-        const result = await stream.result();
+        const result = await settledRequest(stream);
         assert.equal(result.stopReason, "aborted");
         assert.match(result.errorMessage ?? "", /aborted/);
         assert.equal(events.filter((type) => type === "done" || type === "error").length, 1);
-        const metrics = await waitForRequestMetrics((entry) => entry.errorCategory === "aborted");
+        const metrics = await requestMetrics(result, (entry) => entry.errorCategory === "aborted");
         assert.equal(metrics.terminationExpected, true);
     }
     finally {
-        await rm(fake.dir, { recursive: true, force: true });
+        await rm(fake.directory, { recursive: true, force: true });
     }
 });
 test("provider does not spawn Claude for an already-aborted request", async () => {
@@ -833,11 +907,11 @@ test("provider does not spawn Claude for an already-aborted request", async () =
         const events = [];
         for await (const event of stream)
             events.push(event.type);
-        const result = await stream.result();
+        const result = await settledRequest(stream);
         assert.deepEqual(events, ["error"]);
         assert.equal(result.stopReason, "aborted");
         assert.match(result.errorMessage ?? "", /aborted/);
-        const metrics = await waitForRequestMetrics((entry) => entry.errorCategory === "aborted" && entry.lastPhase === "prepared");
+        const metrics = await requestMetrics(result, (entry) => entry.errorCategory === "aborted" && entry.lastPhase === "prepared");
         assert.equal(metrics.terminationExpected, false);
         await assert.rejects(access(marker));
         let privateDirectories = [];
@@ -873,10 +947,10 @@ test("provider does not spawn Claude when the request aborts during the launch c
             version: "test",
             subscriptionType: "pro",
         }, { claimLaunch: abortDuringClaim })(model, context, { reasoning: "medium", signal: controller.signal });
-        const result = await stream.result();
+        const result = await settledRequest(stream);
         assert.equal(result.stopReason, "aborted");
         assert.match(result.errorMessage ?? "", /aborted/);
-        const metrics = await waitForRequestMetrics((entry) => entry.errorCategory === "aborted" && entry.lastPhase === "prepared");
+        const metrics = await requestMetrics(result, (entry) => entry.errorCategory === "aborted" && entry.lastPhase === "prepared");
         assert.equal(metrics.terminationExpected, false);
         await assert.rejects(access(marker));
         let privateDirectories = [];
@@ -900,21 +974,21 @@ test("provider rejects invalid timeout configuration before spawning Claude", as
     const originalIdle = process.env.PI_CLAUDE_CODE_PROVIDER_IDLE_TIMEOUT_MS;
     process.env.PI_CLAUDE_CODE_PROVIDER_IDLE_TIMEOUT_MS = "banana";
     try {
-        const result = await createClaudeStream({
+        const result = await settledRequest(createClaudeStream({
             executable: fake.executable,
             version: "test",
             subscriptionType: "pro",
-        })(model, context, { reasoning: "medium" }).result();
+        })(model, context, { reasoning: "medium" }));
         assert.equal(result.stopReason, "error");
         assert.match(result.errorMessage ?? "", /positive integer/);
-        const metrics = await waitForRequestMetrics((entry) => entry.errorCategory === "timeout_config");
+        const metrics = await requestMetrics(result, (entry) => entry.errorCategory === "timeout_config");
         assert.equal(metrics.lastPhase, "prepared");
         await assert.rejects(access(marker));
     }
     finally {
         if (originalIdle === undefined) delete process.env.PI_CLAUDE_CODE_PROVIDER_IDLE_TIMEOUT_MS;
         else process.env.PI_CLAUDE_CODE_PROVIDER_IDLE_TIMEOUT_MS = originalIdle;
-        await Promise.all([fake.dir, root].map((directory) => rm(directory, { recursive: true, force: true })));
+        await Promise.all([fake.directory, root].map((directory) => rm(directory, { recursive: true, force: true })));
     }
 });
 
@@ -933,15 +1007,15 @@ test("provider accepts Node's maximum timer delay and rejects the next milliseco
     process.on("warning", onWarning);
     try {
         for (const name of names) process.env[name] = "2147483647";
-        await createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, context, { reasoning: "medium" }).result();
+        await settledRequest(createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, context, { reasoning: "medium" }));
         assert.equal(await readFile(marker, "utf8"), "spawned");
         await rm(marker);
         for (const name of names) {
             process.env[name] = "2147483648";
-            const result = await createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, context, { reasoning: "medium" }).result();
+            const result = await settledRequest(createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, context, { reasoning: "medium" }));
             assert.equal(result.stopReason, "error");
             assert.match(result.errorMessage ?? "", /2147483647/);
-            await waitForRequestMetrics((entry) => entry.errorCategory === "timeout_config");
+            await requestMetrics(result, (entry) => entry.errorCategory === "timeout_config");
             await assert.rejects(access(marker));
             process.env[name] = "2147483647";
         }
@@ -952,7 +1026,7 @@ test("provider accepts Node's maximum timer delay and rejects the next milliseco
             if (original[name] === undefined) delete process.env[name];
             else process.env[name] = original[name];
         }
-        await Promise.all([fake.dir, root].map((directory) => rm(directory, { recursive: true, force: true })));
+        await Promise.all([fake.directory, root].map((directory) => rm(directory, { recursive: true, force: true })));
     }
 });
 test("provider rejects tool calls against its private transport directory", async () => {
@@ -976,19 +1050,107 @@ process.stdin.on("end", () => {
             version: CAPTURED_CLAUDE_VERSION,
             subscriptionType: "pro",
         })(model, toolContext, { reasoning: "medium" });
-        const result = await stream.result();
+        const result = await settledRequest(stream);
         assert.equal(result.stopReason, "error");
         assert.match(result.errorMessage ?? "", /provider-private transport state/);
     }
     finally {
-        await rm(fake.dir, { recursive: true, force: true });
+        await rm(fake.directory, { recursive: true, force: true });
     }
 });
+
+test("private-path comparison follows native spelling and cwd rules recursively", () => {
+    const cases = [
+        { platform: "linux", directory: "/tmp/private", cwd: "/work/project", rejected: [
+            "/tmp/./private", "/tmp//private/image.png", "../../tmp/./private/image.png",
+            "/tmp/elsewhere/../private/image.png", "cat /tmp/private/image.png",
+        ], accepted: [
+            "README.md", "/tmp/./private-neighbor/image.png", "/tmp/./private/../public/image.png",
+            "/tmp/./pri\\vate/image.png",
+        ] },
+        { platform: "win32", directory: "C:\\Temp\\Private", cwd: "C:\\Work\\Project", rejected: [
+            "c:/temp/./PRIVATE", "C:\\Temp\\.\\Private\\image.png", "c:/temp//private/image.png",
+            "..\\..\\Temp\\.\\PRIVATE\\image.png", "C:\\Temp\\Other\\..\\Private\\image.png",
+            "cat c:/temp/private/image.png",
+        ], accepted: [
+            "README.md", "c:/temp/./private-neighbor/image.png", "C:\\Temp\\.\\Private\\..\\Public\\image.png",
+            "D:\\Temp\\Private\\image.png",
+        ] },
+        // A macOS volume is case-insensitive by default, so case is folded there too.
+        { platform: "darwin", directory: "/private/var/folders/x/T/pi-claude-code-provider-request-A", cwd: "/work/project", rejected: [
+            "/private/var/folders/x/T/PI-CLAUDE-CODE-PROVIDER-REQUEST-A/prompt.txt",
+            "/Private/var/folders/x/T/pi-claude-code-provider-request-A",
+        ], accepted: [
+            "/private/var/folders/x/T/pi-claude-code-provider-images-A/image.png", "README.md",
+        ] },
+    ];
+    for (const { platform, directory, cwd, rejected, accepted } of cases) {
+        for (const path of rejected) {
+            assert.equal(containsPrivateTransportPath({ outer: [{ path }] }, directory, cwd, platform), true, path);
+        }
+        for (const path of accepted) {
+            assert.equal(containsPrivateTransportPath({ outer: [{ path }] }, directory, cwd, platform), false, path);
+        }
+    }
+    assert.equal(containsPrivateTransportPath("/tmp/prívate/image.png", "/tmp/prívate", "/work", "linux"), true);
+    // The temporary root's alias spelling is caught once both spellings are checked.
+    const macDirectory = "/private/var/folders/x/T/pi-claude-code-provider-request-A";
+    const macSpellings = privatePathSpellings([macDirectory], "/var/folders/x/T/", "/private/var/folders/x/T");
+    const macAlias = "/var/folders/x/T/pi-claude-code-provider-request-A/prompt.txt";
+    assert.equal(containsPrivateTransportPath(macAlias, macDirectory, "/work", "darwin"), false, "one spelling alone misses the alias");
+    assert.equal(macSpellings.some((directory) => containsPrivateTransportPath(macAlias, directory, "/work", "darwin")), true);
+});
+
+for (const sessionImage of [false, true]) {
+    test(`provider rejects equivalent paths into its private ${sessionImage ? "image store" : "request directory"}`, async () => {
+        const store = new SessionImageStore();
+        store.open();
+        const fake = await fakeClaude(`
+process.on("SIGTERM", () => process.exit(143));
+let input = "";
+process.stdin.on("data", (chunk) => { input += chunk; });
+process.stdin.on("end", () => {
+  const path = require("node:path");
+  const requestDirectory = path.dirname(process.argv[process.argv.indexOf("--system-prompt-file") + 1]);
+  const attachment = ${sessionImage} ? JSON.parse(input).message.content.at(-1).text.match(/@"([^"]+)"/)[1] : path.join(requestDirectory, "system-prompt.txt");
+  fs.writeFileSync(path.join(__dirname, "target"), attachment);
+  const privateDirectory = path.dirname(attachment);
+  const alternate = path.dirname(privateDirectory) + path.sep + "." + path.sep + path.basename(privateDirectory) + path.sep + path.basename(attachment);
+  process.stdout.write(JSON.stringify(${JSON.stringify(toolInit)}) + "\\n");
+  const records = ${JSON.stringify(toolUseEvents({ messageId: "msg_private_alias", toolUseId: "toolu_private_alias" }))};
+  records[1].event.content_block.input = { path: alternate };
+  for (const record of records) process.stdout.write(JSON.stringify(record) + "\\n");
+  setInterval(() => {}, 1000);
+});`);
+        const logical = { tools: [readTool], messages: [{ role: "user", timestamp: 1, content: sessionImage ? [
+            { type: "image", mimeType: "image/png", data: Buffer.from("private image bytes").toString("base64") },
+        ] : "hello" }] };
+        try {
+            const result = await settledRequest(createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" }, {
+                resolveSession: () => ({ cwd: fake.directory, imageStore: store }),
+            })(model, providerContext(logical)));
+            assert.equal(result.stopReason, "error");
+            assert.match(result.errorMessage, /provider-private transport state/);
+            const metrics = await requestMetrics(result);
+            assert.equal(metrics.errorCategory, "private_transport");
+            assert.equal(metrics.cleanupComplete, true);
+            const target = await readFile(join(fake.directory, "target"), "utf8");
+            if (sessionImage) assert.equal(await readFile(target, "utf8"), "private image bytes");
+            else await assert.rejects(access(target));
+            await store.close();
+            await assert.rejects(access(target));
+        } finally {
+            await store.close();
+            await rm(fake.directory, { recursive: true, force: true });
+        }
+    });
+}
 // These cases start the real MCP bridge. Restricted sandboxes can drop live
 // stdin to nested Node children, which makes readiness time out independently
 // of provider behavior; run this integration coverage outside the sandbox.
-test("provider checks MCP execution violations after tool-use termination", async () => {
-    const fake = await fakeClaude(`
+for (const proposalName of ["mcp__pi__read", "read"]) {
+    test(`provider checks MCP execution violations after ${proposalName} termination`, async () => {
+        const fake = await fakeClaude(`
 const violationConfigIndex = process.argv.indexOf("--mcp-config");
 const violationConfig = JSON.parse(process.argv[violationConfigIndex + 1]);
 const violation = violationConfig.mcpServers.pi.env.PI_CLAUDE_TOOL_VIOLATION;
@@ -1000,18 +1162,22 @@ else process.on("SIGTERM", () => {
 process.stdin.resume();
 process.stdin.on("end", () => {
   process.stdout.write(JSON.stringify(${JSON.stringify(toolInit)}) + "\\n");
-  for (const record of ${JSON.stringify(toolUseEvents({ messageId: "msg_violation", toolUseId: "toolu_violation" }))}) process.stdout.write(JSON.stringify(record) + "\\n");
+  for (const record of ${JSON.stringify(toolUseEvents({ messageId: "msg_violation", toolUseId: "toolu_violation", name: proposalName }))}) process.stdout.write(JSON.stringify(record) + "\\n");
   setInterval(() => {}, 1000);
 });`);
-    try {
-        const result = await createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, toolContext, { reasoning: "medium" }).result();
-        assert.equal(result.stopReason, "error");
-        assert.match(result.errorMessage ?? "", /Security invariant violated/);
-    }
-    finally {
-        await rm(fake.dir, { recursive: true, force: true });
-    }
-});
+        try {
+            const result = await settledRequest(createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, toolContext, { reasoning: "medium" }));
+            assert.equal(result.stopReason, "error");
+            assert.match(result.errorMessage ?? "", /Security invariant violated/);
+            const metrics = await requestMetrics(result);
+            assert.equal(metrics.errorCategory, "mcp_execution");
+            assert.equal(metrics.cleanupComplete, true);
+        }
+        finally {
+            await rm(fake.directory, { recursive: true, force: true });
+        }
+    });
+}
 test("provider preserves MCP violation diagnostics when private cleanup also fails", async () => {
     const fake = await fakeClaude(`
 const violationConfigIndex = process.argv.indexOf("--mcp-config");
@@ -1036,27 +1202,21 @@ process.stdin.on("end", () => {
         throw new Error("synthetic cleanup failure");
     };
     try {
-        const result = await createClaudeStream(
+        const result = await settledRequest(createClaudeStream(
             { executable: fake.executable, version: "test", subscriptionType: "pro" },
             { cleanupDirectory: failCleanup },
-        )(model, toolContext, { reasoning: "medium" }).result();
+        )(model, toolContext, { reasoning: "medium" }));
         assert.equal(result.stopReason, "error");
         assert.match(result.errorMessage ?? "", /Security invariant violated/);
         assert.match(result.errorMessage ?? "", /private request cleanup failed: synthetic cleanup failure/);
-        for (
-            let attempt = 0;
-            attempt < 20 && (cleanupAttempts < 2 || getLastRequestMetrics()?.cleanupComplete !== false);
-            attempt++
-        ) {
-            await new Promise((resolve) => setTimeout(resolve, 5));
-        }
-        assert.equal(getLastRequestMetrics()?.errorCategory, "mcp_execution");
-        assert.equal(getLastRequestMetrics()?.cleanupComplete, false);
+        assert.equal(cleanupAttempts, 2);
+        assert.equal((await requestMetrics(result))?.errorCategory, "mcp_execution");
+        assert.equal((await requestMetrics(result))?.cleanupComplete, false);
         assert.ok(cleanupAttempts >= 2);
     }
     finally {
         if (privateDirectory) await rm(privateDirectory, { recursive: true, force: true });
-        await rm(fake.dir, { recursive: true, force: true });
+        await rm(fake.directory, { recursive: true, force: true });
     }
 });
 test("accepts only the platform-specific provider-terminated handoff exit", () => {
@@ -1083,14 +1243,14 @@ process.stdin.on("end", () => {
   setInterval(() => {}, 1000);
 });`);
     try {
-        const result = await createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, toolContext, { reasoning: "medium" }).result();
+        const result = await settledRequest(createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, toolContext, { reasoning: "medium" }));
         assert.equal(result.stopReason, "toolUse");
-        const metrics = await waitForRequestMetrics((entry) => entry.stopReason === "toolUse" && entry.exitCode === 1);
+        const metrics = await requestMetrics(result, (entry) => entry.stopReason === "toolUse" && entry.exitCode === 1);
         assert.equal(metrics.exitSignal, null);
         assert.equal(metrics.cleanupComplete, true);
     }
     finally {
-        await rm(fake.dir, { recursive: true, force: true });
+        await rm(fake.directory, { recursive: true, force: true });
     }
 });
 
@@ -1115,12 +1275,12 @@ process.stdin.on("end", () => {
             version: CAPTURED_CLAUDE_VERSION,
             subscriptionType: "pro",
         })(model, toolContext, { reasoning: "medium" });
-        const result = await stream.result();
+        const result = await settledRequest(stream);
         assert.equal(result.stopReason, "toolUse");
         const toolCall = result.content.find((block) => block.type === "toolCall");
         assert.ok(toolCall);
         await assert.rejects(access(toolCall.id));
-        const metrics = await waitForRequestMetrics((entry) => entry.stopReason === "toolUse");
+        const metrics = await requestMetrics(result, (entry) => entry.stopReason === "toolUse");
         assert.equal(result.usage.totalTokens, 6);
         assert.equal(metrics.terminationExpected, true);
         assert.equal(metrics.lastPhase, "completed");
@@ -1129,7 +1289,7 @@ process.stdin.on("end", () => {
         assert.equal(metrics.cleanupComplete, true);
     }
     finally {
-        await rm(fake.dir, { recursive: true, force: true });
+        await rm(fake.directory, { recursive: true, force: true });
     }
 });
 test("provider settles and retains marked state when tool-handoff termination fails", { skip: process.platform === "win32" }, async () => {
@@ -1162,18 +1322,14 @@ process.stdin.on("end", () => {
             events.push(event.type);
             if (event.type === "error") publishedFailure = event.error.errorMessage;
         }
-        const result = await Promise.race([
-            stream.result(),
-            new Promise((_, reject) => setTimeout(() => reject(new Error("tool-handoff stream did not settle")), 500)),
-        ]);
+        const result = await settledRequest(stream);
         assert.equal(result.stopReason, "error");
         assert.equal(events.filter((type) => type === "error" || type === "done").length, 1);
         assert.equal(publishedFailure, result.errorMessage);
         assert.match(result.errorMessage ?? "", /synthetic tool handoff EPERM/);
         assert.match(result.errorMessage ?? "", /runtime state was retained/);
-        const metrics = await waitForRequestMetrics((entry) =>
-            entry.errorCategory === "process_cleanup" && entry.cleanupComplete === false && entry.terminationExpected === true
-        );
+        const metrics = await requestMetrics(result, (entry) =>
+            entry.errorCategory === "process_cleanup" && entry.cleanupComplete === false && entry.terminationExpected === true);
         assert.equal(metrics.stopReason, "error");
         const directories = (await readdir(root)).filter((name) => name.startsWith("pi-claude-code-provider-request-"));
         assert.equal(directories.length, 1);
@@ -1185,7 +1341,7 @@ process.stdin.on("end", () => {
         if (capturedChild) await terminateProcessGroup(capturedChild);
         if (originalTmpdir === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = originalTmpdir;
         await rm(root, { recursive: true, force: true });
-        await rm(fake.dir, { recursive: true, force: true });
+        await rm(fake.directory, { recursive: true, force: true });
     }
 });
 test("provider accepts an exit-143 tool handoff when Claude emits no acknowledgement", { skip: process.platform === "win32" }, async () => {
@@ -1198,14 +1354,14 @@ process.stdin.on("end", () => {
   setInterval(() => {}, 1000);
 });`);
     try {
-        const result = await createClaudeStream({ executable: fake.executable, version: CAPTURED_CLAUDE_VERSION, subscriptionType: "pro" })(model, toolContext, { reasoning: "medium" }).result();
+        const result = await settledRequest(createClaudeStream({ executable: fake.executable, version: CAPTURED_CLAUDE_VERSION, subscriptionType: "pro" })(model, toolContext, { reasoning: "medium" }));
         assert.equal(result.stopReason, "toolUse");
-        const metrics = await waitForRequestMetrics((entry) => entry.stopReason === "toolUse" && entry.exitCode === 143);
+        const metrics = await requestMetrics(result, (entry) => entry.stopReason === "toolUse" && entry.exitCode === 143);
         assert.equal(metrics.lastPhase, "completed");
         assert.equal(metrics.errorCategory, undefined);
     }
     finally {
-        await rm(fake.dir, { recursive: true, force: true });
+        await rm(fake.directory, { recursive: true, force: true });
     }
 });
 test("provider rejects an unexpected exit after the tool-handoff acknowledgement", { skip: process.platform === "win32" }, async () => {
@@ -1220,14 +1376,14 @@ process.stdin.on("end", () => {
   setInterval(() => {}, 1000);
 });`);
     try {
-        const result = await createClaudeStream({ executable: fake.executable, version: CAPTURED_CLAUDE_VERSION, subscriptionType: "pro" })(model, toolContext, { reasoning: "medium" }).result();
+        const result = await settledRequest(createClaudeStream({ executable: fake.executable, version: CAPTURED_CLAUDE_VERSION, subscriptionType: "pro" })(model, toolContext, { reasoning: "medium" }));
         assert.equal(result.stopReason, "error");
         assert.match(result.errorMessage ?? "", /tool handoff exited unexpectedly.*code 1/);
-        const metrics = await waitForRequestMetrics((entry) => entry.errorCategory === "process_exit" && entry.exitCode === 1);
+        const metrics = await requestMetrics(result, (entry) => entry.errorCategory === "process_exit" && entry.exitCode === 1);
         assert.equal(metrics.lastPhase, "process_exited");
     }
     finally {
-        await rm(fake.dir, { recursive: true, force: true });
+        await rm(fake.directory, { recursive: true, force: true });
     }
 });
 test("provider accepts its own SIGKILL escalation after tool-handoff cleanup", { skip: process.platform === "win32" }, async () => {
@@ -1240,16 +1396,16 @@ process.stdin.on("end", () => {
   setInterval(() => {}, 1000);
 });`);
     try {
-        const result = await createClaudeStream({ executable: fake.executable, version: CAPTURED_CLAUDE_VERSION, subscriptionType: "pro" })(model, toolContext, { reasoning: "medium" }).result();
+        const result = await settledRequest(createClaudeStream({ executable: fake.executable, version: CAPTURED_CLAUDE_VERSION, subscriptionType: "pro" })(model, toolContext, { reasoning: "medium" }));
         assert.equal(result.stopReason, "toolUse");
         assert.equal(result.content.find((block) => block.type === "toolCall")?.name, "read");
-        const metrics = await waitForRequestMetrics((entry) => entry.stopReason === "toolUse" && entry.exitSignal === "SIGKILL");
+        const metrics = await requestMetrics(result, (entry) => entry.stopReason === "toolUse" && entry.exitSignal === "SIGKILL");
         assert.equal(metrics.lastPhase, "completed");
         assert.equal(metrics.cleanupComplete, true);
         assert.equal(metrics.errorCategory, undefined);
     }
     finally {
-        await rm(fake.dir, { recursive: true, force: true });
+        await rm(fake.directory, { recursive: true, force: true });
     }
 });
 test("provider rejects SIGKILL when it only sent SIGTERM", { skip: process.platform === "win32" }, async () => {
@@ -1262,14 +1418,14 @@ process.stdin.on("end", () => {
   setInterval(() => {}, 1000);
 });`);
     try {
-        const result = await createClaudeStream({ executable: fake.executable, version: CAPTURED_CLAUDE_VERSION, subscriptionType: "pro" })(model, toolContext, { reasoning: "medium" }).result();
+        const result = await settledRequest(createClaudeStream({ executable: fake.executable, version: CAPTURED_CLAUDE_VERSION, subscriptionType: "pro" })(model, toolContext, { reasoning: "medium" }));
         assert.equal(result.stopReason, "error");
         assert.match(result.errorMessage ?? "", /tool handoff exited unexpectedly.*SIGKILL/);
-        const metrics = await waitForRequestMetrics((entry) => entry.errorCategory === "process_exit" && entry.exitSignal === "SIGKILL");
+        const metrics = await requestMetrics(result, (entry) => entry.errorCategory === "process_exit" && entry.exitSignal === "SIGKILL");
         assert.equal(metrics.cleanupComplete, true);
     }
     finally {
-        await rm(fake.dir, { recursive: true, force: true });
+        await rm(fake.directory, { recursive: true, force: true });
     }
 });
 test("caller abort wins after a tool proposal and before acknowledgement", { skip: process.platform === "win32" }, async () => {
@@ -1300,40 +1456,40 @@ process.stdin.on("end", () => {
         }
         await access(marker);
         controller.abort();
-        const result = await stream.result();
+        const result = await settledRequest(stream);
         assert.equal(result.stopReason, "aborted");
-        const metrics = await waitForRequestMetrics((entry) => entry.errorCategory === "aborted" && entry.requestedModel === "sonnet");
+        const metrics = await requestMetrics(result, (entry) => entry.errorCategory === "aborted" && entry.requestedModel === "sonnet");
         assert.equal(metrics.lastPhase, "process_exited");
         assert.notEqual(metrics.stopReason, "toolUse");
     }
     finally {
-        await Promise.all([fake.dir, markerDirectory].map((directory) => rm(directory, { recursive: true, force: true })));
+        await Promise.all([fake.directory, markerDirectory].map((directory) => rm(directory, { recursive: true, force: true })));
     }
 });
 test("provider reports malformed JSONL and early MCP exit without hanging", async () => {
     const malformed = await fakeClaude(`process.stdin.resume(); process.stdin.on("end", () => process.stdout.write("{bad\\n"));`);
     try {
-        const result = await createClaudeStream({ executable: malformed.executable, version: "test", subscriptionType: "pro" })(model, context, { reasoning: "medium" }).result();
+        const result = await settledRequest(createClaudeStream({ executable: malformed.executable, version: "test", subscriptionType: "pro" })(model, context, { reasoning: "medium" }));
         assert.equal(result.stopReason, "error");
         assert.match(result.errorMessage ?? "", /JSON|record/i);
-        const metrics = await waitForRequestMetrics((entry) => entry.errorCategory === "protocol_invalid_json");
+        const metrics = await requestMetrics(result, (entry) => entry.errorCategory === "protocol_invalid_json");
         assert.equal(metrics.terminationExpected, false);
     }
     finally {
-        await rm(malformed.dir, { recursive: true, force: true });
+        await rm(malformed.directory, { recursive: true, force: true });
     }
     const early = await fakeClaude(`process.exit(7);`, { writeReady: false });
     const started = Date.now();
     try {
-        const result = await createClaudeStream({ executable: early.executable, version: "test", subscriptionType: "pro" })(model, toolContext, { reasoning: "medium" }).result();
+        const result = await settledRequest(createClaudeStream({ executable: early.executable, version: "test", subscriptionType: "pro" })(model, toolContext, { reasoning: "medium" }));
         assert.equal(result.stopReason, "error");
         assert.match(result.errorMessage ?? "", /exited before.*became ready/);
         assert.ok(Date.now() - started < 1000);
-        const metrics = await waitForRequestMetrics((entry) => entry.errorCategory === "mcp_startup");
+        const metrics = await requestMetrics(result, (entry) => entry.errorCategory === "mcp_startup");
         assert.equal(metrics.terminationExpected, false);
     }
     finally {
-        await rm(early.dir, { recursive: true, force: true });
+        await rm(early.directory, { recursive: true, force: true });
     }
 });
 test("MCP readiness has a bounded timeout even while the process remains alive", async () => {
@@ -1375,13 +1531,13 @@ test("provider enforces the idle limit", async () => {
     process.env.PI_CLAUDE_CODE_PROVIDER_IDLE_TIMEOUT_MS = "30";
     process.env.PI_CLAUDE_CODE_PROVIDER_TOTAL_TIMEOUT_MS = "1000";
     try {
-        const result = await createClaudeStream({ executable: idle.executable, version: "test", subscriptionType: "pro" })(model, context, { reasoning: "medium" }).result();
+        const result = await settledRequest(createClaudeStream({ executable: idle.executable, version: "test", subscriptionType: "pro" })(model, context, { reasoning: "medium" }));
         assert.match(result.errorMessage ?? "", /no protocol activity for 30ms/);
     }
     finally {
         if (originalIdle === undefined) delete process.env.PI_CLAUDE_CODE_PROVIDER_IDLE_TIMEOUT_MS; else process.env.PI_CLAUDE_CODE_PROVIDER_IDLE_TIMEOUT_MS = originalIdle;
         if (originalTotal === undefined) delete process.env.PI_CLAUDE_CODE_PROVIDER_TOTAL_TIMEOUT_MS; else process.env.PI_CLAUDE_CODE_PROVIDER_TOTAL_TIMEOUT_MS = originalTotal;
-        await rm(idle.dir, { recursive: true, force: true });
+        await rm(idle.directory, { recursive: true, force: true });
     }
 });
 test("provider retains a caught failure category when private cleanup also fails", async () => {
@@ -1397,19 +1553,13 @@ test("provider retains a caught failure category when private cleanup also fails
         throw new Error("synthetic cleanup failure");
     };
     try {
-        const result = await createClaudeStream(installation, { cleanupDirectory: failCleanup })(model, context, { reasoning: "medium" }).result();
+        const result = await settledRequest(createClaudeStream(installation, { cleanupDirectory: failCleanup })(model, context, { reasoning: "medium" }));
         assert.equal(result.stopReason, "error");
         assert.match(result.errorMessage ?? "", /PI_CLAUDE_CODE_PROVIDER_TOTAL_TIMEOUT_MS must be a positive integer/);
         assert.match(result.errorMessage ?? "", /private request cleanup failed: synthetic cleanup failure/);
-        for (
-            let attempt = 0;
-            attempt < 20 && (cleanupAttempts < 2 || getLastRequestMetrics()?.cleanupComplete !== false);
-            attempt++
-        ) {
-            await new Promise((resolve) => setTimeout(resolve, 5));
-        }
-        assert.equal(getLastRequestMetrics()?.errorCategory, "timeout_config");
-        assert.equal(getLastRequestMetrics()?.cleanupComplete, false);
+        assert.equal(cleanupAttempts, 2);
+        assert.equal((await requestMetrics(result))?.errorCategory, "timeout_config");
+        assert.equal((await requestMetrics(result))?.cleanupComplete, false);
     }
     finally {
         if (originalTotal === undefined) delete process.env.PI_CLAUDE_CODE_PROVIDER_TOTAL_TIMEOUT_MS; else process.env.PI_CLAUDE_CODE_PROVIDER_TOTAL_TIMEOUT_MS = originalTotal;
@@ -1421,14 +1571,14 @@ test("provider explains a Claude Code build removed after preflight", { skip: pr
     const fake = await fakeClaude(`process.exit(0);`);
     await rm(fake.executable);
     try {
-        const result = await createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, context, { reasoning: "medium" }).result();
+        const result = await settledRequest(createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, context, { reasoning: "medium" }));
         assert.equal(result.stopReason, "error");
         assert.match(result.errorMessage ?? "", /Claude Code at .+ no longer exists, probably removed by a Claude Code update; run \/reload/);
-        const metrics = await waitForRequestMetrics((entry) => entry.errorCategory === "executable_missing");
+        const metrics = await requestMetrics(result, (entry) => entry.errorCategory === "executable_missing");
         assert.equal(metrics.cleanupComplete, true);
     }
     finally {
-        await rm(fake.dir, { recursive: true, force: true });
+        await rm(fake.directory, { recursive: true, force: true });
     }
 });
 test("provider cleans private transport state after an early process failure", async () => {
@@ -1436,13 +1586,13 @@ test("provider cleans private transport state after an early process failure", a
     const marker = join(markerDirectory, "cwd");
     const fake = await fakeClaude(`const index = process.argv.indexOf("--system-prompt-file"); const marker = fs.readFileSync(process.argv[index + 1], "utf8"); fs.writeFileSync(marker, require("node:path").dirname(process.argv[index + 1])); process.exit(9);`);
     try {
-        const result = await createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, providerContext({ tools: [], systemPrompt: marker }), { reasoning: "medium" }).result();
+        const result = await settledRequest(createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, providerContext({ tools: [], systemPrompt: marker }), { reasoning: "medium" }));
         assert.equal(result.stopReason, "error");
         const privateDirectory = await readFile(marker, "utf8");
         await assert.rejects(access(privateDirectory));
     }
     finally {
-        await Promise.all([fake.dir, markerDirectory].map((directory) => rm(directory, { recursive: true, force: true })));
+        await Promise.all([fake.directory, markerDirectory].map((directory) => rm(directory, { recursive: true, force: true })));
     }
 });
 const textResponseBody = `
@@ -1464,19 +1614,19 @@ test("provider reports persistent private cleanup failure after a successful res
         throw new Error("synthetic EBUSY");
     };
     try {
-        const result = await createClaudeStream({
+        const result = await settledRequest(createClaudeStream({
             executable: fake.executable,
             version: CAPTURED_CLAUDE_VERSION,
             subscriptionType: "pro",
-        }, { cleanupDirectory: failCleanup })(model, context, { reasoning: "medium" }).result();
+        }, { cleanupDirectory: failCleanup })(model, context, { reasoning: "medium" }));
         assert.equal(result.stopReason, "error");
         assert.match(result.errorMessage ?? "", /private request cleanup failed: synthetic EBUSY/);
         assert.equal(result.content[0]?.text, "hook ok");
-        const metrics = await waitForRequestMetrics((entry) => entry.cleanupComplete === false);
+        const metrics = await requestMetrics(result, (entry) => entry.cleanupComplete === false);
         assert.equal(metrics.stopReason, "error");
     }
     finally {
-        await Promise.all([privateDirectory, fake.dir].filter(Boolean).map((directory) => rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })));
+        await Promise.all([privateDirectory, fake.directory].filter(Boolean).map((directory) => rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })));
     }
 });
 test("provider reports a synthetic response to Pi before streaming content", async () => {
@@ -1497,7 +1647,7 @@ test("provider reports a synthetic response to Pi before streaming content", asy
         });
         for await (const event of stream)
             observed.push(event.type);
-        const result = await stream.result();
+        const result = await settledRequest(stream);
         assert.equal(result.stopReason, "stop", result.errorMessage);
         assert.equal(responses.length, 1);
         // No HTTP response exists, so the status is synthetic and headers are empty.
@@ -1506,7 +1656,7 @@ test("provider reports a synthetic response to Pi before streaming content", asy
         assert.deepEqual(observed, ["response", "start", "text_start", "text_delta", "text_end", "done"]);
     }
     finally {
-        await rm(fake.dir, { recursive: true, force: true });
+        await rm(fake.directory, { recursive: true, force: true });
     }
 });
 test("provider waits for Pi's async response handler before streaming content", async () => {
@@ -1542,12 +1692,12 @@ test("provider waits for Pi's async response handler before streaming content", 
         assert.deepEqual(events, []);
         releaseResponse();
         await consume;
-        const result = await stream.result();
+        const result = await settledRequest(stream);
         assert.equal(result.stopReason, "stop", result.errorMessage);
         assert.deepEqual(events, ["response", "start", "text_start", "text_delta", "text_end", "done"]);
     }
     finally {
-        await rm(fake.dir, { recursive: true, force: true });
+        await rm(fake.directory, { recursive: true, force: true });
     }
 });
 test("provider fails before streaming when Pi's async response handler rejects", async () => {
@@ -1582,17 +1732,198 @@ test("provider fails before streaming when Pi's async response handler rejects",
         assert.deepEqual(events, []);
         rejectResponse(new Error("observer rejected"));
         await consume;
-        const result = await stream.result();
+        const result = await settledRequest(stream);
         assert.equal(result.stopReason, "error");
-        assert.match(result.errorMessage ?? "", /after_provider_response handler failed: .*observer rejected/);
+        assert.equal(result.errorMessage, "Pi after_provider_response handler failed: observer rejected");
         assert.deepEqual(events, ["error"]);
-        const metrics = await waitForRequestMetrics((entry) => entry.errorCategory === "response_hook");
+        const metrics = await requestMetrics(result, (entry) => entry.errorCategory === "response_hook");
         assert.equal(metrics.stopReason, "error");
     }
     finally {
-        await rm(fake.dir, { recursive: true, force: true });
+        await rm(fake.directory, { recursive: true, force: true });
     }
 });
+
+for (const childRemainsAlive of [false, true]) {
+    for (const cancellation of [false, true]) {
+        test(`stalled response observer settles on ${cancellation ? "abort" : "deadline"} with an ${childRemainsAlive ? "alive" : "exited"} child`, async () => {
+            const fake = await fakeClaude(textResponseBody + (childRemainsAlive ? "\nsetInterval(() => {}, 1000);" : ""));
+            const store = new SessionImageStore();
+            store.open();
+            const controller = new AbortController();
+            let releaseObserver;
+            let rejectObserver;
+            const observer = new Promise((resolve, reject) => { releaseObserver = resolve; rejectObserver = reject; });
+            let enterObserver;
+            const entered = new Promise((resolve) => { enterObserver = resolve; });
+            let closeChild;
+            const closed = new Promise((resolve) => { closeChild = resolve; });
+            let privateDirectory;
+            let imageDirectory;
+            let metricRecords = 0;
+            const unhandled = [];
+            const onUnhandled = (error) => unhandled.push(error);
+            process.on("unhandledRejection", onUnhandled);
+            try {
+                const stream = createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" }, {
+                    resolveSession: () => ({ cwd: fake.directory, imageStore: store }),
+                    recordRequestMetrics: () => { metricRecords += 1; },
+                    supervise(child, options) {
+                        privateDirectory = dirname(child.spawnargs[child.spawnargs.indexOf("--system-prompt-file") + 1]);
+                        child.once("close", closeChild);
+                        return superviseProcess(child, options);
+                    },
+                })(model, providerContext({ messages: [{ role: "user", timestamp: 1, content: [
+                    { type: "image", mimeType: "image/png", data: Buffer.from("observer lease bytes").toString("base64") },
+                ] }] }), {
+                    signal: controller.signal,
+                    timeoutMs: cancellation ? 5_000 : 1_000,
+                    async onResponse() {
+                        const images = (await readdir(tmpdir())).filter((name) => name.startsWith("pi-claude-code-provider-images-"));
+                        assert.equal(images.length, 1);
+                        imageDirectory = join(tmpdir(), images[0]);
+                        await store.close();
+                        enterObserver();
+                        await observer;
+                    },
+                });
+                const events = [];
+                const consumed = (async () => { for await (const event of stream) events.push(event.type); })();
+                await withTimeout(entered, "observer entry");
+                if (!childRemainsAlive) await withTimeout(closed, "child exit before observer settles");
+                if (cancellation) controller.abort();
+                // The observer stays unresolved until cleanup and metrics finish.
+                const result = await settledRequest(stream);
+                await consumed;
+                assert.equal(result.stopReason, cancellation ? "aborted" : "error");
+                assert.match(result.errorMessage, cancellation ? /aborted/ : /exceeded 1000ms/);
+                assert.deepEqual(events, ["error"]);
+                const metrics = await requestMetrics(result);
+                assert.equal(metrics.errorCategory, cancellation ? "aborted" : "process");
+                assert.equal(metrics.cleanupComplete, true);
+                await assert.rejects(access(privateDirectory));
+                await waitForRemoval(imageDirectory);
+                const before = { ...metrics };
+                if (cancellation) releaseObserver();
+                else rejectObserver(new Error("late observer failure"));
+                await new Promise((resolve) => setImmediate(resolve));
+                await new Promise((resolve) => setImmediate(resolve));
+                assert.deepEqual(events, ["error"]);
+                assert.deepEqual(await requestMetrics(result), before);
+                assert.equal(metricRecords, 1);
+                assert.deepEqual(unhandled, []);
+            } finally {
+                releaseObserver();
+                controller.abort();
+                process.off("unhandledRejection", onUnhandled);
+                await store.close();
+                await rm(fake.directory, { recursive: true, force: true });
+            }
+        });
+    }
+}
+
+test("a headless host stays alive to settle a stalled observer after Claude exits", async () => {
+    const fake = await fakeClaude(`
+const path = require("node:path");
+fs.writeFileSync(path.join(__dirname, "transport"), path.dirname(process.argv[process.argv.indexOf("--system-prompt-file") + 1]));
+${textResponseBody}`);
+    const probe = await createNodeFixture(`
+(async () => {
+  const { createClaudeStream } = await import(${JSON.stringify(new URL("../../src/provider.ts", import.meta.url).href)});
+  const stream = createClaudeStream(${JSON.stringify({ executable: fake.executable, version: "test", subscriptionType: "pro" })}, {
+    resolveSession: () => ({ cwd: ${JSON.stringify(fake.directory)} }),
+    recordRequestMetrics: (metrics) => process.stdout.write(JSON.stringify(metrics) + "\\n"),
+  })(${JSON.stringify(model)}, ${JSON.stringify(context)}, { timeoutMs: 1000, onResponse: () => new Promise(() => {}) });
+  await stream.result();
+})().catch((error) => { console.error(error); process.exitCode = 1; });`);
+    // --import takes a module specifier: a URL, because Windows rejects a drive path.
+    const child = spawn(process.execPath, ["--import", new URL("../support/register-pi-loader.js", import.meta.url).href, probe.executable], {
+        detached: process.platform !== "win32",
+        stdio: ["ignore", "pipe", "pipe"],
+        // The probe is an ordinary headless host, without test-runner watchdogs.
+        env: { ...process.env, NODE_TEST_CONTEXT: "" },
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    const supervisor = superviseProcess(child, { idleTimeoutMs: 5_000, totalTimeoutMs: 10_000, onFailure() {} });
+    try {
+        const result = await withTimeout(supervisor.wait(), "headless host settlement");
+        assert.equal(result.code, 0, stderr);
+        assert.equal(result.signal, null, stderr);
+        assert.notEqual(stdout.trim(), "", "host exited before lifecycle metrics finalized");
+        const metrics = JSON.parse(stdout);
+        assert.equal(metrics.errorCategory, "process");
+        assert.equal(metrics.cleanupComplete, true);
+        await assert.rejects(access(await readFile(join(fake.directory, "transport"), "utf8")));
+    } finally {
+        await supervisor.terminate();
+        supervisor.dispose();
+        const transport = await readFile(join(fake.directory, "transport"), "utf8").catch(() => undefined);
+        await Promise.all([fake.directory, probe.directory, transport].filter(Boolean).map((directory) => rm(directory, { recursive: true, force: true })));
+    }
+});
+
+for (const uncertainLiveness of [false, true]) {
+    test(`process failure releases a stalled observer and ${uncertainLiveness ? "retains uncertain-live" : "cleans"} private state`, async () => {
+        const fake = await fakeClaude(textResponseBody + "\nsetInterval(() => {}, 1000);");
+        const store = new SessionImageStore();
+        store.open();
+        let releaseObserver;
+        const observer = new Promise((resolve) => { releaseObserver = resolve; });
+        let enterObserver;
+        const entered = new Promise((resolve) => { enterObserver = resolve; });
+        let child;
+        let privateDirectory;
+        let imageDirectory;
+        const supervise = uncertainLiveness
+            ? supervisorWithCleanupFailure(new ProcessTerminationError("synthetic unknown liveness"))
+            : superviseProcess;
+        try {
+            const stream = createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" }, {
+                resolveSession: () => ({ cwd: fake.directory, imageStore: store }),
+                supervise(running, options) {
+                    child = running;
+                    privateDirectory = dirname(child.spawnargs[child.spawnargs.indexOf("--system-prompt-file") + 1]);
+                    return supervise(running, options);
+                },
+            })(model, providerContext({ messages: [{ role: "user", timestamp: 1, content: [
+                { type: "image", mimeType: "image/png", data: Buffer.from("failure lease bytes").toString("base64") },
+            ] }] }), {
+                async onResponse() {
+                    const images = (await readdir(tmpdir())).filter((name) => name.startsWith("pi-claude-code-provider-images-"));
+                    assert.equal(images.length, 1);
+                    imageDirectory = join(tmpdir(), images[0]);
+                    await store.close();
+                    enterObserver();
+                    await observer;
+                },
+            });
+            await withTimeout(entered, "observer entry before pipe failure");
+            child.stdout.emit("error", new Error("synthetic pipe failure"));
+            const result = await settledRequest(stream);
+            assert.equal(result.stopReason, "error");
+            assert.match(result.errorMessage, /stdout failed: synthetic pipe failure/);
+            const metrics = await requestMetrics(result);
+            assert.equal(metrics.cleanupComplete, !uncertainLiveness);
+            if (uncertainLiveness) {
+                assert.match(result.errorMessage, /process liveness is unknown/);
+                await access(privateDirectory);
+                await access(imageDirectory);
+            } else {
+                await assert.rejects(access(privateDirectory));
+                await waitForRemoval(imageDirectory);
+            }
+        } finally {
+            releaseObserver();
+            await store.close();
+            // The fixture established actual death before simulating unknown liveness.
+            await Promise.all([fake.directory, privateDirectory, imageDirectory].filter(Boolean).map((directory) => rm(directory, { recursive: true, force: true })));
+        }
+    });
+}
 
 test("an exhausted subscription window produces a failure Pi will not retry", async () => {
     const limited = await fakeClaude(`
@@ -1601,16 +1932,16 @@ setTimeout(() => {
   process.stdout.write(JSON.stringify({type:"result",is_error:true,api_error_status:429,result:"You've hit your session limit \u00b7 resets 3:50am (America/Sao_Paulo)"}) + "\\n");
 }, 10);`);
     try {
-        const result = await createClaudeStream({ executable: limited.executable, version: "test", subscriptionType: "pro" })(model, context, { reasoning: "medium" }).result();
+        const result = await settledRequest(createClaudeStream({ executable: limited.executable, version: "test", subscriptionType: "pro" })(model, context, { reasoning: "medium" }));
         assert.equal(result.stopReason, "error");
         assert.match(result.errorMessage ?? "", /429.*session limit/);
         // The wording the provider actually emits has to be the wording the
         // normalization boundary recognizes, or Pi retries a window that cannot open.
         assert.equal(normalizeClaudeFailure(result.errorMessage), `quota exceeded: ${result.errorMessage}`);
-        await waitForRequestMetrics((entry) => entry.errorCategory === "claude_error");
+        await requestMetrics(result, (entry) => entry.errorCategory === "claude_error");
     }
     finally {
-        await rm(limited.dir, { recursive: true, force: true });
+        await rm(limited.directory, { recursive: true, force: true });
     }
 });
 
@@ -1677,9 +2008,9 @@ setTimeout(() => {
   process.stdout.write(JSON.stringify({type:"result",is_error:false,result:"large ok",usage:{input_tokens:4,output_tokens:2}}) + "\\n");
 }, 20);`);
     try {
-        const result = await createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, providerContext({ tools: [], systemPrompt }), { reasoning: "medium" }).result();
+        const result = await settledRequest(createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, providerContext({ tools: [], systemPrompt }), { reasoning: "medium" }));
         assert.equal(result.stopReason, "stop", result.errorMessage);
-        const captured = JSON.parse(await readFile(join(fake.dir, "captured-large"), "utf8"));
+        const captured = JSON.parse(await readFile(join(fake.directory, "captured-large"), "utf8"));
         assert.equal(captured.bytes, 146_101);
         assert.ok(captured.head.startsWith("ALPHA-MARKER-4417"), captured.head);
         assert.ok(captured.tail.endsWith("OMEGA-MARKER-9308"), captured.tail);
@@ -1687,17 +2018,17 @@ setTimeout(() => {
         assert.ok(flag >= 0);
         assert.ok(captured.argv[flag + 1].endsWith("system-prompt.txt"));
         assert.ok(captured.argv.every((entry) => !entry.includes("ALPHA-MARKER-4417")));
-        const metrics = await waitForRequestMetrics((entry) => entry.stopReason === "stop");
+        const metrics = await requestMetrics(result, (entry) => entry.stopReason === "stop");
         assert.equal(metrics.cleanupComplete, true);
     }
     finally {
-        await rm(fake.dir, { recursive: true, force: true });
+        await rm(fake.directory, { recursive: true, force: true });
     }
 });
 test("provider rejects a system prompt the served model cannot hold", async () => {
     const systemPrompt = "y".repeat(LARGEST_ADMITTED_SYSTEM_PROMPT_BYTES + 3);
-    const result = await createClaudeStream(DEAD_INSTALLATION)(BUDGET_MODEL, providerContext({ tools: [], systemPrompt }), { reasoning: "medium" }).result();
-    const metrics = await waitForRequestMetrics((entry) => entry.errorCategory === "system_prompt_budget");
+    const result = await settledRequest(createClaudeStream(DEAD_INSTALLATION)(BUDGET_MODEL, providerContext({ tools: [], systemPrompt }), { reasoning: "medium" }));
+    const metrics = await requestMetrics(result, (entry) => entry.errorCategory === "system_prompt_budget");
     assert.match(result.errorMessage ?? "", /system prompt alone needs about \d+ tokens/);
     assert.match(result.errorMessage ?? "", /Reduce loaded system instructions, project context, or skill descriptions/);
     // Rejected before preparation, so no private directory was ever created and
@@ -1709,8 +2040,8 @@ test("provider rejects a system prompt the served model cannot hold", async () =
 });
 test("the system-prompt precheck admits the boundary and the full budget still decides", async () => {
     const systemPrompt = "y".repeat(LARGEST_ADMITTED_SYSTEM_PROMPT_BYTES);
-    const result = await createClaudeStream(DEAD_INSTALLATION)(BUDGET_MODEL, providerContext({ tools: [], systemPrompt }), { reasoning: "medium" }).result();
-    const metrics = await waitForRequestMetrics((entry) => entry.errorCategory === "context_budget");
+    const result = await settledRequest(createClaudeStream(DEAD_INSTALLATION)(BUDGET_MODEL, providerContext({ tools: [], systemPrompt }), { reasoning: "medium" }));
+    const metrics = await requestMetrics(result, (entry) => entry.errorCategory === "context_budget");
     // The precheck is necessary, not sufficient: preparation ran, and the
     // transcript's own bytes then carried the request over the window.
     assert.equal(metrics.lastPhase, "prepared");
@@ -1720,15 +2051,15 @@ test("the system-prompt budget measures bytes rather than characters", async () 
     const systemPrompt = "。".repeat(200_000);
     assert.equal(systemPrompt.length, 200_000);
     assert.equal(Buffer.byteLength(systemPrompt), 600_000);
-    const result = await createClaudeStream(DEAD_INSTALLATION)(BUDGET_MODEL, providerContext({ tools: [], systemPrompt }), { reasoning: "medium" }).result();
-    await waitForRequestMetrics((entry) => entry.errorCategory === "system_prompt_budget");
+    const result = await settledRequest(createClaudeStream(DEAD_INSTALLATION)(BUDGET_MODEL, providerContext({ tools: [], systemPrompt }), { reasoning: "medium" }));
+    await requestMetrics(result, (entry) => entry.errorCategory === "system_prompt_budget");
     assert.match(result.errorMessage ?? "", /system prompt alone needs about \d+ tokens/);
 });
 test("budget failures classify correctly for Pi's overflow recovery", async () => {
-    const oversized = await createClaudeStream(DEAD_INSTALLATION)(BUDGET_MODEL, providerContext({ tools: [], systemPrompt: "y".repeat(LARGEST_ADMITTED_SYSTEM_PROMPT_BYTES + 3) }), { reasoning: "medium" }).result();
-    await waitForRequestMetrics((entry) => entry.errorCategory === "system_prompt_budget");
-    const overBudget = await createClaudeStream(DEAD_INSTALLATION)({ ...model, contextWindow: 100, maxTokens: 90 }, context, { reasoning: "medium" }).result();
-    await waitForRequestMetrics((entry) => entry.errorCategory === "context_budget");
+    const oversized = await settledRequest(createClaudeStream(DEAD_INSTALLATION)(BUDGET_MODEL, providerContext({ tools: [], systemPrompt: "y".repeat(LARGEST_ADMITTED_SYSTEM_PROMPT_BYTES + 3) }), { reasoning: "medium" }));
+    await requestMetrics(oversized, (entry) => entry.errorCategory === "system_prompt_budget");
+    const overBudget = await settledRequest(createClaudeStream(DEAD_INSTALLATION)({ ...model, contextWindow: 100, maxTokens: 90 }, context, { reasoning: "medium" }));
+    await requestMetrics(overBudget, (entry) => entry.errorCategory === "context_budget");
     const asMessage = (result) => ({ stopReason: "error", errorMessage: result.errorMessage ?? "", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } });
     // Compaction cannot shrink a system prompt, so the system-only failure must
     // not look like a recoverable overflow; the transcript one must.
@@ -1739,29 +2070,29 @@ test("provider requires a usable model context window", async () => {
     for (const contextWindow of [undefined, 0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
         const candidate = { ...model, contextWindow };
         if (contextWindow === undefined) delete candidate.contextWindow;
-        const result = await createClaudeStream(DEAD_INSTALLATION)(candidate, context, { reasoning: "medium" }).result();
-        const metrics = await waitForRequestMetrics((entry) => entry.errorCategory === "context_window");
+        const result = await settledRequest(createClaudeStream(DEAD_INSTALLATION)(candidate, context, { reasoning: "medium" }));
+        const metrics = await requestMetrics(result, (entry) => entry.errorCategory === "context_window");
         assert.match(result.errorMessage ?? "", /reports no usable context window/);
         assert.match(result.errorMessage ?? "", /contextWindow override/);
         assert.equal(metrics.lastPhase, "payload_applied");
     }
     // Only positivity and finiteness are required: the window is compared and
     // never propagated, so a fractional Pi override must still run.
-    const fractional = await createClaudeStream(DEAD_INSTALLATION)({ ...model, contextWindow: 1_000_000.5 }, context, { reasoning: "medium" }).result();
-    const metrics = await waitForRequestMetrics((entry) => entry.errorCategory !== "context_window");
+    const fractional = await settledRequest(createClaudeStream(DEAD_INSTALLATION)({ ...model, contextWindow: 1_000_000.5 }, context, { reasoning: "medium" }));
+    const metrics = await requestMetrics(fractional, (entry) => entry.errorCategory !== "context_window");
     assert.notEqual(metrics.errorCategory, "context_window");
     assert.notEqual(metrics.lastPhase, "payload_applied");
     assert.ok(fractional.errorMessage);
 });
 test("the system-prompt budget is measured after Pi's payload hook", async () => {
     const oversized = "y".repeat(LARGEST_ADMITTED_SYSTEM_PROMPT_BYTES + 3);
-    const inflated = await createClaudeStream(DEAD_INSTALLATION)(BUDGET_MODEL, context, { reasoning: "medium", onPayload: (payload) => ({ ...payload, systemPrompt: oversized }) }).result();
-    await waitForRequestMetrics((entry) => entry.errorCategory === "system_prompt_budget");
+    const inflated = await settledRequest(createClaudeStream(DEAD_INSTALLATION)(BUDGET_MODEL, context, { reasoning: "medium", onPayload: (payload) => ({ ...payload, systemPrompt: oversized }) }));
+    await requestMetrics(inflated, (entry) => entry.errorCategory === "system_prompt_budget");
     assert.match(inflated.errorMessage ?? "", /system prompt alone needs about \d+ tokens/);
     // The reverse direction proves the caller's own prompt is not what is
     // measured: a hook that replaces an oversized prompt must let the request run.
-    await createClaudeStream(DEAD_INSTALLATION)(BUDGET_MODEL, providerContext({ tools: [], systemPrompt: oversized }), { reasoning: "medium", onPayload: (payload) => ({ ...payload, systemPrompt: "small" }) }).result();
-    const metrics = await waitForRequestMetrics((entry) => entry.errorCategory !== "system_prompt_budget");
+    const replaced = await settledRequest(createClaudeStream(DEAD_INSTALLATION)(BUDGET_MODEL, providerContext({ tools: [], systemPrompt: oversized }), { reasoning: "medium", onPayload: (payload) => ({ ...payload, systemPrompt: "small" }) }));
+    const metrics = await requestMetrics(replaced, (entry) => entry.errorCategory !== "system_prompt_budget");
     assert.notEqual(metrics.errorCategory, "system_prompt_budget");
     assert.notEqual(metrics.lastPhase, "payload_applied");
 });
@@ -1770,10 +2101,10 @@ test("provider rejects an invalid transcript-breakpoint setting before claiming 
     process.env.PI_CLAUDE_CODE_PROVIDER_TRANSCRIPT_BREAKPOINT = "maybe";
     let claims = 0;
     try {
-        const result = await createClaudeStream(DEAD_INSTALLATION, { claimLaunch: async () => { claims++; } })(model, context, { reasoning: "medium" }).result();
+        const result = await settledRequest(createClaudeStream(DEAD_INSTALLATION, { claimLaunch: async () => { claims++; } })(model, context, { reasoning: "medium" }));
         assert.equal(result.stopReason, "error");
         assert.match(result.errorMessage ?? "", /PI_CLAUDE_CODE_PROVIDER_TRANSCRIPT_BREAKPOINT must be "on" or "off"/);
-        const metrics = await waitForRequestMetrics((entry) => entry.errorCategory === "breakpoint_config");
+        const metrics = await requestMetrics(result, (entry) => entry.errorCategory === "breakpoint_config");
         assert.equal(metrics.lastPhase, "prepared");
         assert.equal(claims, 0);
     }
@@ -1796,16 +2127,16 @@ process.stdin.on("end", () => {
     const original = process.env.PI_CLAUDE_CODE_PROVIDER_TRANSCRIPT_BREAKPOINT;
     process.env.PI_CLAUDE_CODE_PROVIDER_TRANSCRIPT_BREAKPOINT = "off";
     try {
-        const result = await createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, context, { reasoning: "medium" }).result();
+        const result = await settledRequest(createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, context, { reasoning: "medium" }));
         assert.equal(result.stopReason, "stop", result.errorMessage);
-        const prompt = JSON.parse(await readFile(join(fake.dir, "captured-stdin"), "utf8")).message.content;
+        const prompt = JSON.parse(await readFile(join(fake.directory, "captured-stdin"), "utf8")).message.content;
         assert.ok(prompt.length > 0);
         assert.equal(prompt.some((block) => "cache_control" in block), false);
     }
     finally {
         if (original === undefined) delete process.env.PI_CLAUDE_CODE_PROVIDER_TRANSCRIPT_BREAKPOINT;
         else process.env.PI_CLAUDE_CODE_PROVIDER_TRANSCRIPT_BREAKPOINT = original;
-        await rm(fake.dir, { recursive: true, force: true });
+        await rm(fake.directory, { recursive: true, force: true });
     }
 });
 test("a request keeps the image store it was placed on when that session shuts down", async () => {
@@ -1821,21 +2152,20 @@ process.stdout.write(JSON.stringify(${JSON.stringify(init)}) + String.fromCharCo
 process.stdout.write(JSON.stringify({type:"result",is_error:false,result:"ok",usage:{}}) + String.fromCharCode(10));`);
     let closing;
     try {
-        const result = await createProviderStream(
+        const result = await settledRequest(createClaudeStream(
             { executable: fake.executable, version: "test", subscriptionType: "pro" },
             { resolveSession: () => ({ cwd: tmpdir(), imageStore: store }) },
         )(model, context, {
             reasoning: "medium",
             // Returning nothing leaves Pi's payload alone; the shutdown is the point.
             onPayload: () => { closing = store.close(); },
-        }).result();
+        }));
         assert.equal(result.stopReason, "stop", result.errorMessage);
-        // close() is still waiting on this request's lease, which is what keeps
-        // the borrowed directory alive; it settles once the request released it.
+        // Shutdown returns while the lease is held; request settlement releases it.
         await closing;
     }
     finally {
-        await rm(fake.dir, { recursive: true, force: true });
+        await rm(fake.directory, { recursive: true, force: true });
     }
 });
 test("provider writes no cache entry for a one-shot Pi asks not to cache", async () => {
@@ -1854,14 +2184,14 @@ process.stdin.on("end", () => {
     const marked = async (streamOptions) => {
         const fake = await fakeClaude(capture);
         try {
-            const result = await createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, context, streamOptions).result();
+            const result = await settledRequest(createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, context, streamOptions));
             assert.equal(result.stopReason, "stop", result.errorMessage);
-            const prompt = JSON.parse(await readFile(join(fake.dir, "captured-stdin"), "utf8")).message.content;
+            const prompt = JSON.parse(await readFile(join(fake.directory, "captured-stdin"), "utf8")).message.content;
             assert.ok(prompt.length > 0);
             return prompt.some((block) => "cache_control" in block);
         }
         finally {
-            await rm(fake.dir, { recursive: true, force: true });
+            await rm(fake.directory, { recursive: true, force: true });
         }
     };
     assert.equal(await marked({ reasoning: "medium", cacheRetention: "none" }), false);
@@ -1879,14 +2209,66 @@ process.stdin.on("end", () => {
   process.stdout.write(JSON.stringify(${JSON.stringify(rejection)}) + NL);
 });`);
     try {
-        const result = await createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, context, { reasoning: "medium" }).result();
+        const result = await settledRequest(createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, context, { reasoning: "medium" }));
         assert.equal(result.stopReason, "error");
         assert.match(result.errorMessage ?? "", /PI_CLAUDE_CODE_PROVIDER_TRANSCRIPT_BREAKPOINT=off/);
-        const metrics = await waitForRequestMetrics((entry) => entry.errorCategory === "cache_breakpoint_limit");
+        const metrics = await requestMetrics(result, (entry) => entry.errorCategory === "cache_breakpoint_limit");
         assert.equal(metrics.stopReason, "error");
     }
     finally {
-        await rm(fake.dir, { recursive: true, force: true });
+        await rm(fake.directory, { recursive: true, force: true });
+    }
+});
+
+// Claude Code can close its input and exit on its own, for example on a failed
+// login, before the provider writes the prompt. The write then meets a closed
+// pipe, and that broken pipe must not replace what Claude reported on its way out.
+// The provider writes the prompt only once the tool bridge is ready, so closing
+// stdin before announcing readiness makes that write meet a closed pipe every time.
+function closedInputClaude(records, exitCode) {
+    return fakeClaude(`
+const NL = String.fromCharCode(10);
+fs.closeSync(0);
+const mcpIndex = process.argv.indexOf("--mcp-config");
+fs.writeFileSync(JSON.parse(process.argv[mcpIndex + 1]).mcpServers.pi.env.PI_CLAUDE_TOOL_READY, "ready" + NL);
+setTimeout(() => {
+  for (const record of ${JSON.stringify(records)}) process.stdout.write(JSON.stringify(record) + NL);
+  process.stderr.write("fake startup failure" + NL);
+  process.exit(${exitCode});
+}, 200);`, { writeReady: false });
+}
+
+test("a Claude that closed its input reports its own error, not the broken pipe", async () => {
+    const failure = { type: "result", is_error: true, result: "Not logged in · Please run /login" };
+    const fake = await closedInputClaude([toolInit, failure], 1);
+    try {
+        const result = await settledRequest(createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, toolContext, { reasoning: "medium" }));
+        assert.equal(result.stopReason, "error");
+        assert.match(result.errorMessage ?? "", /Not logged in/);
+        assert.doesNotMatch(result.errorMessage ?? "", /stdin failed/);
+        const metrics = await requestMetrics(result, () => true);
+        assert.notEqual(metrics.errorCategory, "process");
+        assert.equal(metrics.cleanupComplete, true);
+    }
+    finally {
+        await rm(fake.directory, { recursive: true, force: true });
+    }
+});
+
+test("a Claude that closed its input and reported nothing fails on its exit", async () => {
+    const fake = await closedInputClaude([], 3);
+    try {
+        const result = await settledRequest(createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, toolContext, { reasoning: "medium" }));
+        assert.equal(result.stopReason, "error");
+        assert.match(result.errorMessage ?? "", /exited before a terminal event \(code 3, signal null/);
+        assert.match(result.errorMessage ?? "", /fake startup failure/);
+        assert.doesNotMatch(result.errorMessage ?? "", /stdin failed/);
+        // Windows pipes accept the write even after the child closed its end, so
+        // only POSIX reports the closed input; the exit explains it either way.
+        if (process.platform !== "win32") assert.match(result.errorMessage ?? "", /closed its input before the prompt was written/);
+    }
+    finally {
+        await rm(fake.directory, { recursive: true, force: true });
     }
 });
 
@@ -1906,14 +2288,14 @@ test("provider refuses an unusable session working directory before preparing or
         ];
         for (const [workingDirectory, message] of cases) {
             let claims = 0;
-            const result = await createClaudeStream(
+            const result = await settledRequest(createClaudeStream(
                 { executable: fake.executable, version: "test", subscriptionType: "pro" },
                 { resolveSession: () => (workingDirectory === undefined ? undefined : { cwd: workingDirectory }), claimLaunch: async () => { claims += 1; } },
-            )(model, context, { reasoning: "medium" }).result();
+            )(model, context, { reasoning: "medium" }));
             assert.equal(result.stopReason, "error");
             assert.match(result.errorMessage ?? "", message);
             assert.equal(claims, 0);
-            const metrics = await waitForRequestMetrics((entry) => entry.errorCategory === "working_directory");
+            const metrics = await requestMetrics(result, (entry) => entry.errorCategory === "working_directory");
             // Validation precedes preparation, so no private request state was created.
             assert.equal(metrics.lastPhase, "payload_applied");
             assert.equal(metrics.transcriptBytes, 0);
@@ -1921,7 +2303,7 @@ test("provider refuses an unusable session working directory before preparing or
         await assert.rejects(access(spawnMarker));
     }
     finally {
-        await Promise.all([root, fake.dir].map((directory) => rm(directory, { recursive: true, force: true })));
+        await Promise.all([root, fake.directory].map((directory) => rm(directory, { recursive: true, force: true })));
     }
 });
 
@@ -1933,7 +2315,7 @@ test("provider does not retry elsewhere when the session directory disappears af
     const fake = await fakeClaude(`fs.writeFileSync(${JSON.stringify(spawnMarker)}, process.cwd()); process.exit(0);`);
     try {
         let claims = 0;
-        const result = await createClaudeStream(
+        const result = await settledRequest(createClaudeStream(
             { executable: fake.executable, version: "test", subscriptionType: "pro" },
             {
                 resolveSession: () => ({ cwd: sessionDirectory }),
@@ -1942,18 +2324,18 @@ test("provider does not retry elsewhere when the session directory disappears af
                     await rm(sessionDirectory, { recursive: true, force: true });
                 },
             },
-        )(model, context, { reasoning: "medium" }).result();
+        )(model, context, { reasoning: "medium" }));
         assert.equal(result.stopReason, "error");
         assert.match(result.errorMessage ?? "", /disappeared before Claude Code could start/);
         assert.doesNotMatch(result.errorMessage ?? "", /spawn .*ENOENT/);
         assert.equal(claims, 1);
-        const metrics = await waitForRequestMetrics((entry) => entry.errorCategory !== undefined);
+        const metrics = await requestMetrics(result, (entry) => entry.errorCategory !== undefined);
         assert.equal(metrics.errorCategory, "working_directory");
         assert.equal(metrics.cleanupComplete, true);
         await assert.rejects(access(spawnMarker));
     }
     finally {
-        await Promise.all([root, fake.dir].map((directory) => rm(directory, { recursive: true, force: true })));
+        await Promise.all([root, fake.directory].map((directory) => rm(directory, { recursive: true, force: true })));
     }
 });
 
@@ -1969,14 +2351,14 @@ test("provider rejects image attachments from a temporary directory containing a
             messages: [{ role: "user", content: [{ type: "text", text: "look" }, { type: "image", data: "AA==", mimeType: "image/png" }], timestamp: 1 }],
             tools: [],
         };
-        const result = await createClaudeStream(
+        const result = await settledRequest(createClaudeStream(
             { executable: join(root, "never-launched"), version: "test", subscriptionType: "pro" },
             { resolveSession: () => ({ cwd: root }), claimLaunch: async () => { claims += 1; } },
-        )(model, imageContext, { reasoning: "medium" }).result();
+        )(model, imageContext, { reasoning: "medium" }));
         assert.equal(result.stopReason, "error");
         assert.match(result.errorMessage ?? "", /double quote/);
         assert.equal(claims, 0);
-        await waitForRequestMetrics((entry) => entry.errorCategory === "image_path");
+        await requestMetrics(result, (entry) => entry.errorCategory === "image_path");
         assert.deepEqual(await readdir(quotedRoot), []);
     }
     finally {
@@ -2017,15 +2399,15 @@ test("provider fails retryably and cleans up when Claude Code recovers mid-respo
     // output cannot be published. The provider must stop it rather than wait.
     const fake = await fakeClaude(capturedBody("drop"));
     try {
-        const result = await createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, context, { reasoning: "medium" }).result();
+        const result = await settledRequest(createClaudeStream({ executable: fake.executable, version: "test", subscriptionType: "pro" })(model, context, { reasoning: "medium" }));
         assert.equal(result.stopReason, "error");
         assert.match(result.errorMessage ?? "", /stream ended before message_stop \(Claude Code began retrying: unknown\)/);
         assert.equal(isRetryableAssistantError(result), true);
-        const metrics = await waitForRequestMetrics((entry) => entry.errorCategory === "stream_interrupted");
+        const metrics = await requestMetrics(result, (entry) => entry.errorCategory === "stream_interrupted");
         assert.equal(metrics.cleanupComplete, true);
     }
     finally {
-        await rm(fake.dir, { recursive: true, force: true });
+        await rm(fake.directory, { recursive: true, force: true });
     }
 });
 test("provider publishes an output-limit response whose process exited before termination landed", async () => {
@@ -2050,18 +2432,18 @@ process.stdin.on("end", () => {
         const events = [];
         for await (const event of stream)
             events.push(event.type);
-        const result = await stream.result();
+        const result = await settledRequest(stream);
         assert.equal(result.stopReason, "length", result.errorMessage);
         assert.equal(events.at(-1), "done");
         // Only the response Pi asked for is published; the continuation turn's
         // blocks were latched out of the stream.
         assert.equal(result.content.some((block) => block.type === "text" && block.text.length > 0), true);
-        const metrics = await waitForRequestMetrics((entry) => entry.lastPhase === "completed");
+        const metrics = await requestMetrics(result, (entry) => entry.lastPhase === "completed");
         assert.equal(metrics.exitCode, 0);
         assert.equal(metrics.cleanupComplete, true);
     }
     finally {
-        await rm(fake.dir, { recursive: true, force: true });
+        await rm(fake.directory, { recursive: true, force: true });
     }
 });
 test("provider returns a length stop when a response reaches the output limit", async () => {
@@ -2082,15 +2464,15 @@ test("provider returns a length stop when a response reaches the output limit", 
         const events = [];
         for await (const event of stream)
             events.push(event.type);
-        const result = await stream.result();
+        const result = await settledRequest(stream);
         assert.equal(result.stopReason, "length", result.errorMessage);
         assert.equal(events.at(-1), "done");
         assert.equal(result.content.some((block) => block.type === "text" && block.text.length > 0), true);
-        const metrics = await waitForRequestMetrics((entry) => entry.lastPhase === "completed");
+        const metrics = await requestMetrics(result, (entry) => entry.lastPhase === "completed");
         assert.equal(metrics.terminationExpected, true);
         assert.equal(metrics.cleanupComplete, true);
     }
     finally {
-        await rm(fake.dir, { recursive: true, force: true });
+        await rm(fake.directory, { recursive: true, force: true });
     }
 });

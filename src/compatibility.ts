@@ -1,6 +1,6 @@
 export const VERIFIED_VERSIONS = Object.freeze({
   pi: "0.87.1",
-  claudeCode: "2.1.281",
+  claudeCode: "2.1.283",
 });
 
 // The oldest Pi and Claude Code this provider claims to support. Deliberately

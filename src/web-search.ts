@@ -15,6 +15,22 @@ import { parseRateLimitNotice, rateLimitRejectionMessage, recordKind, terminalRe
 const MAX_CAPTURE_BYTES = 2 * 1024 * 1024;
 const MAX_REQUEST_BYTES = 64 * 1024;
 const SEARCH_TIMEOUT_MS = 180_000;
+
+export const WEB_SEARCH_ENV = "PI_CLAUDE_CODE_PROVIDER_WEB_SEARCH";
+
+/**
+ * Unset or `on` registers the web-search tool; `off` leaves it unregistered.
+ * Any other value is `invalid`, which also leaves it unregistered: a user who set
+ * the variable almost certainly meant to disable the tool, and registering it
+ * anyway would spend Claude subscription capacity against that intent. This
+ * never throws, because a bad value must not take the provider down with it.
+ */
+export function webSearchSetting(environment: NodeJS.ProcessEnv = process.env): "on" | "off" | "invalid" {
+  const raw = environment[WEB_SEARCH_ENV]?.trim();
+  if (!raw || raw === "on") return "on";
+  if (raw === "off") return "off";
+  return "invalid";
+}
 /** Internal dependency seam for deterministic cleanup-failure tests. */
 type CleanupDirectory = (directory: string) => Promise<void>;
 
@@ -125,7 +141,6 @@ export async function searchWithClaude(
     });
     claude = running;
     metrics.lastPhase = "spawned";
-    await running.recordOwnership();
     const currentProtocol = new SearchProtocol({
       onPhase: (phase) => {
         metrics.lastPhase = phase;
@@ -164,6 +179,10 @@ export async function searchWithClaude(
         }
       }
     });
+    // Only after stdout has a consumer: when a child exits, Node resumes any
+    // unconsumed stdio stream and discards what it buffered, so awaiting the
+    // marker write first could lose a fast-exiting Claude's whole output.
+    await running.recordOwnership();
     const processResult = await running.supervisor.wait();
     metrics.exitCode = processResult.code;
     metrics.exitSignal = processResult.signal;

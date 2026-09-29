@@ -2,6 +2,7 @@ import { open } from "node:fs/promises";
 import { errorCode } from "./errors.ts";
 import type { RequestMetrics, SearchMetrics } from "./types.ts";
 
+// Completion order is deliberate: an older request may finish cleanup last.
 let lastRequestMetrics: RequestMetrics | undefined;
 let lastSearchMetrics: SearchMetrics | undefined;
 let metricsLogError: string | undefined;

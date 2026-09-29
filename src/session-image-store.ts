@@ -3,7 +3,7 @@ import { lstat, readFile, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ClaudeCodeError, errorCode } from "./errors.ts";
-import { createRuntimeDirectory, removeRuntimeDirectory } from "./runtime-directories.ts";
+import { createRuntimeDirectory, removeRuntimeDirectory, retainRuntimeDirectory } from "./runtime-directories.ts";
 
 /** One active Pi session owns the stable paths, never a project directory. */
 export interface ImageStoreLease {
@@ -43,12 +43,17 @@ export class SessionImageStore {
       release: (livenessUnknown = false) => {
         if (released) return;
         released = true;
-        if (livenessUnknown) this.retain = true;
+        if (livenessUnknown) {
+          this.retain = true;
+          // The exit reaper must keep it too: a child that may live can still read it.
+          if (owner.directoryPath) retainRuntimeDirectory(owner.directoryPath);
+        }
         this.active -= 1;
-        // Finish a close() that deferred to this lease. Nothing else will:
-        // session_shutdown arrives once, so without this the directory outlives the
-        // process, and on Windows no stale-state pass ever reclaims it. A store the
-        // next session has already reopened is left alone; that directory is in use.
+        // Finish a close() that deferred to this lease. Nothing else will while the
+        // process lives: session_shutdown arrives once, and on Windows no stale-state
+        // pass ever reclaims it. When the host exits before this release runs, the
+        // exit reaper in runtime-directories.ts removes the directory instead. A store
+        // the next session has already reopened is left alone; that directory is in use.
         if (!this.openForSession && this.active === 0) void this.reclaim().catch(() => undefined);
       },
     };
@@ -61,7 +66,8 @@ export class SessionImageStore {
     // that has not been told to stop yet: waiting for it holds Pi open for the rest
     // of the turn. Leave the directory and its recorded paths intact instead -- the
     // request keeps writing to the paths it was already given, and the last lease to
-    // be released reclaims the directory from release().
+    // be released reclaims the directory from release(), or the exit reaper does if
+    // the host exits first.
     if (this.active > 0) return;
     await this.reclaim();
   }
