@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { basename, extname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ClaudeCodeError } from "./errors.ts";
 import { scriptLaunch, type ScriptLaunch } from "./host-runtime.ts";
@@ -64,11 +66,11 @@ export function thinkingDisplay(environment: NodeJS.ProcessEnv = process.env): "
   throw new ClaudeCodeError("thinking_display_config", `${THINKING_DISPLAY_ENV} must be "summarized", "omitted", or "off"`);
 }
 
-interface PromptBlock {
-  type: "text";
-  text: string;
-  cache_control?: typeof TRANSCRIPT_CACHE_CONTROL;
-}
+const IMAGE_MIME: Record<string, string> = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp" };
+
+type PromptBlock =
+  | { type: "text"; text: string; cache_control?: typeof TRANSCRIPT_CACHE_CONTROL }
+  | { type: "image"; source: { type: "base64"; media_type: string; data: string } };
 
 /** The single owner of how the proposal bridge is launched on either Pi distribution. */
 export function bridgeLaunch(bunConfigPath?: string): ScriptLaunch {
@@ -110,16 +112,14 @@ export function providerArgs(
   effort: string | undefined,
   options: { transcriptBreakpoint?: boolean; thinkingDisplay?: "summarized" | "omitted" } = {},
 ): { args: string[]; prompt: PromptBlock[] } {
-  // Quoted absolute references: Claude runs in Pi's session directory, where a
-  // relative reference would resolve against the project, and the quotes keep a
-  // temporary root containing spaces in one reference.
-  const imageRefs = prepared.attachmentPaths.map((path) => `@"${path.replaceAll("\\", "/")}"`).join(" ");
-  const imageInstruction = imageRefs
-    ? ` Generated image attachments for image_attachment blocks: ${imageRefs}.`
-    : "";
-  // Keep the attachment list after unchanged history and outside the breakpoint.
-  // Claude Code narrates image reads ahead of the transcript, so the paths must
-  // also stay stable across requests for that earlier prefix to be reusable.
+  // Inline base64 rather than an @-reference: a path Claude Code cannot resolve
+  // (a Windows 8.3 short name, say) silently left the model with no image. Each
+  // image is labelled with the name its image_attachment record carries.
+  const imageBlocks: PromptBlock[] = prepared.attachmentPaths.flatMap((path): PromptBlock[] => [
+    { type: "text", text: `Image attachment ${basename(path)}:` },
+    { type: "image", source: { type: "base64", media_type: IMAGE_MIME[extname(path).toLowerCase()] ?? "image/png", data: readFileSync(path).toString("base64") } },
+  ]);
+  // Keep the attachments after unchanged history and outside the breakpoint.
   const markedBlock = options.transcriptBreakpoint === false ? -1 : prepared.transcriptBlocks.length - 1;
   const prompt: PromptBlock[] = [
     ...prepared.transcriptBlocks.map((text, index) => ({
@@ -127,7 +127,7 @@ export function providerArgs(
       text,
       ...(index === markedBlock ? { cache_control: TRANSCRIPT_CACHE_CONTROL } : {}),
     })),
-    ...(imageInstruction ? [{ type: "text" as const, text: imageInstruction.trim() }] : []),
+    ...imageBlocks,
   ];
   const bridge = bridgeLaunch(prepared.bunConfigPath);
   const mcpConfig = prepared.catalogPath

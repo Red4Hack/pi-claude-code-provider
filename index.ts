@@ -14,6 +14,7 @@ import { errorText, normalizeClaudeFailure } from "./src/errors.ts";
 import { formatDoctorSummary, probeBridge, type WebSearchStatus } from "./src/doctor.ts";
 import { flushMetricsLog, getLastRequestMetrics, getLastSearchMetrics, getMetricsLogError } from "./src/metrics.ts";
 import { readProviderPackage } from "./src/package-info.ts";
+import { extractPastedImages } from "./src/pasted-images.ts";
 import { createClaudeStream } from "./src/provider.ts";
 import { cleanupStaleRuntimeDirectories, createRuntimeDirectory } from "./src/runtime-directories.ts";
 import { SessionImageStore } from "./src/session-image-store.ts";
@@ -28,6 +29,9 @@ const API = "pi-claude-code-provider-headless";
 const SEARCH_TOOL = "pi_claude_code_provider_web_search";
 const NOTICE_PREFIX = "[pi-claude-code-provider]";
 const MAX_TRACKED_RATE_LIMIT_NOTICES = 64;
+// PowerShell treats [ and ] in a path as wildcards, so cd/ls on a folder such as
+// [example] reports "path does not exist" unless the path is passed literally.
+const POWERSHELL_PATH_HINT = "\n\nWindows shell note: in PowerShell, `[` and `]` in a path are wildcards. For any path containing them, such as `[example]`, use `-LiteralPath` (`Set-Location -LiteralPath`, `Get-ChildItem -LiteralPath`, `Get-Content -LiteralPath`) instead of `cd path`, `ls path` or `cat path`, or escape the brackets.";
 
 export default async function piClaudeCodeProvider(pi: ExtensionAPI): Promise<void> {
   const runtimeCleanup = await cleanupStaleRuntimeDirectories();
@@ -55,6 +59,8 @@ export default async function piClaudeCodeProvider(pi: ExtensionAPI): Promise<vo
   // because Pi's model runtime keeps only the newest provider.
   const sessions = sessionRegistry();
   let ownSessionId: string | undefined;
+  // Numbers pasted images across the session's sends: [image #1], [image #2], ...
+  let nextImageNumber = 1;
 
   const streamSimple = createClaudeStream(installation, {
     resolveSession: (request) => resolveSession(sessions, {
@@ -93,6 +99,7 @@ export default async function piClaudeCodeProvider(pi: ExtensionAPI): Promise<vo
   pi.on("session_start", (_event, ctx) => {
     searchOutputs.open();
     imageStore.open();
+    nextImageNumber = 1;
     // Another session reloading clears Pi-AI's registry for every extension in
     // the process, so ownership is re-asserted rather than claimed once.
     serveApiRegistry();
@@ -124,6 +131,21 @@ export default async function piClaudeCodeProvider(pi: ExtensionAPI): Promise<vo
       (notice) => activeRateLimitNotify?.(notice),
       (message) => ctx.ui.notify(message, "warning"),
     );
+  });
+
+  // Pi pastes a clipboard image as a temp-file path in the editor. Turn it into a
+  // real image plus an [image #N] marker, for this provider's models only.
+  pi.on("input", async (event, ctx) => {
+    if (event.source !== "interactive" || ctx.model?.provider !== PROVIDER) return { action: "continue" };
+    const pasted = await extractPastedImages(event.text, nextImageNumber);
+    if (pasted.images.length === 0) return { action: "continue" };
+    nextImageNumber = pasted.next;
+    return { action: "transform", text: pasted.text, images: [...(event.images ?? []), ...pasted.images] };
+  });
+
+  pi.on("before_agent_start", (event, ctx) => {
+    if (process.platform !== "win32" || ctx.model?.provider !== PROVIDER) return;
+    return { systemPrompt: event.systemPrompt + POWERSHELL_PATH_HINT };
   });
 
   pi.on("session_shutdown", async () => {

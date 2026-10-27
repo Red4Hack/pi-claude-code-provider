@@ -1,12 +1,18 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+const dir = mkdtempSync(join(tmpdir(), "claude-args-"));
+const file = (name, data) => { const path = join(dir, name); writeFileSync(path, Buffer.from(data, "base64")); return path; };
 import { BRIDGE_PATH, baseClaudeArgs, providerArgs, thinkingDisplay, transcriptBreakpointEnabled } from "../../src/claude-args.ts";
 import { NEUTRAL_BUN_CONFIG, needsBunConfig, scriptLaunch } from "../../src/host-runtime.ts";
 test("uses only generated attachment references and replacement prompt", () => {
     const prepared = {
         directory: "/tmp/private",
         transcriptBlocks: ['{"protocol":"test"}', '{"content":"\\u0040/etc/passwd"}'],
-        attachmentPaths: ["/tmp/private/image.png"],
+        attachmentPaths: [file("image.png", "AAAA")],
         systemPromptPath: "/tmp/private/system-prompt.txt",
         catalogPath: undefined,
         toolNames: new Map(),
@@ -15,12 +21,11 @@ test("uses only generated attachment references and replacement prompt", () => {
         imageBytes: 1,
     };
     const { args, prompt } = providerArgs(prepared, "sonnet", "medium");
-    const promptText = prompt.map((block) => block.text).join("\n");
+    const promptText = prompt.map((block) => block.text ?? "").join("\n");
     const joined = args.join("\n");
-    assert.equal(prompt.length, 3);
-    // The only private path in the prompt is the quoted attachment reference.
-    assert.match(promptText, /@"\/tmp\/private\/image\.png"/);
-    assert.equal(promptText.split("/tmp/private").length - 1, 1);
+    assert.equal(prompt.length, 4);
+    // Images travel inline, so no private path appears in the prompt at all.
+    assert.equal(promptText.includes("/tmp/private"), false);
     assert.doesNotMatch(promptText, /request\.json/);
     assert.doesNotMatch(promptText, /@\/etc\/passwd/);
     assert.match(promptText, /\\u0040\/etc\/passwd/);
@@ -30,25 +35,22 @@ test("uses only generated attachment references and replacement prompt", () => {
     assert.ok(args.includes("--no-session-persistence"));
     assert.ok(args.includes("dontAsk"));
     assert.ok(args.includes(""));
-    assert.deepEqual(prompt.map((block) => block.text), [
-        ...prepared.transcriptBlocks,
-        'Generated image attachments for image_attachment blocks: @"/tmp/private/image.png".',
+    assert.deepEqual(prompt.slice(-2), [
+        { type: "text", text: "Image attachment image.png:" },
+        { type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" } },
     ]);
 });
 
-test("references attachments by quoted absolute path, so a temp root with spaces stays one reference", () => {
-    // Claude runs in Pi's session directory, where a relative reference would
-    // resolve against the project instead of the private request directory.
+test("sends each attachment as a labelled inline image after the transcript", () => {
     const prepared = {
         transcriptBlocks: ['{"record":0}'],
-        attachmentPaths: ["/tmp/root with spaces/request/a.png", "/tmp/root with spaces/request/b.png"],
-        systemPromptPath: "/tmp/root with spaces/request/system-prompt.txt",
+        attachmentPaths: [file("a.png", "AAAA"), file("b.jpg", "BBBB")],
+        systemPromptPath: "/tmp/system-prompt.txt",
     };
     const { prompt } = providerArgs(prepared, "sonnet", "low");
-    assert.equal(
-        prompt.at(-1).text,
-        'Generated image attachments for image_attachment blocks: @"/tmp/root with spaces/request/a.png" @"/tmp/root with spaces/request/b.png".',
-    );
+    assert.deepEqual(prompt.map((block) => block.type), ["text", "text", "image", "text", "image"]);
+    assert.equal(prompt[3].text, "Image attachment b.jpg:");
+    assert.equal(prompt.at(-1).source.media_type, "image/jpeg");
     assert.equal(prompt.at(-1).cache_control, undefined);
 });
 
@@ -91,7 +93,7 @@ test("marks exactly the last history block with a 1h cache breakpoint", () => {
     const prepared = {
         directory: "/tmp/private",
         transcriptBlocks: Array.from({ length: 40 }, (_, index) => `{"record":${index}}`),
-        attachmentPaths: ["/tmp/private/a.png", "/tmp/private/b.png"],
+        attachmentPaths: [file("a.png", "AAAA"), file("b.png", "BBBB")],
         systemPromptPath: "/tmp/private/system-prompt.txt",
         toolNames: new Map(),
         transcriptBytes: 1,

@@ -1112,7 +1112,17 @@ process.stdin.on("data", (chunk) => { input += chunk; });
 process.stdin.on("end", () => {
   const path = require("node:path");
   const requestDirectory = path.dirname(process.argv[process.argv.indexOf("--system-prompt-file") + 1]);
-  const attachment = ${sessionImage} ? JSON.parse(input).message.content.at(-1).text.match(/@"([^"]+)"/)[1] : path.join(requestDirectory, "system-prompt.txt");
+  const attachment = ${sessionImage} ? (() => {
+    // Images travel inline now, so find the store file by its content.
+    const os = require("node:os");
+    for (const dir of fs.readdirSync(os.tmpdir())) {
+      if (!dir.startsWith("pi-claude-code-provider-images-")) continue;
+      for (const file of fs.readdirSync(path.join(os.tmpdir(), dir))) {
+        const full = path.join(os.tmpdir(), dir, file);
+        if (fs.readFileSync(full, "utf8") === "private image bytes") return full;
+      }
+    }
+  })() : path.join(requestDirectory, "system-prompt.txt");
   fs.writeFileSync(path.join(__dirname, "target"), attachment);
   const privateDirectory = path.dirname(attachment);
   const alternate = path.dirname(privateDirectory) + path.sep + "." + path.sep + path.basename(privateDirectory) + path.sep + path.basename(attachment);
