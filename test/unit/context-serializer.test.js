@@ -534,3 +534,15 @@ test("session image store rejects a quoted root before writing and recovers afte
         await rm(fixture, { recursive: true, force: true });
     }
 });
+
+test("escapes cch= so Claude Code cannot rewrite replayed history", async () => {
+  const prepared = await prepareRequest({ messages: [{ role: "user", content: "see cch=00000 and CCH=abc", timestamp: 1 }] });
+  try {
+    const text = transcript(prepared);
+    assert.doesNotMatch(text, /cch=/i);
+    assert.match(text, /cch\\u003d00000/);
+    assert.match(text, /CCH\\u003dabc/);
+  } finally {
+    await rm(prepared.directory, { recursive: true, force: true });
+  }
+});

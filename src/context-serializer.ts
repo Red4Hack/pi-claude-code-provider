@@ -305,7 +305,8 @@ export async function prepareRequestWithLimits(
       }),
       ...messages.map((message) => JSON.stringify(message)),
     ];
-    const transcriptBlocks = records.map((record) => record.replaceAll("@", "\\u0040"));
+    // "cch=" is escaped too: Claude Code rewrites it to a per-request billing hash, which would change replayed history every turn and defeat the cache.
+    const transcriptBlocks = records.map((record) => record.replaceAll("@", "\\u0040").replaceAll(/cch=/gi, (m) => `${m.slice(0, 3)}\\u003d`));
     const transcript = transcriptBlocks.join("\n");
     const transcriptBytes = Buffer.byteLength(transcript);
     if (transcriptBytes > limits.transcriptBytes) {
