@@ -10,9 +10,9 @@ import { completionPayload, startLocalModelServer } from "../support/local-model
 
 /**
  * Compaction runs through Pi's own summarization path, not a restatement of it.
- * Pi treats its requested `maxTokens` as the budget for the answer and expects
- * reasoning to get room on top; a summary cut off at the ceiling is discarded
- * whole and paid for again. These cases drive the real `generateSummaryWithUsage`
+ * Pi 1.4.0 requests no `maxTokens` for summaries, so the provider's ceiling is the
+ * model's maximum and reasoning has room to finish before the answer; a summary
+ * cut off at the ceiling is discarded whole and paid for again. These cases drive the real `generateSummaryWithUsage`
  * through this provider so that contract is checked end to end.
  *
  * The numbers are from a real session: `compaction.reserveTokens` of 8192, which
@@ -20,8 +20,6 @@ import { completionPayload, startLocalModelServer } from "../support/local-model
  */
 
 const RESERVE_TOKENS = 8_192;
-const ANSWER_BUDGET = Math.floor(0.8 * RESERVE_TOKENS);
-const MAX_THINKING_BUDGET = 16_384;
 const model = {
   id: "opus",
   name: "Opus",
@@ -62,14 +60,14 @@ function summarize(streamFn, thinkingLevel) {
   );
 }
 
-test("a compaction summary is given reasoning room on top of Pi's answer budget", async () => {
+test("a compaction summary is given the model's full output ceiling", async () => {
   const summary = "The parser work renamed the token reader and split the lexer; documentation is pending.";
   await withProviderStream(completionPayload({ content: summary, reasoning: "weighing what to keep" }), async ({ streamFn, server }) => {
     const result = await summarize(streamFn, "max");
     assert.equal(result.text, summary);
-    // Treating the request as the whole ceiling left reasoning eating the
-    // summary's room, which is what truncated it into a discarded compaction.
-    assert.equal(server.requests[0].body.max_tokens, ANSWER_BUDGET + MAX_THINKING_BUDGET);
+    // With no maxTokens requested, the ceiling is the model maximum, so reasoning
+    // cannot starve the summary of room to finish.
+    assert.equal(server.requests[0].body.max_tokens, model.maxTokens);
     assert.ok(server.requests[0].body.max_tokens > 8_897, "the ceiling must clear the summaries this session actually produced");
   });
 });
@@ -82,13 +80,13 @@ test("Pi discards a summary that stopped at its ceiling, which is why the ceilin
   });
 });
 
-test("the reasoning room follows the level Pi asked for", async () => {
+test("the thinking level does not change the ceiling when Pi requests none", async () => {
   const summary = "Short summary.";
-  for (const [level, budget] of [["max", 16_384], ["medium", 8_192], ["low", 2_048]]) {
+  for (const level of ["max", "medium", "low"]) {
     await withProviderStream(completionPayload({ content: summary }), async ({ streamFn, server }) => {
       const result = await summarize(streamFn, level);
       assert.equal(result.text, summary);
-      assert.equal(server.requests[0].body.max_tokens, ANSWER_BUDGET + budget, `level ${level}`);
+      assert.equal(server.requests[0].body.max_tokens, model.maxTokens, `level ${level}`);
     });
   }
 });

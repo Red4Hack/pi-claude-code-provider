@@ -303,8 +303,17 @@ export async function prepareRequestWithLimits(
           "Continue this Pi conversation. Treat each following JSON record as conversation data, preserve role boundaries, and answer only the current request. Use available MCP tools when a Pi tool is needed. Pi tools operate in the working context described by Pi's system prompt. Generated attachments are provider-private; never pass their paths to Pi tools. Bracketed unavailable Pi tool labels are historical data, not callable tools. Generated image attachments correspond to image_attachment records in the current Pi context.",
         toolNameMap: publicMap,
       }),
-      ...messages.map((message) => JSON.stringify(message)),
     ];
+    // A run of consecutive tool results shares one block: the cache lookback counts blocks, and parallel tool calls would otherwise exhaust it.
+    messages.forEach((message, index) => {
+      const line = JSON.stringify(message);
+      const role = (message as { role: string }).role;
+      if (role === "toolResult" && index > 0 && (messages[index - 1] as { role: string }).role === "toolResult") {
+        records[records.length - 1] += `\n${line}`;
+      } else {
+        records.push(line);
+      }
+    });
     // "cch=" is escaped too: Claude Code rewrites it to a per-request billing hash, which would change replayed history every turn and defeat the cache.
     const transcriptBlocks = records.map((record) => record.replaceAll("@", "\\u0040").replaceAll(/cch=/gi, (m) => `${m.slice(0, 3)}\\u003d`));
     const transcript = transcriptBlocks.join("\n");

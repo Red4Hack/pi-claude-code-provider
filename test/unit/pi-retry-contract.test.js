@@ -27,9 +27,11 @@ test("an exhausted subscription window stops the turn instead of restarting it",
 });
 
 test("a readiness deadline is reported in seconds so a duration cannot read as an HTTP status", () => {
-  // "5000ms" contains "500", which Pi matches as a retryable server error, so
-  // the old wording restarted a request that needed a fix rather than a retry.
-  assert.equal(isRetryableAssistantError(failure("Pi proposal MCP server did not become ready within 5000ms")), true);
+  // Older Pi matched "500" inside "5000ms" as a retryable server error, which
+  // restarted a request that needed a fix rather than a retry. Newer Pi no
+  // longer matches 500 inside 5000, so that text is non-retryable now; the
+  // seconds wording stays non-retryable either way.
+  assert.equal(isRetryableAssistantError(failure("Pi proposal MCP server did not become ready within 5000ms")), false);
   assert.equal(isRetryableAssistantError(failure("Pi proposal MCP server did not become ready within 20s")), false);
 });
 

@@ -230,7 +230,7 @@ test("keeps active, colliding, removed, and paired historical tool identities co
     const first = await prepareRequest({ messages: history, tools });
     const second = await prepareRequest({ messages: [...history, { role: "user", content: "continue", timestamp: 6 }], tools });
     try {
-        const [header, assistantRecord, ...results] = first.transcriptBlocks.map(JSON.parse);
+        const [header, assistantRecord, ...results] = first.transcriptBlocks.flatMap((block) => block.split("\n")).map((line) => JSON.parse(line));
         assert.deepEqual(header.toolNameMap, [
             { transportName: `mcp__pi__${baseAlias}`, piName: invalidName },
             { transportName: `mcp__pi__${baseAlias}_1`, piName: collisionName },
