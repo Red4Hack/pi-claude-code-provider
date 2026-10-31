@@ -46,6 +46,8 @@ test("builds an allowlisted Claude environment", () => {
         assert.equal(env.CLAUDE_CODE_DISABLE_AUTO_MEMORY, "1");
         // Claude runs in the user's project; its startup git status can run configured Git filters.
         assert.equal(env.CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS, "1");
+        assert.equal(env.CLAUDE_CODE_DISABLE_CLAUDE_MDS, "1");
+        assert.equal(env.CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK, "1");
         assert.equal(env.DISABLE_NON_ESSENTIAL_MODEL_CALLS, undefined);
         assert.equal(env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, "1");
         // Pi owns compaction; Claude Code must never compact the replayed transcript.
@@ -139,12 +141,12 @@ test("matches option aliases and value notation", () => {
 test("compares versions numerically rather than lexically", () => {
     // The failure this guards is real: "2.1.9" sorts above "2.1.241" as strings.
     assert.equal(meetsMinimumVersion("2.1.9", "2.1.241"), false);
-    assert.equal(meetsMinimumVersion("2.1.281", MINIMUM_VERSIONS.claudeCode), true);
-    assert.equal(meetsMinimumVersion("2.1.280", MINIMUM_VERSIONS.claudeCode), false);
+    assert.equal(meetsMinimumVersion("2.1.311", MINIMUM_VERSIONS.claudeCode), true);
+    assert.equal(meetsMinimumVersion("2.1.310", MINIMUM_VERSIONS.claudeCode), false);
     assert.equal(meetsMinimumVersion("2.2.0", MINIMUM_VERSIONS.claudeCode), true);
     assert.equal(meetsMinimumVersion("3.0.0", MINIMUM_VERSIONS.claudeCode), true);
-    assert.equal(meetsMinimumVersion("0.86.1", MINIMUM_VERSIONS.pi), true);
-    assert.equal(meetsMinimumVersion("0.86.0", MINIMUM_VERSIONS.pi), false);
+    assert.equal(meetsMinimumVersion("1.4.0", MINIMUM_VERSIONS.pi), true);
+    assert.equal(meetsMinimumVersion("1.3.9", MINIMUM_VERSIONS.pi), false);
     assert.equal(meetsMinimumVersion("0.85.1", MINIMUM_VERSIONS.pi), false);
 });
 

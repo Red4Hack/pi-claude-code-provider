@@ -262,7 +262,13 @@ test("deduplicates identical images and enforces the image-count limit", async (
     finally {
         await rm(prepared.directory, { recursive: true, force: true });
     }
-    await assert.rejects(prepareRequest({ messages: [{ role: "user", content: Array.from({ length: 21 }, () => image), timestamp: 1 }] }), /At most 20 images/);
+    const trimmed = await prepareRequest({ messages: [{ role: "user", content: Array.from({ length: 21 }, () => image), timestamp: 1 }] });
+    try {
+        assert.equal(trimmed.imageCount, 20);
+    }
+    finally {
+        await rm(trimmed.directory, { recursive: true, force: true });
+    }
 });
 test("enforces every configurable serializer resource boundary", async () => {
     const schema = Type.Object({ value: Type.String() });
@@ -273,7 +279,9 @@ test("enforces every configurable serializer resource boundary", async () => {
     await assert.rejects(prepareRequestWithLimits({ messages: [{ role: "user", content: [fourBytes], timestamp: 1 }] }, { imageBytes: 3 }), /between 1 byte and 3 bytes/);
     const otherFourBytes = { type: "image", data: Buffer.from("5678").toString("base64"), mimeType: "image/png" };
     await assert.rejects(prepareRequestWithLimits({ messages: [{ role: "user", content: [fourBytes, otherFourBytes], timestamp: 1 }] }, { totalImageBytes: 7 }), /Aggregate image size/);
-    await assert.rejects(prepareRequestWithLimits({ messages: [{ role: "user", content: [fourBytes, fourBytes], timestamp: 1 }] }, { images: 1 }), /At most 1 images/);
+    const capped = await prepareRequestWithLimits({ messages: [{ role: "user", content: [fourBytes, fourBytes], timestamp: 1 }] }, { images: 1 });
+    assert.equal(capped.imageCount, 1);
+    await rm(capped.directory, { recursive: true, force: true });
 });
 
 test("canonicalizes aliased temp roots containing spaces and decomposed Unicode", { skip: process.platform === "win32" }, async () => {
@@ -456,14 +464,20 @@ test("rejects a non-boolean redacted flag and a non-string image MIME type", asy
     );
 });
 
-test("counts historical images toward the 20-image limit", async () => {
-    await assert.rejects(prepareRequest({
+test("drops the oldest historical images beyond the 20-image limit", async () => {
+    const prepared = await prepareRequest({
         messages: [
             { role: "user", content: Array.from({ length: 21 }, (_, index) => pixels(`old ${index}`)), timestamp: 1 },
             assistantMessage([{ type: "text", text: "seen" }]),
             { role: "user", content: [pixels("current")], timestamp: 3 },
         ],
-    }), (error) => error.code === "image_count" && /At most 20 images/.test(error.message));
+    });
+    try {
+        assert.equal(prepared.imageCount, 20);
+    }
+    finally {
+        await rm(prepared.directory, { recursive: true, force: true });
+    }
 });
 
 test("attaches images by absolute path under a temp root with spaces, and refuses a root containing a double quote", { skip: process.platform === "win32" }, async () => {

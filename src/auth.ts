@@ -265,5 +265,10 @@ export function buildClaudeEnvironment(extra: NodeJS.ProcessEnv = {}): NodeJS.Pr
   // Pi owns compaction. Given a transcript near its limit, Claude Code otherwise
   // starts compacting it on its own before refusing it as too long.
   env.DISABLE_COMPACT = "1";
+  // Pi supplies its own context; a CLAUDE.md in the project would only duplicate it.
+  env.CLAUDE_CODE_DISABLE_CLAUDE_MDS = "1";
+  // A mid-stream failure must surface as stream_interrupted for Pi to retry; the
+  // non-streaming re-request would answer a turn the provider has already abandoned.
+  env.CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK = "1";
   return { ...env, ...extra };
 }

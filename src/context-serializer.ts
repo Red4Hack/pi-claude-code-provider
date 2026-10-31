@@ -153,6 +153,11 @@ export async function prepareRequestWithLimits(
     const writtenImages = new Set<string>();
     let imageCount = 0;
     let imageBytes = 0;
+    // Images beyond the limit are dropped oldest-first instead of failing the request.
+    let omitImages = Math.max(0, context.messages.reduce((total, message) => {
+      const content = (message as { content?: unknown } | null)?.content;
+      return total + (Array.isArray(content) ? content.filter((b) => b && (b as { type?: unknown }).type === "image").length : 0);
+    }, 0) - limits.images);
     const { catalog, names, historicalNames, publicMap } = serializeToolCatalog(context.tools ?? [], limits);
     const historicalNamesByCallId = new Map<string, string>();
     const historicalName = (piName: string): string =>
@@ -215,6 +220,11 @@ export async function prepareRequestWithLimits(
             break;
           }
           case "image": {
+            if (omitImages > 0) {
+              omitImages -= 1;
+              output.push({ type: "text", text: "[older image omitted: only the most recent images are kept]" });
+              break;
+            }
             imageCount += 1;
             if (imageCount > limits.images) throw new ClaudeCodeError("image_count", `At most ${limits.images} images are supported`);
             const image = raw as ImageContent;
