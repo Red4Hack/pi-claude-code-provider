@@ -1,10 +1,11 @@
+import type { ProviderModelConfig } from "@earendil-works/pi-coding-agent";
 import { spawn } from "node:child_process";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { buildClaudeEnvironment } from "./auth.ts";
 import { providerModels } from "./catalog.ts";
 import { bridgeArgv, bridgeLaunch, formatBridgeArgv } from "./claude-args.ts";
-import { MODEL_ALIASES, type ModelAliasVersions } from "./claude-models.ts";
+import type { ModelAliasVersions } from "./claude-models.ts";
 import type { VersionStatus } from "./compatibility.ts";
 import { NEUTRAL_BUN_CONFIG, hostRuntimeDescription, needsBunConfig } from "./host-runtime.ts";
 import { superviseProcess, terminateProcessGroup, type ProcessResult, type ProcessSupervisor } from "./process-utils.ts";
@@ -154,6 +155,7 @@ export interface DoctorSummaryInput {
   installation: ClaudeInstallation;
   providerPackage?: ProviderPackage;
   modelIds: readonly string[];
+  models?: readonly ProviderModelConfig[];
   modelVersions?: ModelAliasVersions;
   metrics?: RequestMetrics;
   metricsLogError?: string;
@@ -246,7 +248,7 @@ function servedContextWindowNote(input: DoctorSummaryInput, metrics: RequestMetr
   if (typeof served !== "number" || !Number.isFinite(served) || served <= 0) return undefined;
   // Pi 0.99 widened ProviderModelConfig to a union that includes image models
   // without a context window; every model this provider registers carries one.
-  const match = providerModels().find((model) => model.id === metrics.requestedModel);
+  const match = (input.models ?? providerModels()).find((model) => model.id === metrics.requestedModel);
   const configured = match && "contextWindow" in match ? match.contextWindow : undefined;
   if (configured === undefined || configured === served) return undefined;
   return `Context window: ${metrics.requestedModel} served ${served}, configured ${configured}; ` +
@@ -277,7 +279,7 @@ function promptCacheNote(metrics: RequestMetrics): string | undefined {
 function formatServedModels(input: DoctorSummaryInput): string {
   const versions = input.modelVersions;
   if (!versions) return "";
-  const advertised = MODEL_ALIASES.filter((alias) => input.modelIds.includes(alias));
+  const advertised = input.modelIds;
   if (advertised.length === 0) return "";
   const entries = advertised.map((alias) => {
     const model = versions[alias];

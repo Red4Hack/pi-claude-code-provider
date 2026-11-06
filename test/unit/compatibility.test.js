@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { EXPECTED_MODEL_FAMILIES, VERIFIED_VERSIONS, platformStatus, startupPlatformWarning, versionStatus } from "../../src/compatibility.ts";
+import { expectedModelFamily, VERIFIED_VERSIONS, platformStatus, startupPlatformWarning, versionStatus } from "../../src/compatibility.ts";
 
 test("verified versions report verified status without a warning", () => {
   const status = versionStatus("Pi", VERIFIED_VERSIONS.pi, VERIFIED_VERSIONS.pi);
@@ -8,15 +8,13 @@ test("verified versions report verified status without a warning", () => {
   assert.equal(status.warning, undefined);
 });
 
-test("targets a model family for every picker alias, not a dated model id", () => {
-  assert.deepEqual(Object.keys(EXPECTED_MODEL_FAMILIES), ["sonnet", "fable", "opus", "haiku"]);
+test("targets a model family for any alias, not a dated model id", () => {
   // A point release that renames the served model must not fail the paid gate,
   // but an alias serving the wrong family still must.
-  assert.match("claude-opus-5", EXPECTED_MODEL_FAMILIES.opus);
-  assert.match("claude-opus-6-20270101", EXPECTED_MODEL_FAMILIES.opus);
-  assert.doesNotMatch("claude-sonnet-5", EXPECTED_MODEL_FAMILIES.opus);
-  assert.match("claude-fable-5-1", EXPECTED_MODEL_FAMILIES.fable);
-  assert.match("claude-haiku-4-5-20251001", EXPECTED_MODEL_FAMILIES.haiku);
+  assert.match("claude-opus-5", expectedModelFamily("opus"));
+  assert.match("claude-opus-6-20270101", expectedModelFamily("opus"));
+  assert.doesNotMatch("claude-sonnet-5", expectedModelFamily("opus"));
+  assert.match("claude-newmodel-1", expectedModelFamily("newmodel"));
 });
 
 test("a supported-version floor is reported separately from the tested baseline", () => {

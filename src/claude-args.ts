@@ -10,6 +10,7 @@ import type { PreparedRequest } from "./types.ts";
 // and --safe-mode would disable the proposal MCP server.
 // Claude Code otherwise appends a changing <total_tokens> reminder that breaks
 // append-only cache reuse across this provider's fresh print-mode processes.
+// Claude Code 2.1.318 renamed built-in plugins to cc-plugin-*@builtin; both spellings are pinned.
 // Claude Code 2.1.281 loads its built-in agents-md plugin regardless of setting
 // sources; initialization would then report it and fail the isolation check.
 // Pin telemetry too, supplementing the environment's nonessential-traffic switch.
@@ -18,13 +19,29 @@ import type { PreparedRequest } from "./types.ts";
 // this provider can never publish: Pi's events are append-only and the served model
 // would change mid-response. Off, a print-mode request ends with the refusal instead.
 // Managed settings can still turn it on, so stream-events.ts also recognizes the switch.
-const SETTINGS = JSON.stringify({
+const KNOWN_PLUGINS = ["agents-md", "telemetry", "plugin-authoring", "privacy", "sec-default", "mods-guide", "tips"];
+
+// Every built-in plugin the installed Claude Code names, plus the known ones, under
+// both spellings. Sorted so the settings string stays byte-stable for cache reuse.
+function settingsJson(discovered: readonly string[] = []): string {
+  const enabledPlugins: Record<string, false> = {};
+  for (const name of [...new Set([...KNOWN_PLUGINS, ...discovered])].sort()) {
+    enabledPlugins[`${name}@builtin`] = false;
+    enabledPlugins[`cc-plugin-${name}@builtin`] = false;
+  }
+  return JSON.stringify({
   disableAllHooks: true,
   autoMemoryEnabled: false,
   totalTokensReminder: "off",
   switchModelsOnFlag: false,
-  enabledPlugins: { "agents-md@builtin": false, "telemetry@builtin": false, "plugin-authoring@builtin": false  },
-});
+  enabledPlugins,
+  });
+}
+let SETTINGS = settingsJson();
+/** Called once after the install is inspected; later requests pin the discovered plugins. */
+export function setBuiltinPlugins(names: readonly string[]): void {
+  SETTINGS = settingsJson(names);
+}
 export const EMPTY_MCP = JSON.stringify({ mcpServers: {} });
 export const BRIDGE_PATH = fileURLToPath(new URL("../bridge/mcp-proposal-server.js", import.meta.url));
 

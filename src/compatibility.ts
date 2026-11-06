@@ -19,12 +19,9 @@ const VERIFIED_PLATFORMS = "Linux/linux-x64, including WSL2; native Windows/win3
 // Which family an alias must serve, not which dated model. Claude Code refreshes
 // model versions on its own schedule; pinning exact ids only guarantees the paid
 // gate fails on a release that changed nothing here.
-export const EXPECTED_MODEL_FAMILIES = Object.freeze({
-  sonnet: /^claude-sonnet-/,
-  fable: /^claude-fable-/,
-  opus: /^claude-opus-/,
-  haiku: /^claude-haiku-/,
-});
+export function expectedModelFamily(alias: string): RegExp {
+  return new RegExp(`^claude-${alias}-`);
+}
 
 export interface VersionStatus {
   component: string;

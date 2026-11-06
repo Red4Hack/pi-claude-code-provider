@@ -6,8 +6,8 @@ import { join } from "node:path";
 import { Type } from "typebox";
 import { inspectClaudeInstallation } from "./src/auth.ts";
 import { providerModels as catalogModels } from "./src/catalog.ts";
-import { bridgeArgv } from "./src/claude-args.ts";
-import { readClaudeModelAliases } from "./src/claude-models.ts";
+import { bridgeArgv, setBuiltinPlugins } from "./src/claude-args.ts";
+import { readClaudeBuiltinPlugins, readClaudeModelAliases, readClaudeModelLimits } from "./src/claude-models.ts";
 import { MINIMUM_VERSIONS, VERIFIED_VERSIONS, platformStatus, startupPlatformWarning, versionStatus } from "./src/compatibility.ts";
 import { writeDiagnosticReport } from "./src/diagnostics.ts";
 import { errorText, normalizeClaudeFailure } from "./src/errors.ts";
@@ -47,7 +47,8 @@ export default async function piClaudeCodeProvider(pi: ExtensionAPI): Promise<vo
     registerUnavailableNotice(pi, errorText(error));
     return;
   }
-  const providerModels = catalogModels();
+  // Aliases come from the installed Claude Code, so a new model appears without a release here.
+  const providerModels = await discoverModels(installation);
   const currentPlatform = platformStatus();
   const searchOutputs = createSearchOutputOwner();
   const imageStore = new SessionImageStore();
@@ -175,6 +176,15 @@ export default async function piClaudeCodeProvider(pi: ExtensionAPI): Promise<vo
   });
 }
 
+async function discoverModels(installation: ClaudeInstallation) {
+  setBuiltinPlugins(await readClaudeBuiltinPlugins(installation).catch(() => []));
+  const [versions, limits] = await Promise.all([
+    readClaudeModelAliases(installation).catch(() => ({})),
+    readClaudeModelLimits(installation).catch(() => ({})),
+  ]);
+  return catalogModels(Object.keys(versions), versions, limits);
+}
+
 function registerDoctorCommand(
   pi: ExtensionAPI,
   runtimeCleanup: RuntimeCleanupResult,
@@ -227,16 +237,19 @@ function registerDoctorCommand(
         }
         const current = await inspectClaudeInstallation();
         const claudeStatus = versionStatus("Claude Code", current.version, VERIFIED_VERSIONS.claudeCode, MINIMUM_VERSIONS.claudeCode);
+        const modelVersions = await readClaudeModelAliases(current).catch(() => undefined);
+        const models = await discoverModels(current);
         ctx.ui.notify(formatDoctorSummary({
           platformStatus: currentPlatform,
           piStatus,
           claudeStatus,
           installation: current,
           providerPackage,
-          modelIds: catalogModels().map((model) => model.id),
+          modelIds: models.map((model) => model.id),
+          models,
           // Diagnostic only, and fail-soft: a doctor run must never fail
           // because Claude Code moved an undocumented internal table.
-          modelVersions: await readClaudeModelAliases(current).catch(() => undefined),
+          modelVersions,
           metrics: getLastRequestMetrics(),
           metricsLogError: getMetricsLogError(),
           runtimeCleanup,

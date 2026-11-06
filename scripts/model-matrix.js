@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { EXPECTED_MODEL_FAMILIES } from "../src/compatibility.ts";
+import { expectedModelFamily } from "../src/compatibility.ts";
 import { providerModels as catalogModels } from "../src/catalog.ts";
 import { assistantReply, consumeJsonl, describeThinking, superviseLiveProcess } from "./lib/live-process.js";
 import { livePiLaunch } from "./lib/pi-installation.js";
@@ -17,7 +17,6 @@ const providerModels = catalogModels();
 const efforts = ["low", "medium", "high", "xhigh", "max"];
 const effortModels = ["sonnet", "opus"];
 const advertisedModels = providerModels.map((model) => model.id);
-assert.deepEqual(Object.keys(EXPECTED_MODEL_FAMILIES), advertisedModels, "compatibility targets must match advertised models");
 // Fable availability and included quota vary by subscription tier. It is
 // intentionally opt-in and excluded from the blocking gate; the standalone
 // case remains selectable for accounts with Fable access.
@@ -86,7 +85,7 @@ async function runCase(cwd, model, effort) {
     const message = assistantReply(events, `${model}:${effort}`);
     const text = message.content.filter((block) => block.type === "text").map((block) => block.text).join("").trim();
     assert.match(text, /^OK\.?$/, `${model}:${effort} response text`);
-    assert.match(message.responseModel, EXPECTED_MODEL_FAMILIES[model], `${model}:${effort} resolved model`);
+    assert.match(message.responseModel, expectedModelFamily(model), `${model}:${effort} resolved model`);
     const metrics = await waitForMetrics(metricsBefore.length, model, noEffortModels.includes(model) ? "default" : effort);
     const configured = providerModels.find((entry) => entry.id === model);
     assert.equal(metrics.cleanupComplete, true, `${model}:${effort} private-state cleanup`);

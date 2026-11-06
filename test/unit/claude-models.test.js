@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { MODEL_ALIASES, clearModelAliasCache, readClaudeModelAliases } from "../../src/claude-models.ts";
+import { clearModelAliasCache, readClaudeBuiltinPlugins, readClaudeModelAliases, readClaudeModelLimits } from "../../src/claude-models.ts";
 import { CAPTURED_CLAUDE_VERSION } from "../support/claude-fixture.js";
 
 // A synthetic table in the shape the scanner parses, written by this test and
@@ -11,7 +11,7 @@ import { CAPTURED_CLAUDE_VERSION } from "../support/claude-fixture.js";
 // serves: no test here ever opens the installed binary, so an upstream model
 // refresh cannot fail this suite. Do not "update" them to track upstream --
 // that would reintroduce exactly the version coupling this project removed when
-// EXPECTED_MODEL_FAMILIES replaced dated ids. Change them only to cover a new
+// expectedModelFamily replaced dated ids. Change them only to cover a new
 // table *shape*.
 const ALIAS_TABLE = 'aliases:{sonnet:{default:"claude-sonnet-5",per_provider:{gateway:"claude-sonnet-4-6"}},'
     + 'opus:{default:"claude-opus-5"},haiku:{default:"claude-haiku-4-5"},'
@@ -153,6 +153,57 @@ test("an exhausted scan budget reports nothing instead of a partial answer", asy
     }
 });
 
-test("advertises exactly the picker aliases", () => {
-    assert.deepEqual([...MODEL_ALIASES], ["sonnet", "fable", "opus", "haiku"]);
+test("reads an alias it has never heard of", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-claude-code-provider-models-new-"));
+    try {
+        const executable = join(directory, "claude");
+        await writeFile(executable, 'aliases:{sonnet:{default:"claude-sonnet-5"},zeta:{default:"claude-zeta-1"}}');
+        clearModelAliasCache();
+        assert.deepEqual(await readClaudeModelAliases(installation(executable)), { sonnet: "claude-sonnet-5", zeta: "claude-zeta-1" });
+    } finally {
+        await rm(directory, { recursive: true, force: true });
+    }
+});
+
+const entry = (id, window, output, caps = '"effort","adaptive_thinking"') =>
+    `provider_ids:{first_party:"${id}",bedrock:"x"},vertex_region_env_var:"V",context:{window:${window},native_1m:!0},max_output_tokens:{default:${output},upper:${output}},pricing:"p",capabilities:[${caps}],`;
+
+async function withBinary(contents, fn) {
+    const directory = await mkdtemp(join(tmpdir(), "pi-claude-code-provider-limits-"));
+    try {
+        const executable = join(directory, "claude");
+        await writeFile(executable, contents);
+        clearModelAliasCache();
+        return await fn(installation(executable));
+    } finally {
+        await rm(directory, { recursive: true, force: true });
+    }
+}
+
+test("reads window, output cap and effort support per model id", async () => {
+    const limits = await withBinary(
+        `${entry("claude-haiku-5-5", "1e6", 128000)} ${entry("claude-old-1", 200000, 32000, '"adaptive_thinking"')}`,
+        readClaudeModelLimits,
+    );
+    assert.deepEqual(limits["claude-haiku-5-5"], { contextWindow: 1_000_000, maxTokens: 128_000, effort: true });
+    assert.deepEqual(limits["claude-old-1"], { contextWindow: 200_000, maxTokens: 32_000, effort: false });
+});
+
+test("conflicting limit entries for one id report nothing for it", async () => {
+    const limits = await withBinary(
+        `${entry("claude-x-1", 1000000, 64000)} ${entry("claude-x-1", 200000, 64000)} ${entry("claude-y-1", 1000000, 64000)}`,
+        readClaudeModelLimits,
+    );
+    assert.equal(limits["claude-x-1"], undefined);
+    assert.equal(limits["claude-y-1"].maxTokens, 64_000);
+});
+
+test("an unreadable executable yields no limits", async () => {
+    clearModelAliasCache();
+    assert.deepEqual(await readClaudeModelLimits(installation("/nonexistent/claude")), {});
+});
+
+test("reads built-in plugin names in both spellings, sorted and unique", async () => {
+    const plugins = await withBinary("cc-plugin-tips tips@builtin zeta@builtin cc-plugin-alpha", readClaudeBuiltinPlugins);
+    assert.deepEqual(plugins, ["alpha", "tips", "zeta"]);
 });

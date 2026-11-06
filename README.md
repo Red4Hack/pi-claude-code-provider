@@ -35,7 +35,7 @@ For a local checkout, use `pi install /absolute/path/to/pi-claude-code-provider`
 
 ## Use
 
-Open `/model` and choose `sonnet`, `fable`, `opus`, or `haiku` under `pi-claude-code-provider`.
+Open `/model` and choose an alias under `pi-claude-code-provider`. The list is read from your installed Claude Code (today `sonnet`, `fable`, `opus`, `haiku`), so a new model appears after you update Claude Code and restart Pi, with no release of this package. Context window, output cap and effort support are read from the same install, so they track each release. Only when the install cannot be read does the package fall back to built-in values.
 
 To select one directly:
 
@@ -45,7 +45,7 @@ To select one directly:
 
 From the command line, use `pi --model pi-claude-code-provider/sonnet`.
 
-Sonnet, Fable, and Opus support Pi thinking levels from `low` through `max`. Haiku uses Claude Code's default thinking, even when Pi shows thinking as off. Sonnet, Fable, and Opus have a 1M context window on every plan, including Pro; Haiku has 200K.
+Sonnet, Fable, and Opus support Pi thinking levels from `low` through `max`. A model without effort control uses Claude Code's default thinking, even when Pi shows thinking as off.
 
 Fable availability and billing vary by subscription tier; see Anthropic's [Fable plan policy](https://support.claude.com/en/articles/15424964-claude-fable-5-on-your-plan).
 
