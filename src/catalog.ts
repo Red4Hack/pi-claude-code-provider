@@ -31,7 +31,7 @@ function providerModel(id: string, versions: ModelAliasVersions, table: ModelLim
   const effort = served ? served.effort : true;
   return {
     id,
-    name: `Claude Code ${id[0]!.toUpperCase()}${id.slice(1)}`,
+    name: `Claude Code ${id[0]!.toUpperCase()}${id.slice(1)}${versions[id] ? ` (${versions[id]})` : ""}`,
     // Haiku has no effort control. Claude Code still owns its thinking default.
     ...(effort ? { reasoning: true, thinkingLevelMap: EFFORT_LEVELS } : { reasoning: false }),
     input: ["text", "image"],
