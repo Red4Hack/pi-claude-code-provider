@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -21,6 +21,9 @@ const ALIAS_TABLE = 'aliases:{sonnet:{default:"claude-sonnet-5",per_provider:{ga
 const OTHER_SURFACE_TABLE = 'provider_alias_targets:{fable:{default:"claude-fable-4"},'
     + 'haiku:{default:"claude-haiku-4-5-20251001"},opus:{default:"claude-opus-4",per_provider:{gateway:"claude-opus-4-7"}},'
     + 'sonnet:{default:"claude-sonnet-4"}}';
+
+// Keep the disk cache out of the user's real one.
+process.env.PI_CLAUDE_CODE_PROVIDER_CACHE_DIR = await mkdtemp(join(tmpdir(), "pi-claude-code-provider-cache-"));
 
 function installation(executable) {
     return { executable, version: CAPTURED_CLAUDE_VERSION, subscriptionType: "pro" };
@@ -206,4 +209,28 @@ test("an unreadable executable yields no limits", async () => {
 test("reads built-in plugin names in both spellings, sorted and unique", async () => {
     const plugins = await withBinary("cc-plugin-tips tips@builtin zeta@builtin cc-plugin-alpha", readClaudeBuiltinPlugins);
     assert.deepEqual(plugins, ["alpha", "tips", "zeta"]);
+});
+
+test("persists the scan to disk and reuses it without reading the executable", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-claude-code-provider-models-disk-"));
+    try {
+        const executable = join(directory, "claude");
+        await writeFile(executable, ALIAS_TABLE);
+        clearModelAliasCache();
+        const first = await readClaudeModelAliases(installation(executable));
+        assert.equal(first.opus, "claude-opus-5");
+        const stored = JSON.parse(await readFile(join(process.env.PI_CLAUDE_CODE_PROVIDER_CACHE_DIR, "models-v1.json"), "utf8"));
+        assert.equal(stored.versions.opus, "claude-opus-5");
+        // Same size and mtime, so the key matches: a doctored cache is served as-is.
+        stored.versions.opus = "from-disk";
+        await writeFile(join(process.env.PI_CLAUDE_CODE_PROVIDER_CACHE_DIR, "models-v1.json"), JSON.stringify(stored));
+        clearModelAliasCache();
+        assert.equal((await readClaudeModelAliases(installation(executable))).opus, "from-disk");
+        // A changed executable invalidates it.
+        await writeFile(executable, ALIAS_TABLE.replace("claude-opus-5", "claude-opus-6"));
+        clearModelAliasCache();
+        assert.equal((await readClaudeModelAliases(installation(executable))).opus, "claude-opus-6");
+    } finally {
+        await rm(directory, { recursive: true, force: true });
+    }
 });

@@ -1,4 +1,6 @@
-import { open, stat } from "node:fs/promises";
+import { mkdir, open, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import type { ClaudeInstallation } from "./types.ts";
 
 /**
@@ -75,9 +77,41 @@ async function load(installation: ClaudeInstallation, timeoutMs: number): Promis
     return EMPTY();
   }
   if (cache?.key === key) return cache;
+  const stored = await readDisk(key);
+  if (stored) { cache = { key, ...stored }; return stored; }
   const scanned = await scan(path, timeoutMs);
   cache = { key, ...scanned };
+  // An empty result may be a failed scan, so only a found table is persisted.
+  if (Object.keys(scanned.versions).length > 0) await writeDisk(key, scanned);
   return scanned;
+}
+
+// The scan reads the whole executable (about 4s), so its result outlives the process.
+// Lives in Pi's agent dir (<agent-dir>/cache), same on every OS. The cache-dir override exists for tests.
+function diskCachePath(): string {
+  const agentDir = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
+  const root = process.env.PI_CLAUDE_CODE_PROVIDER_CACHE_DIR || join(agentDir, "cache", "pi-claude-code-provider");
+  return join(root, "models-v1.json");
+}
+
+async function readDisk(key: string): Promise<Scanned | undefined> {
+  try {
+    const data = JSON.parse(await readFile(diskCachePath(), "utf8"));
+    if (data?.key !== key || typeof data.versions !== "object" || typeof data.limits !== "object" || !Array.isArray(data.plugins)) return undefined;
+    return { versions: data.versions, limits: data.limits, plugins: data.plugins };
+  } catch {
+    return undefined;
+  }
+}
+
+async function writeDisk(key: string, scanned: Scanned): Promise<void> {
+  try {
+    const file = diskCachePath();
+    await mkdir(dirname(file), { recursive: true, mode: 0o700 });
+    const tmp = `${file}.${process.pid}.tmp`;
+    await writeFile(tmp, JSON.stringify({ key, ...scanned }), { mode: 0o600 });
+    await rename(tmp, file);
+  } catch { /* cache is best-effort */ }
 }
 
 async function scan(path: string, timeoutMs: number): Promise<Scanned> {
