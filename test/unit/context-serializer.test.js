@@ -64,9 +64,9 @@ test("serializes Pi context, tools, literal at-paths, and images privately", asy
         assert.match(JSON.stringify(messages[2]), /image_attachment/);
         assert.deepEqual(header.toolNameMap.map((entry) => entry.piName), ["odd tool/name"]);
         assert.match(header.toolNameMap[0].transportName, /^mcp__pi__tool_[a-f0-9]{16}$/);
-        assert.equal(messages[1].content[1].name, header.toolNameMap[0].transportName);
+        assert.equal(messages[1].content[0].name, header.toolNameMap[0].transportName);
+        assert.equal(messages[1].content.some((block) => block.type === "thinking"), false);
         assert.equal(messages[2].toolName, header.toolNameMap[0].transportName);
-        assert.equal(messages[1].content[0].thinkingSignature, undefined);
         assert.equal(messages[1].usage, undefined);
         assert.equal(prepared.attachmentPaths.length, 1);
         assert.equal(prepared.toolNames.size, 1);

@@ -200,11 +200,7 @@ export async function prepareRequestWithLimits(
             if (block.redacted !== undefined && typeof block.redacted !== "boolean") {
               throw new ClaudeCodeError("content_shape", "Pi thinking redacted must be boolean");
             }
-            output.push({
-              type: "thinking",
-              thinking: block.thinking,
-              ...(block.redacted === true ? { redacted: true } : {}),
-            });
+            // Replaying old reasoning adds tokens and can trip the reasoning_extraction classifier; it is validated, then dropped.
             break;
           case "toolCall": {
             const id = requireNonemptyString(block.id, "tool-call ID");
