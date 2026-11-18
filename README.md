@@ -51,7 +51,7 @@ Fable availability and billing vary by subscription tier; see Anthropic's [Fable
 
 To see which model served a response, inspect `responseModel` in Pi's JSON output.
 
-Pi's active tools are advertised through MCP. If the model omits the MCP prefix on exactly `bash`, `read`, `edit`, or `write`, the provider accepts that name only when the same lowercase Pi tool is active. Bare capitalized names such as `Bash` and bare names of other tools remain errors. Arguments must still follow Pi's advertised schema; the provider does not translate Claude Code's built-in argument fields or timeout units.
+Pi's active tools are advertised through MCP. If the model omits the MCP prefix on an active Pi tool whose name starts with a lowercase letter (for example `bash`, `read`, or `codemode`), the provider accepts that name only when `mcp__pi__<name>` maps to that same active Pi tool. Bare capitalized names such as `Bash` and bare names of inactive tools remain errors. Arguments must still follow Pi's advertised schema; the provider does not translate Claude Code's built-in argument fields or timeout units.
 
 After installation or an upstream update, run:
 

@@ -63,11 +63,11 @@ interface IndexedBlock {
   parsedLength?: number;
 }
 
-// Issue #14: recover only an omitted MCP prefix on Pi's four default names.
-// Capitalized Claude Code names and argument conversion are intentionally excluded.
-// Keep this exception local to response mapping so it can be removed independently
-// of the advertised catalog and initialization's exact inventory validation.
-const BARE_PI_TOOL_NAMES: ReadonlySet<string> = new Set(["bash", "read", "edit", "write"]);
+// Issue #14: recover an omitted MCP prefix on any active Pi tool whose name starts
+// lowercase. Capitalized names (Claude Code built-ins such as Bash, Read) and argument
+// conversion are intentionally excluded. Keep this exception local to response mapping
+// so it can be removed independently of the catalog and initialization's inventory check.
+const BARE_PI_TOOL_NAME = /^[a-z]/;
 
 export type ClaudeTerminationCause = "none" | "tool_handoff" | "caller_abort";
 
@@ -404,7 +404,7 @@ export class ClaudeEventMapper {
   private resolveToolName(proposedName: string): string | undefined {
     const exact = this.toolNames.get(proposedName);
     if (exact !== undefined) return exact;
-    if (!BARE_PI_TOOL_NAMES.has(proposedName)) return undefined;
+    if (!BARE_PI_TOOL_NAME.test(proposedName)) return undefined;
     const active = this.toolNames.get(`mcp__pi__${proposedName}`);
     // A matching transport key must belong to that same active Pi tool.
     return active === proposedName ? active : undefined;

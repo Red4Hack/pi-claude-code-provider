@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- An omitted MCP prefix on any active Pi tool whose name starts lowercase (such as `codemode`) no longer fails the turn with `Claude proposed an unknown tool`. Previously only `bash`, `read`, `edit`, and `write` were recovered, so other tools wasted a whole turn of tokens and context. Capitalized names and inactive tools remain errors; arguments are unchanged ([#14](https://github.com/chem/pi-claude-code-provider/issues/14)).
 - An exhausted Claude subscription window now ends the turn instead of being retried. Claude Code reports it as HTTP 429, which Pi's retry classifier reads as transient throttling, so a session or weekly limit was restarted on a backoff, spending one Claude launch per attempt against a window that could not open before its reset. Provider failures now carry the account-limit marker Pi stops on, and genuinely transient failures keep their retryable wording.
 - The MCP tool-catalog readiness deadline rose from five to twenty seconds, and it now also ends on Claude's own validated initialization record or on a failure Claude already reported. An ordinary slow Claude Code start was failing requests that were about to succeed, and the report named the deadline rather than the answer Claude had already given.
 - A readiness timeout reports its deadline in seconds. Pi classifies a failed turn by matching HTTP status substrings in its text, so the previous `5000ms` read as a retryable `500` and restarted a request that needed a fix.

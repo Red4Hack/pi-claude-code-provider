@@ -87,12 +87,21 @@ test("bare default-name recovery does not convert Claude Code arguments", async 
     assert.deepEqual((await stream.result()).content[0].arguments, args);
 });
 
-test("bare recovery excludes case variants, arbitrary tools, aliases, and foreign namespaces", () => {
+test("bare recovery accepts any active lowercase Pi tool", async () => {
+    for (const piName of ["codemode", "grep", "ls", "custom-tool"]) {
+        const { mapper, stream } = initializedToolMapper(new Map([[`mcp__pi__${piName}`, piName]]));
+        for (const record of toolUseEvents({ messageId: "msg_bare_any", toolUseId: "toolu_bare_any", name: piName })) mapper.accept(record);
+        mapper.completeToolUse();
+        assert.equal((await stream.result()).content[0].name, piName);
+    }
+});
+
+test("bare recovery excludes case variants, inactive tools, aliases, and foreign namespaces", () => {
     const names = new Map(["bash", "read", "edit", "write", "grep", "find", "ls", "powershell", "custom", "Bash", "Read", "Edit", "Write"].map((name) => [`mcp__pi__${name}`, name]));
     names.set("mcp__pi__tool_1234567890abcdef", "odd tool/name");
     const rejected = [
         ...["bash", "read", "edit", "write"].flatMap((name) => [name[0].toUpperCase() + name.slice(1), name.toUpperCase(), name[0] + name.slice(1).toUpperCase(), ` ${name}`, `${name} `]),
-        "grep", "find", "ls", "powershell", "custom", "odd tool/name", "tool_1234567890abcdef", "mcp__other__bash", "mcp__pi__BASH", "", null,
+        "inactive", "Custom", "odd tool/name", "tool_1234567890abcdef", "mcp__other__bash", "mcp__pi__BASH", "", null,
     ];
     for (const name of rejected) {
         const { mapper } = initializedToolMapper(names);
@@ -103,7 +112,7 @@ test("bare recovery excludes case variants, arbitrary tools, aliases, and foreig
 });
 
 test("bare defaults require their same active lowercase mapping", () => {
-    for (const piName of ["bash", "read", "edit", "write"]) {
+    for (const piName of ["bash", "read", "edit", "write", "codemode"]) {
         for (const names of [new Map(), new Map([[`mcp__pi__${piName}`, "different"]])]) {
             const { mapper } = initializedToolMapper(names);
             mapper.accept({ type: "stream_event", event: { type: "message_start", message: { id: "msg_inactive", usage: {} } } });
