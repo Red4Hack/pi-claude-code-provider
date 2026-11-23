@@ -599,6 +599,9 @@ test("rejects unsupported blocks, deltas, unclosed blocks, and events after stop
     const unclosed = make();
     unclosed.accept({ type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } } });
     assert.throws(() => unclosed.accept({ type: "result", is_error: false, result: "" }), /unclosed content blocks/);
+    const cut = make();
+    cut.accept({ type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } } });
+    assert.throws(() => cut.accept({ type: "stream_event", event: { type: "message_stop" } }), /stream ended before message_stop.*unclosed content blocks/);
     const stopped = make();
     stopped.accept({ type: "stream_event", event: { type: "message_stop" } });
     assert.throws(() => stopped.accept({ type: "stream_event", event: { type: "ping" } }), /after message_stop/);

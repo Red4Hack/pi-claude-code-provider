@@ -376,7 +376,8 @@ export class ClaudeEventMapper {
     else if (type === "content_block_stop") this.endBlock(event);
     else if (type === "message_delta") this.acceptMessageDelta(event);
     else if (type === "message_stop") {
-      if (this.blocks.size > 0) throw new ClaudeCodeError("protocol_blocks", "Claude stopped with unclosed content blocks");
+      // A message that stops with blocks still open was cut mid-block; the wording is what Pi's retry classifier matches.
+      if (this.blocks.size > 0) throw new ClaudeCodeError("stream_interrupted", "Claude Code API stream ended before message_stop (message stopped with unclosed content blocks)");
       this.messageStopped = true;
       if (this.stopReason === "tool_use") this.latchHandoff(this.onToolUse);
       else if (isLengthStop(this.stopReason)) this.latchHandoff(this.onLengthStop);
